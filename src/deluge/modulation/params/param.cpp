@@ -201,7 +201,9 @@ char const* getParamDisplayName(Kind kind, int32_t p) {
 		    [UNPATCHED_MOD_FX_OFFSET] = STRING_FOR_MODFX_OFFSET,
 		    [UNPATCHED_MOD_FX_FEEDBACK] = STRING_FOR_MODFX_FEEDBACK,
 		    [UNPATCHED_SIDECHAIN_SHAPE] = STRING_FOR_SIDECHAIN_SHAPE,
-		    [UNPATCHED_COMPRESSOR_THRESHOLD] = STRING_FOR_THRESHOLD};
+		    [UNPATCHED_COMPRESSOR_THRESHOLD] = STRING_FOR_THRESHOLD,
+		    [UNPATCHED_CV1_SEND] = STRING_FOR_CV1_SEND,
+		    [UNPATCHED_CV2_SEND] = STRING_FOR_CV2_SEND};
 		return l10n::get(NAMES[p]);
 	}
 
@@ -239,6 +241,11 @@ char const* getParamDisplayName(Kind kind, int32_t p) {
 		    [UNPATCHED_VOLUME - unc] = STRING_FOR_MASTER_LEVEL,
 		    [UNPATCHED_SIDECHAIN_VOLUME - unc] = STRING_FOR_SIDECHAIN_LEVEL,
 		    [UNPATCHED_PITCH_ADJUST - unc] = STRING_FOR_MASTER_PITCH,
+		    // Was absent, which was harmless only while nothing followed it -- a designated
+		    // initializer may not leave a hole once a later index is given.
+		    [UNPATCHED_TEMPO - unc] = STRING_FOR_TEMPO,
+		    [UNPATCHED_CV1_MASTER - unc] = STRING_FOR_OUTPUT_LEVEL_CV1,
+		    [UNPATCHED_CV2_MASTER - unc] = STRING_FOR_OUTPUT_LEVEL_CV2,
 		};
 		return l10n::get(NAMES[p - unc]);
 	}
@@ -351,6 +358,12 @@ constexpr char const* paramNameForFileConst(Kind const kind, ParamType const par
 
 		case UNPATCHED_PITCH_ADJUST:
 			return "pitchAdjust";
+
+		case UNPATCHED_CV1_MASTER:
+			return "cv1Master";
+
+		case UNPATCHED_CV2_MASTER:
+			return "cv2Master";
 		case UNPATCHED_GLOBAL_MAX_NUM:
 		    // Intentional fallthrough, not handled
 		    ;
@@ -391,6 +404,12 @@ constexpr char const* paramNameForFileConst(Kind const kind, ParamType const par
 
 		case UNPATCHED_COMPRESSOR_THRESHOLD:
 			return "compressorThreshold";
+
+		case UNPATCHED_CV1_SEND:
+			return "cv1Send";
+
+		case UNPATCHED_CV2_SEND:
+			return "cv2Send";
 
 		case UNPATCHED_NUM_SHARED:
 		    // Intentionally not handled

@@ -16,6 +16,7 @@
  */
 
 #include "processing/engines/audio_engine.h"
+#include "testing/hardware_testing.h"
 #include "definitions_cxx.hpp"
 #include "dsp/reverb/reverb.hpp"
 #include "dsp/timestretch/time_stretcher.h"
@@ -583,6 +584,11 @@ void renderAudioForStemExport(size_t numSamples);
 	numSamplesLastTime = numSamples;
 	renderAudio(numSamples);
 
+	// Once per rendered window, with the window's real length. Must stay paired with
+	// renderAudio: the capture that feeds it happens in there, and pumping without a fresh
+	// capture emits silence while still advancing the stream.
+	cvStreamPump(numSamples);
+
 	scheduleMidiGateOutISR(saddrPosAtStart, unadjustedNumSamplesBeforeLappingPlayHead,
 	                       timeWithinWindowAtWhichMIDIOrGateOccurs);
 
@@ -1031,6 +1037,15 @@ int32_t getNumSamplesLeftToOutputFromPreviousRender() {
 
 // Returns whether we got to the end
 bool doSomeOutputting() {
+
+	// The CV pump used to be called from here, and that was wrong. This function runs up to
+	// three times per rendered window (see the while loop in routine()), and it was handed
+	// "samples still waiting to be output" rather than "samples just rendered". A window
+	// that could not be output in one pass got pumped a second time with no fresh captured
+	// audio -- streaming silence into the ring and advancing the write pointer anyway, so
+	// the rate loop integrated frames that carried nothing and walked toward its clamp.
+	// It now runs exactly once per render, from routine_(). The CV tap itself is unaffected:
+	// that happens inside Song::renderAudio, before master volume and master FX.
 
 	// Copy to actual output buffer, and apply heaps of gain too, with clipping
 	int32_t numSamplesOutputted = 0;

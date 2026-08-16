@@ -2,6 +2,10 @@
 #include "definitions_cxx.hpp"
 #include "gui/context_menu/clip_settings/launch_style.h"
 #include "gui/l10n/l10n.h"
+#include "gui/menu_item/cv_output/routing.h"
+#include "gui/ui/menus.h"
+#include "gui/ui/sound_editor.h"
+#include "testing/hardware_testing.h"
 #include "gui/ui/rename/rename_clipname_ui.h"
 #include "gui/ui/root_ui.h"
 #include "gui/views/session_view.h"
@@ -20,6 +24,10 @@ char const* ClipSettingsMenu::getTitle() {
 
 Sized<char const**> ClipSettingsMenu::getOptions() {
 	using enum l10n::String;
+	// CV routing used to have an entry here. It moved to the AUX menu on each track, where
+	// the sends live: reaching Clip Settings needs a launch-adjacent press, which is no use
+	// mid-performance, and this menu is about how a clip behaves rather than where its audio
+	// goes.
 	if (clip->type == ClipType::AUDIO) {
 		static const char* optionsls[] = {
 		    l10n::get(STRING_FOR_CLIP_MODE),
@@ -61,7 +69,7 @@ bool ClipSettingsMenu::acceptCurrentOption() {
 			launchStyle.setupAndCheckAvailability();
 			openUI(&launchStyle);
 		}
-		else {
+		else if (option == 1) {
 			currentUIMode = UI_MODE_NONE;
 			renameClipNameUI.clip = clip;
 			openUI(&renameClipNameUI);

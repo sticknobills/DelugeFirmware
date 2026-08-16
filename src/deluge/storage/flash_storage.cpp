@@ -16,6 +16,7 @@
  */
 
 #include "storage/flash_storage.h"
+#include "testing/hardware_testing.h"
 #include "RZA1/cpu_specific.h"
 #include "definitions_cxx.hpp"
 #include "gui/menu_item/colour.h"
@@ -183,6 +184,9 @@ enum Entries {
 175: accessibilityMenuHighlighting
 176: default new clip type
 177: use last clip type
+190: unused (was CV1 audio output level; now a song param)
+191: unused (was CV2 audio output level; now a song param)
+192: CV stereo split -- 0 unwritten/default-on, 1 off, 2 on
 */
 
 uint8_t defaultScale;
@@ -336,6 +340,8 @@ void resetSettings() {
 
 	defaultNewClipType = OutputType::SYNTH;
 	defaultUseLastClipType = true;
+
+	cvSetStereoSplit(true);
 }
 
 void resetMidiFollowSettings() {
@@ -727,6 +733,12 @@ void readSettings() {
 	else {
 		defaultUseLastClipType = buffer[177];
 	}
+
+	// Stereo split, global. Tri-state rather than a plain bool, because the default is now ON
+	// and a never-written slot reads as 0 -- a bool would force every existing Deluge to the
+	// wrong default. 0 means "never written, use the default", 1 is explicitly off, 2 is
+	// explicitly on. The socket levels that used to sit at 190/191 are song params now.
+	cvSetStereoSplit(buffer[192] != 1);
 }
 
 static bool areMidiFollowSettingsValid(std::span<uint8_t> buffer) {
@@ -992,6 +1004,8 @@ void writeSettings() {
 
 	buffer[176] = util::to_underlying(defaultNewClipType);
 	buffer[177] = defaultUseLastClipType;
+
+	buffer[192] = cvGetStereoSplit() ? 2 : 1;
 
 	R_SFLASH_EraseSector(0x80000 - 0x1000, SPIBSC_CH, SPIBSC_CMNCR_BSZ_SINGLE, 1, SPIBSC_OUTPUT_ADDR_24);
 	R_SFLASH_ByteProgram(0x80000 - 0x1000, buffer.data(), 256, SPIBSC_CH, SPIBSC_CMNCR_BSZ_SINGLE, SPIBSC_1BIT,

@@ -99,6 +99,21 @@ ActionResult buttonAction(deluge::hid::Button b, bool on, bool inCardRoutine) {
 		considerCrossScreenReleaseForCrossScreenMode = false;
 	}
 
+	// DIAGNOSTIC BUILD ONLY -- SHIFT + CV advances the I2S output diagnostic by one
+	// step. Returns immediately; SSI3 and the DMA carry on in hardware.
+	//
+	// This has to live here rather than in View::buttonAction, because SessionView,
+	// InstrumentClipView and ArrangerView each handle the CV button themselves and
+	// return without ever falling through to View. Buttons::buttonAction runs before
+	// any UI sees the press, so it is the only place a global chord actually works.
+	if (on && b == CV && isShiftButtonPressed()) {
+		if (inCardRoutine) {
+			return ActionResult::REMIND_ME_OUTSIDE_CARD_ROUTINE;
+		}
+		i2sAdvance();
+		return ActionResult::DEALT_WITH;
+	}
+
 	ActionResult result;
 
 	// See if it was one of the mod buttons
