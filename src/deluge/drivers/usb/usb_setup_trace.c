@@ -27,7 +27,7 @@ static volatile uint16_t writeIndex = 0;
 static volatile uint16_t readIndex = 0;
 static volatile uint16_t sequence = 0;
 
-void usbSetupTraceRecord(uint16_t type, uint16_t value, uint16_t index, uint16_t length) {
+static void push(uint16_t type, uint16_t value, uint16_t index, uint16_t length, uint16_t isMark) {
 	uint16_t next = (uint16_t)((writeIndex + 1u) & TRACE_MASK);
 	sequence++;
 	if (next == readIndex) {
@@ -38,7 +38,16 @@ void usbSetupTraceRecord(uint16_t type, uint16_t value, uint16_t index, uint16_t
 	entries[writeIndex].index = index;
 	entries[writeIndex].length = length;
 	entries[writeIndex].sequence = sequence;
+	entries[writeIndex].isMark = isMark;
 	writeIndex = next;
+}
+
+void usbSetupTraceRecord(uint16_t type, uint16_t value, uint16_t index, uint16_t length) {
+	push(type, value, index, length, 0u);
+}
+
+void usbSetupTraceMark(uint16_t tag, uint16_t a, uint16_t b, uint16_t c) {
+	push(tag, a, b, c, 1u);
 }
 
 int usbSetupTracePop(UsbSetupTraceEntry* out) {
@@ -50,6 +59,7 @@ int usbSetupTracePop(UsbSetupTraceEntry* out) {
 	out->index = entries[readIndex].index;
 	out->length = entries[readIndex].length;
 	out->sequence = entries[readIndex].sequence;
+	out->isMark = entries[readIndex].isMark;
 	readIndex = (uint16_t)((readIndex + 1u) & TRACE_MASK);
 	return 1;
 }

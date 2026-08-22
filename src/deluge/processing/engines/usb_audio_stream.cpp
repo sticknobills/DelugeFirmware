@@ -39,7 +39,7 @@ namespace {
 constexpr uint16_t kAudioInterfaceNumber = 2;
 constexpr uint16_t kStreamingAltSetting = 1;
 
-constexpr uint32_t kChannels = 8;
+constexpr uint32_t kChannels = USB_CFG_PAUDIO_CHANNELS;
 constexpr uint32_t kSubframeBytes = 2;
 constexpr uint32_t kFrameBytes = kChannels * kSubframeBytes;
 constexpr uint32_t kSampleRate = 44100;
@@ -88,6 +88,23 @@ void drainSetupTrace() {
 			*p++ = "0123456789ABCDEF"[(v >> shift) & 0xF];
 		}
 	};
+
+	if (entry.isMark) {
+		// A point reached in the driver, not a request off the wire. Tags are in usb_setup_trace.h.
+		emit("MK ");
+		emitHex(entry.sequence, 4);
+		emit(" t");
+		emitHex(entry.type, 2);
+		emit(" ");
+		emitHex(entry.value, 4);
+		emit(" ");
+		emitHex(entry.index, 4);
+		emit(" ");
+		emitHex(entry.length, 4);
+		*p = '\0';
+		Debug::sysexDebugPrint(*Debug::midiDebugCable, line, true);
+		return;
+	}
 
 	// bmRequestType and bRequest share one register: low byte then high byte.
 	emit("SU ");

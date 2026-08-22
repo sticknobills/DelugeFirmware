@@ -27,16 +27,27 @@
 extern "C" {
 #endif
 
+/* Marker tags, for following the SET_INTERFACE path that a host stream start dies on. */
+#define USB_TRACE_MARK_SETIF_PIPES_BEGIN 0x01u /* about to configure pipes for the new alternate setting */
+#define USB_TRACE_MARK_SETIF_PIPES_END 0x02u   /* they all came back */
+#define USB_TRACE_MARK_PIPE_INIT_BEGIN 0x03u   /* one pipe, with the PIPEMAXP and PIPECFG about to be written */
+#define USB_TRACE_MARK_PIPE_INIT_END 0x04u     /* that pipe came back */
+
 typedef struct {
-	uint16_t type; /* USBREQ: low byte bmRequestType, high byte bRequest */
+	uint16_t type; /* Request: low byte bmRequestType, high byte bRequest. Marker: the tag. */
 	uint16_t value;
 	uint16_t index;
 	uint16_t length;
 	uint16_t sequence; /* Wraps. Non-consecutive numbers on arrival mean entries were dropped. */
+	uint16_t isMark;   /* 1 for a code-path marker, 0 for a control request off the wire. */
 } UsbSetupTraceEntry;
 
 /// Called from the USB interrupt for every control request. Drops the entry if the buffer is full.
 void usbSetupTraceRecord(uint16_t type, uint16_t value, uint16_t index, uint16_t length);
+
+/// Records a point in the driver rather than a request off the wire, so a path that never returns can be told apart
+/// from one that returns and achieves nothing. Same buffer, so markers interleave with requests in order.
+void usbSetupTraceMark(uint16_t tag, uint16_t a, uint16_t b, uint16_t c);
 
 /// Pops one entry. Returns 0 when empty.
 int usbSetupTracePop(UsbSetupTraceEntry* out);

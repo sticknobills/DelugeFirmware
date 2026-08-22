@@ -76,6 +76,7 @@ usb_setup_t g_usb_pstd_req_reg; /* Device Request - Request structure */
 
 #include "RZA1/usb/r_usb_basic/r_usb_basic_if.h"
 #include "definitions.h"
+#include "deluge/drivers/usb/usb_setup_trace.h"
 #include "deluge/drivers/usb/userdef/r_usb_pmidi_config.h"
 
 /***********************************************************************************************************************
@@ -727,7 +728,9 @@ void usb_pstd_set_pipe_register(uint16_t pipe_number, uint16_t* tbl)
                         i = (uint16_t)(USB_EPL * g_usb_pstd_eptbl_index[dir][ep]);
                         /* Pipe number */
                         pipe = (uint16_t)(tbl[i + 0] & USB_CURPIPE);
+                        usbSetupTraceMark(USB_TRACE_MARK_PIPE_INIT_BEGIN, pipe, tbl[i + 3], tbl[i + 1]);
                         usb_cstd_pipe_init(USB_NULL, pipe, tbl, i);
+                        usbSetupTraceMark(USB_TRACE_MARK_PIPE_INIT_END, pipe, 0, 0);
                     }
                 }
             }

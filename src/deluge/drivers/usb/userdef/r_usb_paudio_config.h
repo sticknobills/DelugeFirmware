@@ -21,9 +21,18 @@
 // r_usb_pdriver.c. PIPE2 and PIPE3 belong to USB MIDI, so PIPE1 is the only one available.
 #define USB_CFG_PAUDIO_ISO_IN (USB_PIPE1)
 
-// 8 channels x 16 bit is 16 bytes per audio frame. 44.1 kHz gives 44 or 45 frames per 1 ms
-// packet, so the largest packet is 45 * 16 = 720 bytes. Pipe buffers are allocated in 64-byte
-// units, so 768 is the smallest that fits.
+// Channel count for the stream. The descriptors and the transmit path both derive their packet
+// arithmetic from this, so it is the only place it is written down.
+//
+// Temporarily 2 rather than the 8 this build targets: a host will not start the stream, and
+// shrinking the packet from 720 to 180 bytes is the single-variable cut that says whether the
+// fault scales with packet size. Put back to 8 once that is answered.
+#define USB_CFG_PAUDIO_CHANNELS (2u)
+
+// The pipe buffer stays sized for 8 channels while the channel count above is being varied, so
+// that only the packet size moves: 8 x 16 bit is 16 bytes per audio frame, 44.1 kHz gives 44 or
+// 45 frames per 1 ms packet, so the largest packet is 45 * 16 = 720 bytes. Pipe buffers are
+// allocated in 64-byte units, so 768 is the smallest that fits.
 #define USB_CFG_PAUDIO_BUF_BYTES (768u)
 
 // First 64-byte buffer block. MIDI holds blocks 8-15 and 72-79; double buffering doubles the

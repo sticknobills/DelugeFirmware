@@ -49,6 +49,8 @@ Macro definitions
  * (9+4+ncables)*2 - shared bulk endpoint, descriptors include list of cables
  * for easy c+p -> 9+9+7+((6+9)*ncables)+(9+4+ncables)*2
  */
+#include "deluge/drivers/usb/userdef/r_usb_paudio_config.h"
+
 #define NCABLES 3
 #define USB_MIDI_CD_WTOTALLENGTH (9 + 7 + (15 * NCABLES) + (13 + NCABLES) * 2)
 
@@ -100,7 +102,7 @@ Macro definitions
 #define AUDIO_IN_TERMINAL_ID 0x01
 #define AUDIO_OUT_TERMINAL_ID 0x02
 
-#define AUDIO_NUM_CHANNELS 8
+#define AUDIO_NUM_CHANNELS USB_CFG_PAUDIO_CHANNELS
 #define AUDIO_SUBFRAME_BYTES 2
 #define AUDIO_BIT_RESOLUTION 16
 #define AUDIO_SAMPLE_RATE 44100

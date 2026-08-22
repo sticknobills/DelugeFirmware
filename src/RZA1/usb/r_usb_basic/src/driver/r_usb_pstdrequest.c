@@ -33,6 +33,7 @@
 #include "RZA1/usb/r_usb_basic/src/driver/inc/r_usb_typedef.h"
 #include "RZA1/usb/r_usb_basic/src/hw/inc/r_usb_bitdefine.h"
 #include "RZA1/usb/r_usb_basic/src/hw/inc/r_usb_reg_access.h"
+#include "deluge/drivers/usb/usb_setup_trace.h"
 
 #if defined(USB_CFG_PMSC_USE)
 #include "drivers/usb/r_usb_pmsc/r_usb_pmsc_if.h"
@@ -1203,7 +1204,10 @@ static void usb_pstd_set_interface3(void)
                     g_usb_pstd_config_num, g_usb_pstd_req_index, g_usb_pstd_alt_num[g_usb_pstd_req_index]);
                 p_table = g_usb_pstd_driver.p_pipetbl;
                 /* Set pipe configuration register */
+                usbSetupTraceMark(USB_TRACE_MARK_SETIF_PIPES_BEGIN, g_usb_pstd_req_index,
+                    g_usb_pstd_alt_num[g_usb_pstd_req_index], 0);
                 usb_pstd_set_pipe_register((uint16_t)USB_PERIPIPE, p_table);
+                usbSetupTraceMark(USB_TRACE_MARK_SETIF_PIPES_END, g_usb_pstd_req_index, 0, 0);
             }
             else
             {
