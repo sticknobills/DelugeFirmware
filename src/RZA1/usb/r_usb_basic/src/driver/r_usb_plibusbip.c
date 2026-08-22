@@ -1199,6 +1199,45 @@ void usb_pstd_bemp_pipe_process_rohan_midi(uint16_t bitsts)
 }
 
 /***********************************************************************************************************************
+ Function Name   : usb_pstd_brdy_pipe_process_paudio
+ Description     : The audio pipe's share of the non-zero-pipe BRDY interrupt: carry on writing a packet that did not
+                 : finish in one pass. The driver enables BRDY in place of BEMP whenever that happens, so without this
+                 : the transfer stays outstanding for good.
+                 : The MIDI handler alongside deliberately keeps its unconditional behaviour - it guards on its own
+                 : receive state, and it carries the SysEx debug channel these counters are read over.
+ Arguments       : uint16_t     bitsts       : BRDYSTS Register
+ Return value    : none
+ ***********************************************************************************************************************/
+void usb_pstd_brdy_pipe_process_paudio(uint16_t bitsts)
+{
+    const uint16_t pipe = USB_CFG_PAUDIO_ISO_IN;
+
+    usbBrdyNonZeroCount++;
+
+    if ((bitsts & USB_BITSET(pipe)) == 0)
+    {
+        return;
+    }
+    usbBrdyAudioCount++;
+
+    hw_usb_clear_status_bemp(USB_NULL, pipe);
+
+    if (USB_NULL == g_p_usb_pipe[pipe])
+    {
+        return;
+    }
+
+    if (USB_CUSE == usb_pstd_pipe2fport(pipe))
+    {
+        /* Send pipe, so this is the rest of a packet rather than anything arriving. */
+        if (USB_BUF2FIFO == usb_cstd_get_pipe_dir(USB_NULL, pipe))
+        {
+            usb_pstd_buf2fifo(pipe, USB_CUSE);
+        }
+    }
+} /* End of function usb_pstd_brdy_pipe_process_paudio() */
+
+/***********************************************************************************************************************
  Function Name   : usb_pstd_bemp_pipe_process_paudio
  Description     : The audio pipe's share of the non-zero-pipe BEMP interrupt: hand a sent isochronous packet back to
                  : its owner. Takes only its own bit, so it sits alongside the MIDI handler on the same interrupt.

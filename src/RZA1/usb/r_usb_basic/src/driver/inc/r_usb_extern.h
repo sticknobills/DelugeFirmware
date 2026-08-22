@@ -184,6 +184,7 @@ void usb_pstd_bemp_pipe_process(uint16_t bitsts);
 void usb_pstd_bemp_pipe_process_paudio(uint16_t bitsts);
 void usb_pstd_bemp_pipe_process_rohan_midi(uint16_t bitsts); // By Rohan
 void usb_pstd_brdy_pipe_process(uint16_t bitsts);
+void usb_pstd_brdy_pipe_process_paudio(uint16_t bitsts);
 void usb_pstd_brdy_pipe_process_rohan_midi(uint16_t bitsts); // By Rohan
 
 #endif /* (USB_CFG_MODE & USB_CFG_PERI) == USB_CFG_PERI */

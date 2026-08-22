@@ -66,6 +66,12 @@ extern volatile uint32_t usbBempBitsSeen;
 /// Audio-pipe interrupts that found the pipe stalled.
 extern volatile uint32_t usbBempAudioStall;
 
+/// Every non-zero-pipe BRDY interrupt. This is the other interrupt that carries a transfer forward, and the driver
+/// enables it in place of BEMP whenever a packet does not finish writing in one pass.
+extern volatile uint32_t usbBrdyNonZeroCount;
+/// Only those carrying the audio pipe's bit.
+extern volatile uint32_t usbBrdyAudioCount;
+
 #ifdef __cplusplus
 }
 #endif

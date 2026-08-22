@@ -110,7 +110,10 @@ static void usb_pstd_interrupt(uint16_t type, uint16_t status)
             break;
 
         case USB_INT_BRDY: // BRDY (receive finished arriving) for non-0 pipe
+            // Same split as BEMP below. The MIDI handler discards the status word and assumes its own pipe, so
+            // an unfinished audio packet had nothing to carry it forward and the transfer never ended.
             usb_pstd_brdy_pipe_process_rohan_midi(status);
+            usb_pstd_brdy_pipe_process_paudio(status);
             break;
 
         case USB_INT_BEMP0: // BEMP (send finished) for pipe0

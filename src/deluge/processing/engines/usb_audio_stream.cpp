@@ -251,6 +251,10 @@ void reportStats() {
 	emitDec(usbBempBitsSeen);
 	emit(" bst");
 	emitDec(usbBempAudioStall);
+	emit(" brd");
+	emitDec(usbBrdyNonZeroCount);
+	emit(" bra");
+	emitDec(usbBrdyAudioCount);
 	emit(" ur");
 	emitDec(statUnderruns);
 	emit(" rs");
@@ -269,6 +273,8 @@ void reportStats() {
 	statSubmits = 0;
 	usbBempNonZeroCount = 0;
 	usbBempAudioCount = 0;
+	usbBrdyNonZeroCount = 0;
+	usbBrdyAudioCount = 0;
 	// usbBempBitsSeen is deliberately not cleared: which pipes are live at all is the question, not how often.
 }
 
