@@ -24,15 +24,12 @@
 // Channel count for the stream. The descriptors and the transmit path both derive their packet
 // arithmetic from this, so it is the only place it is written down.
 //
-// Temporarily 2 rather than the 8 this build targets: a host will not start the stream, and
-// shrinking the packet from 720 to 180 bytes is the single-variable cut that says whether the
-// fault scales with packet size. Put back to 8 once that is answered.
-#define USB_CFG_PAUDIO_CHANNELS (2u)
+#define USB_CFG_PAUDIO_CHANNELS (8u)
 
-// The pipe buffer stays sized for 8 channels while the channel count above is being varied, so
-// that only the packet size moves: 8 x 16 bit is 16 bytes per audio frame, 44.1 kHz gives 44 or
-// 45 frames per 1 ms packet, so the largest packet is 45 * 16 = 720 bytes. Pipe buffers are
-// allocated in 64-byte units, so 768 is the smallest that fits.
+// 8 x 16 bit is 16 bytes per audio frame. 44.1 kHz gives 44 or 45 frames per 1 ms packet, so the
+// largest packet is 45 * 16 = 720 bytes. Pipe buffers are allocated in 64-byte units, so 768 is
+// the smallest that fits, and it is left at that size when the channel count is varied for a
+// test so that only the packet size moves.
 #define USB_CFG_PAUDIO_BUF_BYTES (768u)
 
 // First 64-byte buffer block. MIDI holds blocks 8-15 and 72-79; double buffering doubles the
