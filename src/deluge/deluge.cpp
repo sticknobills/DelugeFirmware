@@ -62,6 +62,7 @@
 #include "playback/mode/session.h"
 #include "processing/engines/audio_engine.h"
 #include "processing/engines/cv_engine.h"
+#include "processing/engines/usb_audio_stream.h"
 #include "scheduler_api.h"
 #include "storage/audio/audio_file_manager.h"
 #include "storage/flash_storage.h"
@@ -552,6 +553,9 @@ void registerTasks() {
 	AudioEngine::routine_task_id = addRepeatingTask(&(AudioEngine::routine_task), p++, 8 / 44100., 64 / 44100.,
 	                                                128 / 44100., "audio  routine", RESOURCE_NONE);
 	addRepeatingTask(MidiEngine::check_incoming_usb, p++, 0.0005, 0.0005, 0.001, "check usb midi", RESOURCE_USB);
+	// An isochronous endpoint has to answer every frame it is polled, so this keeps a transfer in flight rather than
+	// waiting for something to send. Double buffering on the pipe gives two packets of slack on the 1 ms deadline.
+	addRepeatingTask(usbAudioStreamRoutine, p++, 0.0005, 0.0005, 0.001, "usb audio stream", RESOURCE_USB);
 
 	// this will block itself unless an encoder is actually moved so can have a fast rate
 	encoders::EncoderTaskID = addRepeatingTask(&(encoders::interpretEncodersTask), p++, 0.001, 0.001, 0.002,
