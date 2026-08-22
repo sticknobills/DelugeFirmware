@@ -106,7 +106,17 @@ uint32_t statPacketsSent = 0;
 uint32_t statFramesSent = 0;
 uint32_t statReportCountdown = 0;
 
+/// Branch counters. "Nothing was sent" cannot distinguish the task never running, the task
+/// returning because a transfer is still outstanding, and the task sending silence because the
+/// ring looked empty - and those want three different fixes. Counting the branch taken is what
+/// separates them; counting completions tests whether the driver ever hands the transfer back.
+uint32_t statAlt1 = 0;
+uint32_t statInFlight = 0;
+uint32_t statPrimeSilence = 0;
+uint32_t statCompletes = 0;
+
 void transferComplete(usb_utr_t* /*ptr*/, uint16_t /*data1*/, uint16_t /*data2*/) {
+	statCompletes++;
 	transferInFlight = false;
 }
 
@@ -201,7 +211,15 @@ void reportStats() {
 		}
 	};
 
-	emit("AU pkt");
+	emit("AU a1:");
+	emitDec(statAlt1);
+	emit(" inf");
+	emitDec(statInFlight);
+	emit(" sil");
+	emitDec(statPrimeSilence);
+	emit(" cpl");
+	emitDec(statCompletes);
+	emit(" pkt");
 	emitDec(statPacketsSent);
 	emit(" frm");
 	emitDec(statFramesSent);
@@ -216,6 +234,10 @@ void reportStats() {
 
 	statPacketsSent = 0;
 	statFramesSent = 0;
+	statAlt1 = 0;
+	statInFlight = 0;
+	statPrimeSilence = 0;
+	statCompletes = 0;
 }
 
 } // namespace
@@ -242,8 +264,10 @@ void USBAudioStream::routine() {
 		return;
 	}
 	streamActive = true;
+	statAlt1++;
 
 	if (transferInFlight) {
+		statInFlight++;
 		return;
 	}
 
@@ -271,6 +295,7 @@ void USBAudioStream::routine() {
 	// not produce a gap the host has to hear.
 	if (!primed) {
 		if (available < kLeadFrames) {
+			statPrimeSilence++;
 			transfer.keyword = USB_CFG_PAUDIO_ISO_IN;
 			transfer.tranlen = frames * kFrameBytes;
 			memset(packet, 0, frames * kFrameBytes);
