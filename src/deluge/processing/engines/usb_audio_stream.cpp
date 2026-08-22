@@ -116,16 +116,6 @@ uint32_t statPrimeSilence = 0;
 uint32_t statCompletes = 0;
 uint32_t statSubmits = 0;
 uint32_t statLastErr = 0xFFFF;
-uint32_t statWedges = 0;
-
-/// How many passes a transfer may stay outstanding before it is treated as lost.
-///
-/// The task runs about every half millisecond and the endpoint is polled every millisecond, so
-/// a packet still outstanding after three passes is not coming back. Without this a single
-/// failed submit stops the stream for good, which is exactly what happened - the driver
-/// guards in the transfer-start path are compiled out, so a rejection reports nothing.
-constexpr uint32_t kInFlightPassLimit = 3;
-uint32_t inFlightPasses = 0;
 
 void transferComplete(usb_utr_t* /*ptr*/, uint16_t /*data1*/, uint16_t /*data2*/) {
 	statCompletes++;
@@ -141,8 +131,9 @@ void submit(const uint8_t* data, uint32_t bytes) {
 	statSubmits++;
 	const usb_er_t err = usb_pstd_transfer_start(&transfer);
 	statLastErr = (uint32_t)err;
+	// Always USB_OK in practice - every guard in that function is compiled out - so this records the
+	// code rather than relying on it. Kept as one call site so the flag cannot be set in two places.
 	transferInFlight = (err == USB_OK);
-	inFlightPasses = 0;
 }
 
 /// Diagnostic for USB Audio Class bring-up: reports every control request the host sends, over the SysEx debug
@@ -217,7 +208,7 @@ void reportStats() {
 	}
 	statReportCountdown = 1000;
 
-	char line[64];
+	char line[160];
 	char* p = line;
 	auto emit = [&p](const char* t) {
 		while (*t != '\0') {
@@ -246,10 +237,6 @@ void reportStats() {
 	emitDec(statCompletes);
 	emit(" sub");
 	emitDec(statSubmits);
-	emit(" err");
-	emitDec(statLastErr);
-	emit(" wdg");
-	emitDec(statWedges);
 	emit(" pkt");
 	emitDec(statPacketsSent);
 	emit(" frm");
@@ -270,7 +257,6 @@ void reportStats() {
 	statPrimeSilence = 0;
 	statCompletes = 0;
 	statSubmits = 0;
-	statWedges = 0;
 }
 
 } // namespace
@@ -282,8 +268,17 @@ void USBAudioStream::routine() {
 	reportStats();
 
 	if (!ringCleared) {
-		// Channels beyond the first two are never written, so zeroing once here is what keeps them silent.
 		memset(ring, 0, sizeof(ring));
+		// DIAGNOSTIC. Channels 3 upwards get a distinct constant, written here and never touched by the
+		// render path, so one recording separates three cases that silence cannot: transport dead
+		// (everything zero), transport alive but capture broken (these present, mix channels zero), and
+		// working (both). The differing value per channel proves the channel mapping at the same time.
+		// Remove once real audio is confirmed - it permanently occupies those channels.
+		for (uint32_t f = 0; f < kRingFrames; f++) {
+			for (uint32_t c = 2; c < kChannels; c++) {
+				ring[f * kChannels + c] = (int16_t)((c + 1u) * 2000u);
+			}
+		}
 		ringCleared = true;
 	}
 
@@ -301,15 +296,8 @@ void USBAudioStream::routine() {
 
 	if (transferInFlight) {
 		statInFlight++;
-		if (++inFlightPasses < kInFlightPassLimit) {
-			return;
-		}
-		// Treated as lost rather than waited on any longer. Counted, so a stream that only works
-		// because of this reads as broken rather than as healthy.
-		statWedges++;
-		transferInFlight = false;
+		return;
 	}
-	inFlightPasses = 0;
 
 	if (!transferInitialised) {
 		transfer.complete = transferComplete;
