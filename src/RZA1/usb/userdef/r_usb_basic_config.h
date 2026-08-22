@@ -57,6 +57,12 @@
 #define USB_CFG_PMIDI_USE
 #define USB_CFG_HMIDI_USE
 
+/** [Peripheral Audio Class]
+ * Adds an isochronous IN endpoint alongside USB MIDI, carrying 8 channels of 16-bit 44.1 kHz
+ * audio. Pipe and buffer choices are in deluge/drivers/usb/userdef/r_usb_paudio_config.h.
+ */
+#define USB_CFG_PAUDIO_USE
+
 /**  [DMA use setting]
  * USB_CFG_ENABLE       : Uses DMA
  * USB_CFG_DISABLE      : Does not use DMA

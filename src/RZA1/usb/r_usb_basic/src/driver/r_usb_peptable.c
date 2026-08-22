@@ -47,6 +47,10 @@
 #include "deluge/drivers/usb/userdef/r_usb_pmidi_config.h"
 #endif
 
+#if defined(USB_CFG_PAUDIO_USE)
+#include "deluge/drivers/usb/userdef/r_usb_paudio_config.h"
+#endif
+
 #if ((USB_CFG_MODE & USB_CFG_PERI) == USB_CFG_PERI)
 /***********************************************************************************************************************
  Exported global variables (to be accessed by other files)
@@ -122,6 +126,24 @@ uint16_t g_usb_pstd_eptbl[] = {
     USB_NULL,                                                                                     /* PIPEPERI */
     USB_NULL,                                                                                     /* reserve */
 #endif /* defined(USB_CFG_PCDC_USE) */
+
+/**************/
+/* for PAUDIO */
+/**************/
+/* Rows are consumed in the order endpoint descriptors appear in the configuration descriptor
+ * (usb_peri_pipe_info). This row is third, matching the isochronous endpoint in the
+ * AudioStreaming interface, which follows USB MIDI's two bulk endpoints.
+ * SHTNAK is a bulk short-packet setting and is off here; CNTMD is likewise bulk-only and is
+ * already off globally. */
+#if defined(USB_CFG_PAUDIO_USE)
+    USB_CFG_PAUDIO_ISO_IN, /* Pipe No. */
+    /* TYPE    / BFRE        / DBLB         / CNTMD         / SHTNAK             / DIR      / EPNUM */
+    USB_NULL | USB_BFREOFF | USB_CFG_DBLB | USB_CFG_CNTMD | USB_CFG_SHTNAKOFF | USB_NULL | USB_NULL, /* PIPECFG */
+    (uint16_t)USB_BUF_SIZE(USB_CFG_PAUDIO_BUF_BYTES) | USB_BUF_NUMB(USB_CFG_PAUDIO_BUF_START),       /* PIPEBUF */
+    USB_NULL,                                                                                        /* PIPEMAXP */
+    USB_NULL,                                                                                        /* PIPEPERI */
+    USB_NULL,                                                                                        /* reserve */
+#endif /* defined(USB_CFG_PAUDIO_USE) */
 
 /************/
 /* for PHID */
