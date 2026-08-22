@@ -16,10 +16,13 @@
  */
 
 #include "processing/engines/usb_audio_stream.h"
+#include "io/debug/print.h"
+#include "io/midi/sysex.h"
 #include <cstdint>
 
 extern "C" {
 #include "RZA1/usb/r_usb_basic/r_usb_basic_if.h"
+#include "deluge/drivers/usb/usb_setup_trace.h"
 #include "deluge/drivers/usb/userdef/r_usb_paudio_config.h"
 
 // Declared here rather than by including r_usb_extern.h, which carries an inline function that only compiles as C.
@@ -62,11 +65,57 @@ void transferComplete(usb_utr_t* /*ptr*/, uint16_t /*data1*/, uint16_t /*data2*/
 	transferInFlight = false;
 }
 
+/// Diagnostic for USB Audio Class bring-up: reports every control request the host sends, over the SysEx debug
+/// channel. One per call so a burst cannot monopolise the task. Enable the channel with F0 00 21 7B 01 03 00 01 F7.
+void drainSetupTrace() {
+	if (Debug::midiDebugCable == nullptr) {
+		return;
+	}
+	UsbSetupTraceEntry entry;
+	if (!usbSetupTracePop(&entry)) {
+		return;
+	}
+	// Hand-formatted rather than via snprintf, which drags in newlib stdio that this firmware does not link.
+	char line[48];
+	char* p = line;
+	auto emit = [&p](const char* s) {
+		while (*s != '\0') {
+			*p++ = *s++;
+		}
+	};
+	auto emitHex = [&p](uint32_t v, int digits) {
+		for (int shift = (digits - 1) * 4; shift >= 0; shift -= 4) {
+			*p++ = "0123456789ABCDEF"[(v >> shift) & 0xF];
+		}
+	};
+
+	// bmRequestType and bRequest share one register: low byte then high byte.
+	emit("SU ");
+	emitHex(entry.sequence, 4);
+	emit(" rt");
+	emitHex(entry.type & 0xFF, 2);
+	emit(" rq");
+	emitHex((entry.type >> 8) & 0xFF, 2);
+	emit(" v");
+	emitHex(entry.value, 4);
+	emit(" i");
+	emitHex(entry.index, 4);
+	emit(" l");
+	emitHex(entry.length, 4);
+	emit(" a");
+	emitHex(g_usb_pstd_alt_num[kAudioInterfaceNumber], 2);
+	*p = '\0';
+
+	Debug::sysexDebugPrint(*Debug::midiDebugCable, line, true);
+}
+
 } // namespace
 
 namespace deluge::processing::engines {
 
 void USBAudioStream::routine() {
+	drainSetupTrace();
+
 	// The host parks the interface at alt 0 when it is not streaming, which is what frees the isochronous bandwidth.
 	if (!g_usb_peri_connected || g_usb_pstd_alt_num[kAudioInterfaceNumber] != kStreamingAltSetting) {
 		transferInFlight = false;

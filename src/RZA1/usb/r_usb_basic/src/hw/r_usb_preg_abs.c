@@ -34,6 +34,7 @@
 #include "RZA1/usb/r_usb_basic/src/driver/inc/r_usb_typedef.h"
 #include "RZA1/usb/r_usb_basic/src/hw/inc/r_usb_bitdefine.h"
 #include "RZA1/usb/r_usb_basic/src/hw/inc/r_usb_reg_access.h"
+#include "deluge/drivers/usb/usb_setup_trace.h"
 
 /***********************************************************************************************************************
  Exported global variables (to be accessed by other files)
@@ -362,6 +363,9 @@ void usb_pstd_save_request(void)
     g_usb_pstd_req_value  = hw_usb_read_usbval();
     g_usb_pstd_req_index  = hw_usb_read_usbindx();
     g_usb_pstd_req_length = hw_usb_read_usbleng();
+
+    /* Diagnostic for USB Audio Class bring-up. Every control request passes through here. */
+    usbSetupTraceRecord(g_usb_pstd_req_type, g_usb_pstd_req_value, g_usb_pstd_req_index, g_usb_pstd_req_length);
 } /* End of function usb_pstd_save_request() */
 
 /***********************************************************************************************************************
