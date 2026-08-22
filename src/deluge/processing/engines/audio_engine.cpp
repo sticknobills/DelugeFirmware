@@ -48,6 +48,7 @@
 #include "modulation/patch/patch_cable_set.h"
 #include "processing/audio_output.h"
 #include "processing/engines/cv_engine.h"
+#include "processing/engines/usb_audio_stream.h"
 #include "processing/live/live_input_buffer.h"
 #include "processing/metronome/metronome.h"
 #include "processing/sound/sound.h"
@@ -1210,6 +1211,10 @@ bool doSomeOutputting() {
 	i2sTXBufferPos = (uint32_t)i2sTXBufferPosNow;
 
 	if (numSamplesOutputted) {
+
+		// The same samples the OUTPUT recorder takes below, at the same point and the same scale -- this is the
+		// mix as the codec receives it, so a USB host and a resampled recording agree by construction.
+		deluge::processing::engines::USBAudioStream::feedMix(outputBufferForResampling.data(), numSamplesOutputted);
 
 		i2sRXBufferPos += (numSamplesOutputted << (NUM_MONO_INPUT_CHANNELS_MAGNITUDE + 2));
 		if (i2sRXBufferPos >= (uint32_t)getRxBufferEnd()) {

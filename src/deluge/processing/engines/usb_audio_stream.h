@@ -17,6 +17,10 @@
 
 #pragma once
 
+#include <cstdint>
+
+struct StereoSample;
+
 namespace deluge::processing::engines {
 
 /// Keeps the USB Audio Class isochronous endpoint answering the host.
@@ -28,6 +32,13 @@ class USBAudioStream {
 public:
 	/// Submits the next packet if the previous one has completed. Safe to call when no host is streaming.
 	static void routine();
+
+	/// Hands the finished main mix to the stream, from the output stage that already walks these samples.
+	///
+	/// The Deluge is the clock master here: a device-to-host isochronous stream carries whatever the source
+	/// produced and the host adapts, so packets are sized from what this leaves in the ring rather than from a
+	/// nominal rate. Costs nothing when no host is streaming.
+	static void feedMix(const StereoSample* mix, uint32_t numSamples);
 };
 
 } // namespace deluge::processing::engines

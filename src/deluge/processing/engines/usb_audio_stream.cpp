@@ -16,9 +16,12 @@
  */
 
 #include "processing/engines/usb_audio_stream.h"
+#include "definitions_cxx.hpp"
+#include "dsp/stereo_sample.h"
 #include "io/debug/print.h"
 #include "io/midi/sysex.h"
 #include <cstdint>
+#include <cstring>
 
 extern "C" {
 #include "RZA1/usb/r_usb_basic/r_usb_basic_if.h"
@@ -53,13 +56,55 @@ constexpr uint32_t kMaxPacketBytes = (kFramesPerPacket + 1) * kFrameBytes;
 static_assert(kMaxPacketBytes <= USB_CFG_PAUDIO_BUF_BYTES,
               "Audio packet does not fit the pipe buffer declared in r_usb_paudio_config.h");
 
-/// Nothing renders into this yet, so every packet sends the same silence.
-alignas(4) uint8_t silence[kMaxPacketBytes] = {};
+/// Frames held between the audio routine and this task. A power of two so the wrap is a mask.
+///
+/// The producer writes a whole render window at once and windows reach 128 frames, so the ring only has to
+/// outrun a burst rather than hold latency. 1024 leaves eight bursts of margin for 22 KB of SDRAM.
+constexpr uint32_t kRingFrames = 1024u;
+constexpr uint32_t kRingMask = kRingFrames - 1u;
+
+/// How far ahead of the host the ring tries to stay before the first packet goes out.
+///
+/// This is the stream's latency and the only thing standing between an engine that ran late and an audible
+/// gap. 128 frames is ~2.9 ms -- one worst-case render window. A DAW compensates for a reported latency and
+/// does not care about a few ms, so this starts far tighter than the 768 frames the CV sockets need.
+constexpr uint32_t kLeadFrames = 128u;
+
+/// Past this the host is not draining us and the ring is heading for a lap. Snap back to the lead instead:
+/// one discontinuity, immediately recovered, rather than a wrap that silently reorders a second of audio.
+constexpr uint32_t kResyncFrames = kRingFrames - (kRingFrames / 4u);
+
+/// Interleaved, one frame per host audio frame. Only channels 0 and 1 are ever written, so the rest are
+/// zeroed once at startup and left alone -- per-track routing fills them in a later cut.
+PLACE_SDRAM_BSS int16_t ring[kRingFrames * kChannels];
+
+/// Written by the audio routine, read by this task, and vice versa. Each is single-writer and 32-bit
+/// aligned, which is atomic on this core, so no lock is needed between the two.
+volatile uint32_t writeFrame = 0;
+volatile uint32_t readFrame = 0;
+bool ringCleared = false;
+bool primed = false;
+
+/// Whether a host currently has the streaming interface selected. Read by the producer so that a machine with
+/// nothing plugged in does not pay for the conversion, and set in one place so the two sides cannot disagree.
+bool streamActive = false;
+
+/// Copied out of the ring before submitting, because the driver reads this memory after the call returns and
+/// the producer must stay free to write. One buffer suffices: only one transfer is ever in flight.
+alignas(4) uint8_t packet[kMaxPacketBytes] = {};
 
 usb_utr_t transfer;
 bool transferInitialised = false;
 bool transferInFlight = false;
 uint32_t frameAccumulator = 0;
+
+/// Stream health, reported over the SysEx debug channel. Silence costs nothing to render, so these only mean
+/// anything once real audio is flowing -- which is exactly what makes them the first evidence on T3.
+uint32_t statUnderruns = 0;
+uint32_t statResyncs = 0;
+uint32_t statPacketsSent = 0;
+uint32_t statFramesSent = 0;
+uint32_t statReportCountdown = 0;
 
 void transferComplete(usb_utr_t* /*ptr*/, uint16_t /*data1*/, uint16_t /*data2*/) {
 	transferInFlight = false;
@@ -126,19 +171,77 @@ void drainSetupTrace() {
 	Debug::sysexDebugPrint(*Debug::midiDebugCable, line, true);
 }
 
+/// One line a second while the debug channel is on: how much audio actually left, and how often the ring was
+/// empty or had to be snapped back. A gap-free stream reports rising packets with underruns and resyncs at zero.
+void reportStats() {
+	if (Debug::midiDebugCable == nullptr) {
+		return;
+	}
+	if (statReportCountdown-- != 0) {
+		return;
+	}
+	statReportCountdown = 1000;
+
+	char line[64];
+	char* p = line;
+	auto emit = [&p](const char* t) {
+		while (*t != '\0') {
+			*p++ = *t++;
+		}
+	};
+	auto emitDec = [&p](uint32_t v) {
+		char tmp[11];
+		int n = 0;
+		do {
+			tmp[n++] = (char)('0' + (v % 10u));
+			v /= 10u;
+		} while (v != 0u);
+		while (n-- > 0) {
+			*p++ = tmp[n];
+		}
+	};
+
+	emit("AU pkt");
+	emitDec(statPacketsSent);
+	emit(" frm");
+	emitDec(statFramesSent);
+	emit(" ur");
+	emitDec(statUnderruns);
+	emit(" rs");
+	emitDec(statResyncs);
+	emit(" lead");
+	emitDec((writeFrame - readFrame) & kRingMask);
+	*p = '\0';
+	Debug::sysexDebugPrint(*Debug::midiDebugCable, line, true);
+
+	statPacketsSent = 0;
+	statFramesSent = 0;
+}
+
 } // namespace
 
 namespace deluge::processing::engines {
 
 void USBAudioStream::routine() {
 	drainSetupTrace();
+	reportStats();
+
+	if (!ringCleared) {
+		// Channels beyond the first two are never written, so zeroing once here is what keeps them silent.
+		memset(ring, 0, sizeof(ring));
+		ringCleared = true;
+	}
 
 	// The host parks the interface at alt 0 when it is not streaming, which is what frees the isochronous bandwidth.
 	if (!g_usb_peri_connected || g_usb_pstd_alt_num[kAudioInterfaceNumber] != kStreamingAltSetting) {
 		transferInFlight = false;
 		frameAccumulator = 0;
+		primed = false;
+		streamActive = false;
+		readFrame = writeFrame;
 		return;
 	}
+	streamActive = true;
 
 	if (transferInFlight) {
 		return;
@@ -153,6 +256,8 @@ void USBAudioStream::routine() {
 		transferInitialised = true;
 	}
 
+	// Nominal packet size, used only while there is nothing real to send. 44.1 kHz does not divide into 1 ms
+	// frames, so 44 frames with a 45th every tenth packet averages exactly 44100 rather than drifting.
 	uint32_t frames = kFramesPerPacket;
 	frameAccumulator += kFrameRemainder;
 	if (frameAccumulator >= 1000) {
@@ -160,12 +265,90 @@ void USBAudioStream::routine() {
 		frameAccumulator -= 1000;
 	}
 
+	uint32_t available = (writeFrame - readFrame) & kRingMask;
+
+	// Hold the first packets back until there is a window's worth of slack, so the very first late render does
+	// not produce a gap the host has to hear.
+	if (!primed) {
+		if (available < kLeadFrames) {
+			transfer.keyword = USB_CFG_PAUDIO_ISO_IN;
+			transfer.tranlen = frames * kFrameBytes;
+			memset(packet, 0, frames * kFrameBytes);
+			transfer.p_tranadr = packet;
+			transferInFlight = true;
+			usb_pstd_transfer_start(&transfer);
+			return;
+		}
+		primed = true;
+	}
+
+	// The host is not draining us fast enough to keep up. A rate trim cannot recover this in useful time, so
+	// put the read pointer back at the lead and take the one discontinuity.
+	if (available >= kResyncFrames) {
+		readFrame = (writeFrame - kLeadFrames) & kRingMask;
+		available = kLeadFrames;
+		statResyncs++;
+	}
+
+	if (available == 0) {
+		// The engine has not produced anything since the last poll. Send correctly sized silence rather than
+		// nothing, so the endpoint keeps answering, and do not advance the read pointer.
+		statUnderruns++;
+		memset(packet, 0, frames * kFrameBytes);
+		transfer.keyword = USB_CFG_PAUDIO_ISO_IN;
+		transfer.tranlen = frames * kFrameBytes;
+		transfer.p_tranadr = packet;
+		transferInFlight = true;
+		usb_pstd_transfer_start(&transfer);
+		return;
+	}
+
+	// Send what the engine actually produced. Never a partial audio frame: a host that appends one rotates the
+	// channel mapping permanently and silently.
+	uint32_t send = available;
+	if (send > kFramesPerPacket + 1u) {
+		send = kFramesPerPacket + 1u;
+	}
+
+	const uint32_t start = readFrame & kRingMask;
+	const uint32_t firstRun = (start + send > kRingFrames) ? (kRingFrames - start) : send;
+	memcpy(packet, &ring[start * kChannels], firstRun * kFrameBytes);
+	if (firstRun < send) {
+		memcpy(&packet[firstRun * kFrameBytes], &ring[0], (send - firstRun) * kFrameBytes);
+	}
+	readFrame = (readFrame + send) & kRingMask;
+
+	statPacketsSent++;
+	statFramesSent += send;
+
 	transfer.keyword = USB_CFG_PAUDIO_ISO_IN;
-	transfer.tranlen = frames * kFrameBytes;
-	transfer.p_tranadr = silence;
+	transfer.tranlen = send * kFrameBytes;
+	transfer.p_tranadr = packet;
 
 	transferInFlight = true;
 	usb_pstd_transfer_start(&transfer);
+}
+
+void USBAudioStream::feedMix(const StereoSample* mix, uint32_t numSamples) {
+	// Nothing is listening, so do not pay for the conversion. While stopped the consumer parks the read pointer
+	// on the write pointer every pass, so the ring cannot look full to the first host that arrives.
+	if (!streamActive || numSamples == 0 || mix == nullptr) {
+		return;
+	}
+
+	// Producer and consumer are both cooperative tasks on one core, so neither can interleave with the other and
+	// the single-writer pointers below need no barrier. That is a property of the scheduler, not of the pointers:
+	// moving either side into an interrupt would break it.
+
+	uint32_t w = writeFrame;
+	for (uint32_t i = 0; i < numSamples; i++) {
+		int16_t* const frame = &ring[(w & kRingMask) * kChannels];
+		// The samples handed here are already at output scale, so this is only a width reduction.
+		frame[0] = (int16_t)(mix[i].l >> 16);
+		frame[1] = (int16_t)(mix[i].r >> 16);
+		w++;
+	}
+	writeFrame = w & kRingMask;
 }
 
 } // namespace deluge::processing::engines
