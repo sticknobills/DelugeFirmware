@@ -114,10 +114,35 @@ uint32_t statAlt1 = 0;
 uint32_t statInFlight = 0;
 uint32_t statPrimeSilence = 0;
 uint32_t statCompletes = 0;
+uint32_t statSubmits = 0;
+uint32_t statLastErr = 0xFFFF;
+uint32_t statWedges = 0;
+
+/// How many passes a transfer may stay outstanding before it is treated as lost.
+///
+/// The task runs about every half millisecond and the endpoint is polled every millisecond, so
+/// a packet still outstanding after three passes is not coming back. Without this a single
+/// failed submit stops the stream for good, which is exactly what happened - the driver
+/// guards in the transfer-start path are compiled out, so a rejection reports nothing.
+constexpr uint32_t kInFlightPassLimit = 3;
+uint32_t inFlightPasses = 0;
 
 void transferComplete(usb_utr_t* /*ptr*/, uint16_t /*data1*/, uint16_t /*data2*/) {
 	statCompletes++;
 	transferInFlight = false;
+}
+
+/// Submits one packet and reports whether the driver accepted it. The flag is only held when it
+/// did: setting it unconditionally is what turned a single rejected transfer into a dead stream.
+void submit(const uint8_t* data, uint32_t bytes) {
+	transfer.keyword = USB_CFG_PAUDIO_ISO_IN;
+	transfer.tranlen = bytes;
+	transfer.p_tranadr = (void*)data;
+	statSubmits++;
+	const usb_er_t err = usb_pstd_transfer_start(&transfer);
+	statLastErr = (uint32_t)err;
+	transferInFlight = (err == USB_OK);
+	inFlightPasses = 0;
 }
 
 /// Diagnostic for USB Audio Class bring-up: reports every control request the host sends, over the SysEx debug
@@ -219,6 +244,12 @@ void reportStats() {
 	emitDec(statPrimeSilence);
 	emit(" cpl");
 	emitDec(statCompletes);
+	emit(" sub");
+	emitDec(statSubmits);
+	emit(" err");
+	emitDec(statLastErr);
+	emit(" wdg");
+	emitDec(statWedges);
 	emit(" pkt");
 	emitDec(statPacketsSent);
 	emit(" frm");
@@ -238,6 +269,8 @@ void reportStats() {
 	statInFlight = 0;
 	statPrimeSilence = 0;
 	statCompletes = 0;
+	statSubmits = 0;
+	statWedges = 0;
 }
 
 } // namespace
@@ -268,8 +301,15 @@ void USBAudioStream::routine() {
 
 	if (transferInFlight) {
 		statInFlight++;
-		return;
+		if (++inFlightPasses < kInFlightPassLimit) {
+			return;
+		}
+		// Treated as lost rather than waited on any longer. Counted, so a stream that only works
+		// because of this reads as broken rather than as healthy.
+		statWedges++;
+		transferInFlight = false;
 	}
+	inFlightPasses = 0;
 
 	if (!transferInitialised) {
 		transfer.complete = transferComplete;
@@ -296,12 +336,8 @@ void USBAudioStream::routine() {
 	if (!primed) {
 		if (available < kLeadFrames) {
 			statPrimeSilence++;
-			transfer.keyword = USB_CFG_PAUDIO_ISO_IN;
-			transfer.tranlen = frames * kFrameBytes;
 			memset(packet, 0, frames * kFrameBytes);
-			transfer.p_tranadr = packet;
-			transferInFlight = true;
-			usb_pstd_transfer_start(&transfer);
+			submit(packet, frames * kFrameBytes);
 			return;
 		}
 		primed = true;
@@ -320,11 +356,7 @@ void USBAudioStream::routine() {
 		// nothing, so the endpoint keeps answering, and do not advance the read pointer.
 		statUnderruns++;
 		memset(packet, 0, frames * kFrameBytes);
-		transfer.keyword = USB_CFG_PAUDIO_ISO_IN;
-		transfer.tranlen = frames * kFrameBytes;
-		transfer.p_tranadr = packet;
-		transferInFlight = true;
-		usb_pstd_transfer_start(&transfer);
+		submit(packet, frames * kFrameBytes);
 		return;
 	}
 
@@ -346,12 +378,7 @@ void USBAudioStream::routine() {
 	statPacketsSent++;
 	statFramesSent += send;
 
-	transfer.keyword = USB_CFG_PAUDIO_ISO_IN;
-	transfer.tranlen = send * kFrameBytes;
-	transfer.p_tranadr = packet;
-
-	transferInFlight = true;
-	usb_pstd_transfer_start(&transfer);
+	submit(packet, send * kFrameBytes);
 }
 
 void USBAudioStream::feedMix(const StereoSample* mix, uint32_t numSamples) {
