@@ -208,7 +208,9 @@ void reportStats() {
 	}
 	statReportCountdown = 1000;
 
-	char line[160];
+	// Sized for every counter at its full width rather than for the line as it reads today. Growing this line past
+	// its buffer is the likeliest cause of the freeze on 2026-08-22.
+	char line[256];
 	char* p = line;
 	auto emit = [&p](const char* t) {
 		while (*t != '\0') {
@@ -241,6 +243,14 @@ void reportStats() {
 	emitDec(statPacketsSent);
 	emit(" frm");
 	emitDec(statFramesSent);
+	emit(" bmp");
+	emitDec(usbBempNonZeroCount);
+	emit(" bau");
+	emitDec(usbBempAudioCount);
+	emit(" bbt");
+	emitDec(usbBempBitsSeen);
+	emit(" bst");
+	emitDec(usbBempAudioStall);
 	emit(" ur");
 	emitDec(statUnderruns);
 	emit(" rs");
@@ -257,6 +267,9 @@ void reportStats() {
 	statPrimeSilence = 0;
 	statCompletes = 0;
 	statSubmits = 0;
+	usbBempNonZeroCount = 0;
+	usbBempAudioCount = 0;
+	// usbBempBitsSeen is deliberately not cleared: which pipes are live at all is the question, not how often.
 }
 
 } // namespace

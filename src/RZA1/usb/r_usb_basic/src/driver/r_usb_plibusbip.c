@@ -35,6 +35,8 @@
 #include "RZA1/usb/r_usb_basic/src/hw/inc/r_usb_reg_access.h"
 
 // Added by Rohan
+#include "deluge/drivers/usb/usb_setup_trace.h"
+#include "deluge/drivers/usb/userdef/r_usb_paudio_config.h"
 #include "deluge/drivers/usb/userdef/r_usb_pmidi_config.h"
 #include "deluge/io/midi/midi_device_manager.h"
 #include "deluge/io/midi/midi_engine.h"
@@ -1101,7 +1103,9 @@ void usb_pstd_bemp_pipe_process_rohan_midi(uint16_t bitsts)
 {
     uint16_t pipe = USB_CFG_PMIDI_BULK_OUT;
 
-    if (true || (bitsts & USB_BITSET(pipe)) != 0) // Surely we can skip this. Rohan
+    // The bit test is back on. One interrupt carries every pipe that finished, and this handler owns only MIDI:
+    // taking somebody else's completion zeroes numBytesSendingNow on a send that is still in progress.
+    if ((bitsts & USB_BITSET(pipe)) != 0)
     {
         /* Interrupt check */
         if (true || USB_NULL != g_p_usb_pipe[pipe]) // Don't bother with this check now we don't actually need to
@@ -1193,6 +1197,50 @@ void usb_pstd_bemp_pipe_process_rohan_midi(uint16_t bitsts)
         }
     }
 }
+
+/***********************************************************************************************************************
+ Function Name   : usb_pstd_bemp_pipe_process_paudio
+ Description     : The audio pipe's share of the non-zero-pipe BEMP interrupt: hand a sent isochronous packet back to
+                 : its owner. Takes only its own bit, so it sits alongside the MIDI handler on the same interrupt.
+ Arguments       : uint16_t     bitsts       : BEMPSTS Register
+ Return value    : none
+ ***********************************************************************************************************************/
+void usb_pstd_bemp_pipe_process_paudio(uint16_t bitsts)
+{
+    const uint16_t pipe = USB_CFG_PAUDIO_ISO_IN;
+
+    usbBempNonZeroCount++;
+    usbBempBitsSeen |= bitsts;
+
+    if ((bitsts & USB_BITSET(pipe)) == 0)
+    {
+        return;
+    }
+    usbBempAudioCount++;
+
+    if (USB_NULL == g_p_usb_pipe[pipe])
+    {
+        return;
+    }
+
+    /* MAX packet size error ? */
+    if ((usb_cstd_get_pid(USB_NULL, pipe) & USB_PID_STALL) == USB_PID_STALL)
+    {
+        usbBempAudioStall++;
+        usb_pstd_forced_termination(pipe, (uint16_t)USB_DATA_STALL);
+        return;
+    }
+
+    /* The pipe is double-buffered, so the other half may still hold a packet the host has not taken. Waiting for it
+     * rather than ending the transfer here is what the stock handler does for this pipe range. */
+    if ((hw_usb_read_pipectr(USB_NULL, pipe) & USB_INBUFM) == USB_INBUFM)
+    {
+        hw_usb_set_bempenb(USB_NULL, pipe);
+        return;
+    }
+
+    usb_pstd_data_end(pipe, (uint16_t)USB_DATA_NONE);
+} /* End of function usb_pstd_bemp_pipe_process_paudio() */
 
 /***********************************************************************************************************************
  Function Name   : usb_pstd_bemp_pipe_process

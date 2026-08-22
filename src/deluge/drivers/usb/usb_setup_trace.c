@@ -27,6 +27,11 @@ static volatile uint16_t writeIndex = 0;
 static volatile uint16_t readIndex = 0;
 static volatile uint16_t sequence = 0;
 
+volatile uint32_t usbBempNonZeroCount = 0;
+volatile uint32_t usbBempAudioCount = 0;
+volatile uint32_t usbBempBitsSeen = 0;
+volatile uint32_t usbBempAudioStall = 0;
+
 static void push(uint16_t type, uint16_t value, uint16_t index, uint16_t length, uint16_t isMark) {
 	uint16_t next = (uint16_t)((writeIndex + 1u) & TRACE_MASK);
 	sequence++;

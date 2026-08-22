@@ -53,6 +53,19 @@ void usbSetupTraceMark(uint16_t tag, uint16_t a, uint16_t b, uint16_t c);
 /// Pops one entry. Returns 0 when empty.
 int usbSetupTracePop(UsbSetupTraceEntry* out);
 
+/* Counters for the non-zero-pipe BEMP interrupt, which is the one that reports a sent packet. Too frequent for the
+ * trace ring above -- a running stream raises it every millisecond -- so they are counted and read once a second. */
+
+/// Every non-zero-pipe BEMP interrupt, whichever pipe raised it.
+extern volatile uint32_t usbBempNonZeroCount;
+/// Only those carrying the audio pipe's bit. Zero here means the host never drains the audio buffer at all, which is
+/// a different fault from the completion being delivered to the wrong place.
+extern volatile uint32_t usbBempAudioCount;
+/// Every pipe bit seen since the last report, OR'd. Names which pipes are actually live.
+extern volatile uint32_t usbBempBitsSeen;
+/// Audio-pipe interrupts that found the pipe stalled.
+extern volatile uint32_t usbBempAudioStall;
+
 #ifdef __cplusplus
 }
 #endif

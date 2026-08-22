@@ -118,7 +118,11 @@ static void usb_pstd_interrupt(uint16_t type, uint16_t status)
             break;
 
         case USB_INT_BEMP: // BEMP (send finished) for non-0 pipe
+            // Both handlers see the whole status word and each takes only its own pipe's bit. Routing this
+            // straight to MIDI is what left the audio pipe's completion undelivered - the transfer stayed
+            // outstanding for good, and the stream stopped after one packet.
             usb_pstd_bemp_pipe_process_rohan_midi(status);
+            usb_pstd_bemp_pipe_process_paudio(status);
             break;
 
         // NRDY interrupts don't need processing (I filter them out during the interrupt) unless we use ISO endpoints.

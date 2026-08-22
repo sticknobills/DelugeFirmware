@@ -181,6 +181,7 @@ void usb_pstd_data_end(uint16_t pipe, uint16_t status);
 #if (USB_CFG_MODE & USB_CFG_PERI) == USB_CFG_PERI
 void usb_pstd_nrdy_pipe_process(uint16_t bitsts);
 void usb_pstd_bemp_pipe_process(uint16_t bitsts);
+void usb_pstd_bemp_pipe_process_paudio(uint16_t bitsts);
 void usb_pstd_bemp_pipe_process_rohan_midi(uint16_t bitsts); // By Rohan
 void usb_pstd_brdy_pipe_process(uint16_t bitsts);
 void usb_pstd_brdy_pipe_process_rohan_midi(uint16_t bitsts); // By Rohan
