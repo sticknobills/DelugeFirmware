@@ -1190,7 +1190,12 @@ static void usb_pstd_set_interface3(void)
     uint16_t* p_table;
 
     /* Configured ? */
-    if ((USB_TRUE == usb_pstd_chk_configured()) && ((USB_INTERFACE == g_usb_pstd_req_type & USB_BMREQUESTTYPERECIP)))
+    /* The recipient test used to read "USB_INTERFACE == g_usb_pstd_req_type & USB_BMREQUESTTYPERECIP", which C
+     * parses as "(USB_INTERFACE == g_usb_pstd_req_type) & USB_BMREQUESTTYPERECIP" - a comparison against the whole
+     * USBREQ register rather than against its recipient field. It is never true, so every SetInterface was stalled.
+     * Latent until now because USB MIDI has one interface with one alternate setting, so no host ever sent one.
+     * The other ten uses of USB_BMREQUESTTYPERECIP in this file are bracketed the way this one now is. */
+    if ((USB_TRUE == usb_pstd_chk_configured()) && ((g_usb_pstd_req_type & USB_BMREQUESTTYPERECIP) == USB_INTERFACE))
     {
         if ((g_usb_pstd_req_index <= usb_pstd_get_interface_num(g_usb_pstd_config_num)) && (0 == g_usb_pstd_req_length))
         {
@@ -1212,18 +1217,21 @@ static void usb_pstd_set_interface3(void)
             else
             {
                 /* Request error */
+                usbSetupTraceMark(USB_TRACE_MARK_SETIF_REJECT, 3, g_usb_pstd_req_value, 0);
                 usb_pstd_set_stall_pipe0();
             }
         }
         else
         {
             /* Request error */
+            usbSetupTraceMark(USB_TRACE_MARK_SETIF_REJECT, 2, g_usb_pstd_req_index, g_usb_pstd_req_length);
             usb_pstd_set_stall_pipe0();
         }
     }
     else
     {
         /* Request error */
+        usbSetupTraceMark(USB_TRACE_MARK_SETIF_REJECT, 1, g_usb_pstd_req_type, usb_pstd_chk_configured());
         usb_pstd_set_stall_pipe0();
     }
 } /* End of function usb_pstd_set_interface3() */

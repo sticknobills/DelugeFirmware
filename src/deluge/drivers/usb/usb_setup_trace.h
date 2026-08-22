@@ -32,6 +32,7 @@ extern "C" {
 #define USB_TRACE_MARK_SETIF_PIPES_END 0x02u   /* they all came back */
 #define USB_TRACE_MARK_PIPE_INIT_BEGIN 0x03u   /* one pipe, with the PIPEMAXP and PIPECFG about to be written */
 #define USB_TRACE_MARK_PIPE_INIT_END 0x04u     /* that pipe came back */
+#define USB_TRACE_MARK_SETIF_REJECT 0x05u      /* SET_INTERFACE stalled; the arg says which test rejected it */
 
 typedef struct {
 	uint16_t type; /* Request: low byte bmRequestType, high byte bRequest. Marker: the tag. */
