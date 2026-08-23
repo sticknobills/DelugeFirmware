@@ -81,8 +81,9 @@ constexpr uint32_t kResyncFrames = kRingFrames - (kRingFrames / 4u);
 /// zeroed once at startup and left alone -- per-track routing fills them in a later cut.
 PLACE_SDRAM_BSS int16_t ring[kRingFrames * kChannels];
 
-/// Written by the audio routine, read by this task, and vice versa. Each is single-writer and 32-bit
-/// aligned, which is atomic on this core, so no lock is needed between the two.
+/// writeFrame is advanced by the audio routine, readFrame by whoever builds the next packet - the task for the
+/// first of a stream, the completion interrupt for the rest. Each is single-writer and 32-bit aligned, which is
+/// atomic on this core, so no lock is needed between the two.
 volatile uint32_t writeFrame = 0;
 volatile uint32_t readFrame = 0;
 bool ringCleared = false;
@@ -159,11 +160,23 @@ uint32_t stuckPasses = 0;
 uint32_t statAbandonedSeen = 0;
 uint32_t statAbandonedEnded = 0;
 
+void sendNextPacket();
+
 void transferComplete(usb_utr_t* /*ptr*/, uint16_t /*data1*/, uint16_t /*data2*/) {
 	statCompletes++;
 	transferInFlight = false;
 	regsAtLastCompletion = readPipeRegisters();
 	regsSnapshotTaken = true;
+
+	// Hand the next packet over here rather than waiting for the task to come round again. Needing a second pass
+	// to notice the completion is what capped delivery at ~460 packets/s against the 1000/s the host polls at;
+	// from here it is one pass per packet and the cadence is the host's, not the scheduler's.
+	//
+	// The copy this costs the interrupt is ~990 bytes at 1 kHz. Measured effect on the audio engine's own 2.9 ms
+	// deadline: see the underrun and resync counters, which is what the numbers below are for.
+	if (streamActive && transferInitialised) {
+		sendNextPacket();
+	}
 }
 
 /// Submits one packet and reports whether the driver accepted it. The flag is only held when it
@@ -178,6 +191,75 @@ void submit(const uint8_t* data, uint32_t bytes) {
 	// Always USB_OK in practice - every guard in that function is compiled out - so this records the
 	// code rather than relying on it. Kept as one call site so the flag cannot be set in two places.
 	transferInFlight = (err == USB_OK);
+}
+
+/// Builds one packet from the ring and hands it to the endpoint.
+///
+/// Called from the task for the first packet of a stream and after a recovery, and from the completion for every
+/// packet after that. Both are single-threaded against each other: the task only builds when no transfer is
+/// outstanding, and a completion can only arrive when one is.
+///
+/// submit() is deliberately the last statement, because the completion for it can arrive before this returns.
+void sendNextPacket() {
+	// Nominal packet size, used only while there is nothing real to send. 44.1 kHz does not divide into 1 ms
+	// frames, so 44 frames with a 45th every tenth packet averages exactly 44100 rather than drifting.
+	uint32_t frames = kFramesPerPacket;
+	frameAccumulator += kFrameRemainder;
+	if (frameAccumulator >= 1000) {
+		frames++;
+		frameAccumulator -= 1000;
+	}
+
+	uint32_t available = (writeFrame - readFrame) & kRingMask;
+
+	// Hold the first packets back until there is a window's worth of slack, so the very first late render does
+	// not produce a gap the host has to hear.
+	if (!primed) {
+		if (available < kLeadFrames) {
+			statPrimeSilence++;
+			memset(packet, 0, frames * kFrameBytes);
+			submit(packet, frames * kFrameBytes);
+			return;
+		}
+		primed = true;
+	}
+
+	// The host is not draining us fast enough to keep up. A rate trim cannot recover this in useful time, so
+	// put the read pointer back at the lead and take the one discontinuity.
+	if (available >= kResyncFrames) {
+		readFrame = (writeFrame - kLeadFrames) & kRingMask;
+		available = kLeadFrames;
+		statResyncs++;
+	}
+
+	if (available == 0) {
+		// The engine has not produced anything since the last poll. Send correctly sized silence rather than
+		// nothing, so the endpoint keeps answering, and do not advance the read pointer.
+		statUnderruns++;
+		memset(packet, 0, frames * kFrameBytes);
+		submit(packet, frames * kFrameBytes);
+		return;
+	}
+
+	// Send what the engine actually produced. Never a partial audio frame: a host that appends one rotates the
+	// channel mapping permanently and silently.
+	uint32_t send = available;
+	if (send > kFramesPerPacket + 1u) {
+		send = kFramesPerPacket + 1u;
+	}
+
+	const uint32_t start = readFrame & kRingMask;
+	const uint32_t firstRun = (start + send > kRingFrames) ? (kRingFrames - start) : send;
+	memcpy(packet, &ring[start * kChannels], firstRun * kFrameBytes);
+	if (firstRun < send) {
+		memcpy(&packet[firstRun * kFrameBytes], &ring[0], (send - firstRun) * kFrameBytes);
+	}
+	readFrame = (readFrame + send) & kRingMask;
+
+	statPacketsSent++;
+	statFramesSent += send;
+
+	submit(packet, send * kFrameBytes);
 }
 
 /// Ends a transfer the hardware has already finished with but never reported.
@@ -451,65 +533,7 @@ void USBAudioStream::routine() {
 		transferInitialised = true;
 	}
 
-	// Nominal packet size, used only while there is nothing real to send. 44.1 kHz does not divide into 1 ms
-	// frames, so 44 frames with a 45th every tenth packet averages exactly 44100 rather than drifting.
-	uint32_t frames = kFramesPerPacket;
-	frameAccumulator += kFrameRemainder;
-	if (frameAccumulator >= 1000) {
-		frames++;
-		frameAccumulator -= 1000;
-	}
-
-	uint32_t available = (writeFrame - readFrame) & kRingMask;
-
-	// Hold the first packets back until there is a window's worth of slack, so the very first late render does
-	// not produce a gap the host has to hear.
-	if (!primed) {
-		if (available < kLeadFrames) {
-			statPrimeSilence++;
-			memset(packet, 0, frames * kFrameBytes);
-			submit(packet, frames * kFrameBytes);
-			return;
-		}
-		primed = true;
-	}
-
-	// The host is not draining us fast enough to keep up. A rate trim cannot recover this in useful time, so
-	// put the read pointer back at the lead and take the one discontinuity.
-	if (available >= kResyncFrames) {
-		readFrame = (writeFrame - kLeadFrames) & kRingMask;
-		available = kLeadFrames;
-		statResyncs++;
-	}
-
-	if (available == 0) {
-		// The engine has not produced anything since the last poll. Send correctly sized silence rather than
-		// nothing, so the endpoint keeps answering, and do not advance the read pointer.
-		statUnderruns++;
-		memset(packet, 0, frames * kFrameBytes);
-		submit(packet, frames * kFrameBytes);
-		return;
-	}
-
-	// Send what the engine actually produced. Never a partial audio frame: a host that appends one rotates the
-	// channel mapping permanently and silently.
-	uint32_t send = available;
-	if (send > kFramesPerPacket + 1u) {
-		send = kFramesPerPacket + 1u;
-	}
-
-	const uint32_t start = readFrame & kRingMask;
-	const uint32_t firstRun = (start + send > kRingFrames) ? (kRingFrames - start) : send;
-	memcpy(packet, &ring[start * kChannels], firstRun * kFrameBytes);
-	if (firstRun < send) {
-		memcpy(&packet[firstRun * kFrameBytes], &ring[0], (send - firstRun) * kFrameBytes);
-	}
-	readFrame = (readFrame + send) & kRingMask;
-
-	statPacketsSent++;
-	statFramesSent += send;
-
-	submit(packet, send * kFrameBytes);
+	sendNextPacket();
 }
 
 void USBAudioStream::feedMix(const StereoSample* mix, uint32_t numSamples) {
@@ -519,9 +543,10 @@ void USBAudioStream::feedMix(const StereoSample* mix, uint32_t numSamples) {
 		return;
 	}
 
-	// Producer and consumer are both cooperative tasks on one core, so neither can interleave with the other and
-	// the single-writer pointers below need no barrier. That is a property of the scheduler, not of the pointers:
-	// moving either side into an interrupt would break it.
+	// The consumer runs in the USB completion interrupt, so it can interleave with this at any instruction. What
+	// makes that safe is the pointers rather than the scheduler: one writer each, 32-bit aligned, and each is
+	// advanced only after its own data is in place, which is the ordinary single-producer/single-consumer ring.
+	// Both sides run on the same core, so there is no cache to reconcile - only the compiler, which volatile holds.
 
 	uint32_t w = writeFrame;
 	for (uint32_t i = 0; i < numSamples; i++) {
