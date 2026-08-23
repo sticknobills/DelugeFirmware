@@ -35,6 +35,7 @@ extern "C" {
 extern uint16_t g_usb_peri_connected;
 extern uint16_t g_usb_pstd_alt_num[];
 usb_er_t usb_pstd_transfer_start(usb_utr_t* ptr);
+void usb_pstd_forced_termination(uint16_t pipe, uint16_t status);
 usb_regadr_t usb_hstd_get_usb_ip_adr(uint16_t ipno);
 }
 
@@ -135,12 +136,28 @@ PipeRegisters readPipeRegisters() {
 	return PipeRegisters{*pipectr, reg->BEMPENB, reg->NRDYSTS, reg->FRMNUM};
 }
 
+/// PIPEnCTR bits and the driver's transfer-status codes, named here rather than by including the driver's private
+/// headers, which do not compile as C++.
+constexpr uint16_t kPipeCtrInBufM = 0x4000u; ///< The IN buffer still holds data for the host.
+constexpr uint16_t kPipeCtrPBusy = 0x0020u;  ///< A transaction is in progress on the pipe.
+constexpr uint16_t kUsbDataStop = 8u;        ///< USB_DATA_STOP, r_usb_basic_define.h.
+
 /// The same registers frozen at the last completion the driver handed back. The stream wedges with the host still
 /// polling, so the live values are the dead state and these are the working one. A pipe that went bad before it
 /// stopped and a pipe that looks healthy and simply stopped being asked want opposite fixes, and only the pair
 /// tells them apart.
 PipeRegisters regsAtLastCompletion = {};
 bool regsSnapshotTaken = false;
+
+/// Consecutive passes on which the pipe has looked abandoned, how many such passes there have been, and how often
+/// one was acted on. Recovering on a single reading would risk ending a transfer that is genuinely live, which is
+/// what froze the machine on 2026-08-22; two readings a millisecond apart cost nothing and cannot catch a transient.
+///
+/// A recovery runs the completion callback through the driver, so statCompletes counts it too - real completions
+/// are statCompletes minus statAbandonedEnded.
+uint32_t stuckPasses = 0;
+uint32_t statAbandonedSeen = 0;
+uint32_t statAbandonedEnded = 0;
 
 void transferComplete(usb_utr_t* /*ptr*/, uint16_t /*data1*/, uint16_t /*data2*/) {
 	statCompletes++;
@@ -161,6 +178,41 @@ void submit(const uint8_t* data, uint32_t bytes) {
 	// Always USB_OK in practice - every guard in that function is compiled out - so this records the
 	// code rather than relying on it. Kept as one call site so the flag cannot be set in two places.
 	transferInFlight = (err == USB_OK);
+}
+
+/// Ends a transfer the hardware has already finished with but never reported.
+///
+/// An isochronous IN transaction that the device is not ready for ends with a not-ready event rather than the
+/// buffer-empty one that carries our completion. This driver neither enables nor handles not-ready - the case is
+/// commented out in usb_pstd_interrupt under a note that it is unneeded "unless we use ISO endpoints" - so the
+/// transfer stays outstanding for good and the stream stops. Measured 2026-08-23: pipe enabled, buffer empty,
+/// nothing in progress, and the task still holding its in-flight flag.
+///
+/// The three conditions are checked together because the not-ready latch alone does not mean the transfer ended.
+/// An empty IN buffer and an idle pipe are the hardware saying it has nothing outstanding while we think it has.
+void endAbandonedTransfer() {
+	const uint16_t pipeBit = (uint16_t)(1u << USB_CFG_PAUDIO_ISO_IN);
+	const PipeRegisters regs = readPipeRegisters();
+
+	if ((regs.nrdysts & pipeBit) == 0 || (regs.pipectr & (kPipeCtrInBufM | kPipeCtrPBusy)) != 0) {
+		stuckPasses = 0;
+		return;
+	}
+	statAbandonedSeen++;
+
+	if (++stuckPasses < 2) {
+		return;
+	}
+	stuckPasses = 0;
+
+	usb_regadr_t reg = usb_hstd_get_usb_ip_adr(USB_CFG_USE_USBIP);
+	reg->NRDYSTS = (uint16_t)~pipeBit; // Cleared by writing 0 to the bit, 1 everywhere else.
+
+	statAbandonedEnded++;
+	// Through the driver's own path rather than by clearing our flag: that releases g_p_usb_pipe too, and
+	// submitting over a pipe the driver still believes is busy is what froze the machine on 2026-08-22.
+	usb_pstd_forced_termination(USB_CFG_PAUDIO_ISO_IN, kUsbDataStop);
+	transferInFlight = false;
 }
 
 /// Diagnostic for USB Audio Class bring-up: reports every control request the host sends, over the SysEx debug
@@ -284,6 +336,10 @@ void reportStats() {
 	emitDec(usbBrdyAudioCount);
 	emit(" ur");
 	emitDec(statUnderruns);
+	emit(" nrs");
+	emitDec(statAbandonedSeen);
+	emit(" nre");
+	emitDec(statAbandonedEnded);
 	emit(" rs");
 	emitDec(statResyncs);
 	emit(" lead");
@@ -336,6 +392,8 @@ void reportStats() {
 	statPrimeSilence = 0;
 	statCompletes = 0;
 	statSubmits = 0;
+	statAbandonedSeen = 0;
+	statAbandonedEnded = 0;
 	usbBempNonZeroCount = 0;
 	usbBempAudioCount = 0;
 	usbBrdyNonZeroCount = 0;
@@ -380,6 +438,7 @@ void USBAudioStream::routine() {
 
 	if (transferInFlight) {
 		statInFlight++;
+		endAbandonedTransfer();
 		return;
 	}
 
