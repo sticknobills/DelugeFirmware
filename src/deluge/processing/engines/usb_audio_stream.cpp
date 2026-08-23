@@ -182,19 +182,22 @@ void submit(const uint8_t* data, uint32_t bytes) {
 
 /// Ends a transfer the hardware has already finished with but never reported.
 ///
-/// An isochronous IN transaction that the device is not ready for ends with a not-ready event rather than the
-/// buffer-empty one that carries our completion. This driver neither enables nor handles not-ready - the case is
-/// commented out in usb_pstd_interrupt under a note that it is unneeded "unless we use ISO endpoints" - so the
-/// transfer stays outstanding for good and the stream stops. Measured 2026-08-23: pipe enabled, buffer empty,
-/// nothing in progress, and the task still holding its in-flight flag.
+/// An isochronous IN the device is not ready for ends with a not-ready event rather than the buffer-empty one that
+/// carries our completion, and usb_pstd_interrupt_handler clears every not-ready bit and returns "all dealt with"
+/// before usb_pstd_interrupt is ever called. So nothing downstream can see one, and a transfer ended that way stays
+/// outstanding for good.
 ///
-/// The three conditions are checked together because the not-ready latch alone does not mean the transfer ended.
-/// An empty IN buffer and an idle pipe are the hardware saying it has nothing outstanding while we think it has.
+/// Detected from the pipe instead: an empty IN buffer and an idle pipe, while we still hold the in-flight flag, is
+/// the hardware saying it has nothing outstanding while we think it has. That is the measured stall state exactly
+/// (PIPE1CTR 0x8001, 2026-08-23), and it does not need the not-ready bit, which cannot be caught from a task -
+/// polling for it saw it on 5 to 9 passes a second out of a thousand because the handler wipes it in between.
+///
+/// Two consecutive passes, because there is a microsecond between the host taking a packet and the interrupt that
+/// says so, in which a healthy transfer looks like this one. A millisecond apart, both readings cannot land in it.
 void endAbandonedTransfer() {
-	const uint16_t pipeBit = (uint16_t)(1u << USB_CFG_PAUDIO_ISO_IN);
 	const PipeRegisters regs = readPipeRegisters();
 
-	if ((regs.nrdysts & pipeBit) == 0 || (regs.pipectr & (kPipeCtrInBufM | kPipeCtrPBusy)) != 0) {
+	if ((regs.pipectr & (kPipeCtrInBufM | kPipeCtrPBusy)) != 0) {
 		stuckPasses = 0;
 		return;
 	}
@@ -204,9 +207,6 @@ void endAbandonedTransfer() {
 		return;
 	}
 	stuckPasses = 0;
-
-	usb_regadr_t reg = usb_hstd_get_usb_ip_adr(USB_CFG_USE_USBIP);
-	reg->NRDYSTS = (uint16_t)~pipeBit; // Cleared by writing 0 to the bit, 1 everywhere else.
 
 	statAbandonedEnded++;
 	// Through the driver's own path rather than by clearing our flag: that releases g_p_usb_pipe too, and
