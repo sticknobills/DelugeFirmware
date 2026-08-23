@@ -24,6 +24,8 @@
 #include <cstring>
 
 extern "C" {
+#include "RZA1/system/iodefine.h"
+#include "RZA1/system/iodefines/usb20_iodefine.h"
 #include "RZA1/usb/r_usb_basic/r_usb_basic_if.h"
 #include "deluge/drivers/usb/usb_setup_trace.h"
 #include "deluge/drivers/usb/userdef/r_usb_paudio_config.h"
@@ -117,9 +119,34 @@ uint32_t statCompletes = 0;
 uint32_t statSubmits = 0;
 uint32_t statLastErr = 0xFFFF;
 
+/// The audio pipe's own state, straight off the hardware. Five readings of the driver source have produced one
+/// right answer and four wrong ones on this stream; these registers are what the chip itself says.
+struct PipeRegisters {
+	uint16_t pipectr; ///< PID, buffer status, INBUFM - whether the pipe is armed and holding data.
+	uint16_t bempenb; ///< Which pipes may still raise a send-complete interrupt.
+	uint16_t nrdysts; ///< Not-ready events. Latched by the chip whether or not the interrupt is unmasked.
+	uint16_t frmnum;  ///< Frame counter, and the OVRN bit an isochronous over- or under-run sets.
+};
+
+PipeRegisters readPipeRegisters() {
+	usb_regadr_t reg = usb_hstd_get_usb_ip_adr(USB_CFG_USE_USBIP);
+	// PIPEnCTR are contiguous from PIPE1CTR, one per pipe, which is how the driver indexes them itself.
+	volatile uint16_t* pipectr = &reg->PIPE1CTR + (USB_CFG_PAUDIO_ISO_IN - 1);
+	return PipeRegisters{*pipectr, reg->BEMPENB, reg->NRDYSTS, reg->FRMNUM};
+}
+
+/// The same registers frozen at the last completion the driver handed back. The stream wedges with the host still
+/// polling, so the live values are the dead state and these are the working one. A pipe that went bad before it
+/// stopped and a pipe that looks healthy and simply stopped being asked want opposite fixes, and only the pair
+/// tells them apart.
+PipeRegisters regsAtLastCompletion = {};
+bool regsSnapshotTaken = false;
+
 void transferComplete(usb_utr_t* /*ptr*/, uint16_t /*data1*/, uint16_t /*data2*/) {
 	statCompletes++;
 	transferInFlight = false;
+	regsAtLastCompletion = readPipeRegisters();
+	regsSnapshotTaken = true;
 }
 
 /// Submits one packet and reports whether the driver accepted it. The flag is only held when it
@@ -263,6 +290,44 @@ void reportStats() {
 	emitDec((writeFrame - readFrame) & kRingMask);
 	*p = '\0';
 	Debug::sysexDebugPrint(*Debug::midiDebugCable, line, true);
+
+	// Second line rather than more fields on the first: at full counter width that one already runs near its
+	// buffer, and growing a fixed-size debug line past it is the likeliest cause of the freeze on 2026-08-22.
+	// Live values first, then the same registers as they stood at the last completion.
+	char regLine[128];
+	p = regLine;
+	auto emitHex = [&p](uint32_t v) {
+		for (int shift = 12; shift >= 0; shift -= 4) {
+			*p++ = "0123456789ABCDEF"[(v >> shift) & 0xF];
+		}
+	};
+
+	const PipeRegisters now = readPipeRegisters();
+	emit("AUR pc");
+	emitHex(now.pipectr);
+	emit(" be");
+	emitHex(now.bempenb);
+	emit(" nr");
+	emitHex(now.nrdysts);
+	emit(" fn");
+	emitHex(now.frmnum);
+	// Dashes rather than zeros when no completion has ever happened: a zero reading and no reading at all are
+	// different findings, and this build exists because they have been confused before.
+	if (regsSnapshotTaken) {
+		emit(" Lpc");
+		emitHex(regsAtLastCompletion.pipectr);
+		emit(" Lbe");
+		emitHex(regsAtLastCompletion.bempenb);
+		emit(" Lnr");
+		emitHex(regsAtLastCompletion.nrdysts);
+		emit(" Lfn");
+		emitHex(regsAtLastCompletion.frmnum);
+	}
+	else {
+		emit(" Lpc---- Lbe---- Lnr---- Lfn----");
+	}
+	*p = '\0';
+	Debug::sysexDebugPrint(*Debug::midiDebugCable, regLine, true);
 
 	statPacketsSent = 0;
 	statFramesSent = 0;
