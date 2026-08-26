@@ -188,6 +188,50 @@ PipeRegisters readPipeRegisters() {
 	return PipeRegisters{*pipectr, reg->BEMPENB, reg->NRDYSTS, reg->FRMNUM};
 }
 
+/// CFIFOCTR and CFIFOSEL bits, named here rather than by including the driver's private headers.
+constexpr uint16_t kFifoCtrFrdy = 0x2000u;    ///< b13: a buffer plane is free to be written into.
+constexpr uint16_t kFifoSelCurPipe = 0x000Fu; ///< b2-0: which pipe the shared CPU FIFO port points at.
+
+/// What the CPU-side FIFO port says immediately after a packet has been written and committed.
+///
+/// The pipe holds two planes. FRDY set afterwards means one is still free, FRDY clear means both hold data - so
+/// a submit that reached a second plane reads clear and a submit that overwrote the first reads set. That is the
+/// outcome the second-plane question turns on, and the distinction a counter on the loading code cannot make.
+///
+/// fifosel is carried with it because the port is shared with MIDI: a reading taken while it points at another
+/// pipe describes that pipe's FIFO, and is discarded rather than counted.
+struct FifoProbe {
+	uint16_t fifoctr;
+	uint16_t fifosel;
+	uint16_t pipectr;
+};
+
+/// Three volatile reads, no writes and no selector steering, so this cannot change what the pipe does. Steering
+/// the selector here would - the driver's own send path owns it.
+FifoProbe readFifoProbe() {
+	usb_regadr_t reg = usb_hstd_get_usb_ip_adr(USB_CFG_USE_USBIP);
+	volatile uint16_t* pipectr = &reg->PIPE1CTR + (USB_CFG_PAUDIO_ISO_IN - 1);
+	return FifoProbe{reg->CFIFOCTR, reg->CFIFOSEL, *pipectr};
+}
+
+bool fifoProbeIsOurs(const FifoProbe& probe) {
+	return (probe.fifosel & kFifoSelCurPipe) == USB_CFG_PAUDIO_ISO_IN;
+}
+
+/// Every submit's outcome. Index 1 is a plane still free afterwards, index 0 both planes full. One packet is in
+/// flight at a time, so this reads all-1 unless the depth ever actually grows.
+uint32_t statFrdyAfterSubmit[2] = {};
+uint32_t statProbeNotOurs = 0;
+
+/// The readings either side of the one packet that loads the second plane, latched rather than counted.
+///
+/// It happens once per stream, and the marker built for the same question last session fired outside the
+/// recording window - where zero of them is indistinguishable from it never having happened. These are held from
+/// the moment they are taken and printed on every report after it, so no window can miss them.
+FifoProbe planeProbeFirst = {};
+FifoProbe planeProbeSecond = {};
+bool planeProbeTaken = false;
+
 /// The audio pipe's static configuration - how the endpoint is set up, as against what it is doing. Delivery sits
 /// at exactly one packet every two frames with the task running 1840 times a second and the ring never empty,
 /// which is a shape no amount of CPU explains; these are the registers that decide how many packets the pipe can
@@ -314,8 +358,15 @@ void transferComplete(usb_utr_t* /*ptr*/, uint16_t /*data1*/, uint16_t /*data2*/
 		if (!secondPlaneLoaded) {
 			secondPlaneLoaded = true;
 			statSecondPlaneLoads++;
+			// Either side of the second write, so the pair says what that write changed rather than what the state
+			// happened to be. The first is taken after this completion's own refill has already gone in.
+			const FifoProbe before = readFifoProbe();
 			taggingSecondPlane = true;
 			sendNextPacket();
+			const FifoProbe after = readFifoProbe();
+			planeProbeFirst = before;
+			planeProbeSecond = after;
+			planeProbeTaken = true;
 		}
 	}
 }
@@ -329,6 +380,15 @@ void submit(const uint8_t* data, uint32_t bytes) {
 	statSubmits++;
 	const usb_er_t err = usb_pstd_transfer_start(&transfer);
 	statLastErr = (uint32_t)err;
+	// submit() returns with the packet already in a plane and BVAL set, so this reads whether a plane is left
+	// free rather than whether the write happened at all.
+	const FifoProbe probe = readFifoProbe();
+	if (fifoProbeIsOurs(probe)) {
+		statFrdyAfterSubmit[(probe.fifoctr & kFifoCtrFrdy) != 0u ? 1u : 0u]++;
+	}
+	else {
+		statProbeNotOurs++;
+	}
 	// Always USB_OK in practice - every guard in that function is compiled out - so this records the
 	// code rather than relying on it. Kept as one call site so the flag cannot be set in two places.
 	transferInFlight = (err == USB_OK);
@@ -691,6 +751,37 @@ void reportStats() {
 	*p = '\0';
 	Debug::sysexDebugPrint(*Debug::midiDebugCable, timingLine, true);
 
+	// Fifth line, own buffer for the same reason as the third and fourth. fr1/fr0 are every submit's outcome; the
+	// latched f/pc pair is the second-plane answer, and FRDY (0x2000) still set in f2 says a plane was free after
+	// the second write, which means it did not reach one.
+	char planeLine[160];
+	p = planeLine;
+	emit("AUP fr1:");
+	emitDec(statFrdyAfterSubmit[1]);
+	emit(" fr0:");
+	emitDec(statFrdyAfterSubmit[0]);
+	emit(" bad:");
+	emitDec(statProbeNotOurs);
+	if (planeProbeTaken) {
+		emit(" f1:");
+		emitHex(planeProbeFirst.fifoctr);
+		emit(" pc1:");
+		emitHex(planeProbeFirst.pipectr);
+		emit(" f2:");
+		emitHex(planeProbeSecond.fifoctr);
+		emit(" pc2:");
+		emitHex(planeProbeSecond.pipectr);
+		emit(" s:");
+		emitHex(planeProbeSecond.fifosel);
+	}
+	else {
+		// Dashes rather than zeros: the pair not having been taken and a pair of zero readings are different
+		// findings, which is the confusion this whole build exists to end.
+		emit(" f1---- pc1---- f2---- pc2---- s----");
+	}
+	*p = '\0';
+	Debug::sysexDebugPrint(*Debug::midiDebugCable, planeLine, true);
+
 	statPacketsSent = 0;
 	statFramesSent = 0;
 	statAlt1 = 0;
@@ -710,6 +801,9 @@ void reportStats() {
 	for (uint32_t i = 0; i < 5; i++) {
 		statCompletionGap[i] = 0;
 	}
+	statFrdyAfterSubmit[0] = 0;
+	statFrdyAfterSubmit[1] = 0;
+	statProbeNotOurs = 0;
 	// usbBempBitsSeen is deliberately not cleared: which pipes are live at all is the question, not how often.
 }
 
@@ -747,6 +841,7 @@ void USBAudioStream::routine() {
 		pipeConfigRead = false;
 		lastCompletionFrameValid = false;
 		secondPlaneLoaded = false;
+		planeProbeTaken = false;
 		readFrame = writeFrame;
 		return;
 	}
