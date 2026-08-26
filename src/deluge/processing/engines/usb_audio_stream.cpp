@@ -221,20 +221,43 @@ uint32_t statCompletes = 0;
 uint32_t statSubmits = 0;
 uint32_t statLastErr = 0xFFFF;
 
-/// Stamped into channel 3 of every audio frame of every packet, so the host's own recording says which packets
-/// actually arrived rather than the driver saying which it thinks it sent.
+/// DIAGNOSTIC. Stamps the producer's own frame count into the ring, so a recording says what fraction of the
+/// audio the Deluge rendered actually reached the host.
 ///
-/// Delivery runs at exactly half the host's frame rate and cpl, sub and pkt all agree with each other - but those
-/// are all our side of the wire. A host substitutes silence for a packet that never lands, so a contiguous
-/// sequence in the recording and a sequence missing every other value look identical in every counter we have.
-/// This is the first instrument here that reads what the host received rather than what we submitted.
-uint16_t packetSequence = 0;
+/// The previous stamp was written by the packet builder into the packet, which made it circular: it counted our
+/// own output, so a stream delivering half the audio and one delivering all of it read alike at the host. This
+/// counts the other end of the pipeline. A frame the builder discards at a resync simply never appears, and the
+/// gap in the numbers is the loss.
+///
+/// Stamped per block of frames rather than per frame, because the host's capture path is not sample-exact: a
+/// value that changed every frame could not survive it, while a run of identical values loses at most its edges.
+/// 64 frames is 1.45 ms of resolution, far finer than the effect being measured.
+constexpr uint32_t kStampBlockShift = 6;
 
-/// The capture path dithers every sample by +/-1, so all three of these have to survive that. The scale puts a
-/// step of 8 between consecutive sequence numbers, and the two marks sit far from each other and far from the
-/// zero the host writes when it substitutes silence for a packet that never arrived.
-constexpr int16_t kSequenceScale = 8;
-constexpr int16_t kNormalMark = 8000;
+/// Thirteen bits per channel at a step of 8, split low and high across two channels: 26 bits of block count is
+/// 25 hours before it wraps, so a capture never has to reason about a wrap at all.
+constexpr uint32_t kStampBits = 13;
+constexpr uint32_t kStampMask = (1u << kStampBits) - 1u;
+
+/// The capture path dithers every sample by +/-1, so every value here has to survive that. A step of 8 does, and
+/// the marks sit far from each other and far from the zero a host writes when it substitutes silence.
+constexpr int16_t kStampScale = 8;
+
+/// What wrote this frame. The host's own substituted silence carries none of these, which is what separates
+/// "we never sent it" from "we sent silence deliberately" - two very different faults that a zeroed channel
+/// cannot tell apart.
+constexpr int16_t kMarkRendered = 8000;       ///< carries audio the engine produced
+constexpr int16_t kMarkDeviceSilence = 24000; ///< a packet we sent with nothing to put in it
+
+/// Centred on the signed range so all 13 bits are usable.
+int16_t encodeStamp(uint32_t value) {
+	return (int16_t)((int32_t)(value & kStampMask) * kStampScale - 32768);
+}
+
+/// Cached so the encoding runs once per block rather than once per frame.
+uint32_t stampBlock = 0xFFFFFFFFu;
+int16_t stampLow = 0;
+int16_t stampHigh = 0;
 
 /// The audio pipe's own state, straight off the hardware. Five readings of the driver source have produced one
 /// right answer and four wrong ones on this stream; these registers are what the chip itself says.
@@ -487,24 +510,21 @@ void submit(const uint8_t* data, uint32_t bytes) {
 	transferInFlight = (err == USB_OK);
 }
 
-/// Writes this packet's sequence number into channel 3 of every audio frame, and marks channel 4 when this is the
-/// packet that loads the second buffer plane.
+/// DIAGNOSTIC. Marks a packet the device sent with nothing real in it.
 ///
-/// Channels 3 upwards already carry the diagnostic constants and nothing real, so this costs no audio. Channels 1
-/// and 2 are untouched - the mix has to stay listenable for the recording to be worth anything else.
-void stampSequence(uint8_t* buffer, uint32_t frames) {
+/// A packet of deliberate silence and a packet that never arrived reach the host as the same zeroes, and they
+/// mean opposite things - one is the transport keeping the endpoint answering, the other is the transport
+/// failing. Only the device can write this mark, so the recording separates them.
+///
+/// Channels 3 upwards carry diagnostics and nothing real, so this costs no audio. Channels 1 and 2 are
+/// untouched: the mix has to stay listenable for the recording to be worth anything else.
+void markDeviceSilence(uint8_t* buffer, uint32_t frames) {
 	int16_t* samples = (int16_t*)buffer;
-	// Scaled, because the capture path is not bit-exact: every constant channel comes back dithered by +/-1 LSB,
-	// and an unscaled counter cannot tell that wobble from a real step to the next packet. A step of 8 survives it.
-	// 12 bits of sequence at 8x fills the 15-bit range, which wraps every ~8 s at 500 packets/s - the decoder
-	// takes the step modulo that.
-	const int16_t sequence = (int16_t)((packetSequence & 0x0FFFu) * kSequenceScale);
-	const int16_t mark = kNormalMark;
 	for (uint32_t f = 0; f < frames; f++) {
-		samples[f * kChannels + 2] = sequence;
-		samples[f * kChannels + 3] = mark;
+		samples[f * kChannels + 2] = 0;
+		samples[f * kChannels + 3] = 0;
+		samples[f * kChannels + 4] = kMarkDeviceSilence;
 	}
-	packetSequence++;
 }
 
 /// Builds one packet from the ring and hands it to the endpoint.
@@ -542,7 +562,7 @@ uint32_t buildNextPacket(uint8_t* buffer) {
 		if (available < kLeadFrames) {
 			statPrimeSilence++;
 			memset(buffer, 0, frames * kFrameBytes);
-			stampSequence(buffer, frames);
+			markDeviceSilence(buffer, frames);
 			return frames;
 		}
 		primed = true;
@@ -575,7 +595,7 @@ uint32_t buildNextPacket(uint8_t* buffer) {
 		// nothing, so the endpoint keeps answering, and do not advance the read pointer.
 		statUnderruns++;
 		memset(buffer, 0, frames * kFrameBytes);
-		stampSequence(buffer, frames);
+		markDeviceSilence(buffer, frames);
 		return frames;
 	}
 
@@ -598,7 +618,6 @@ uint32_t buildNextPacket(uint8_t* buffer) {
 	statPacketsSent++;
 	statFramesSent += send;
 
-	stampSequence(buffer, send);
 	return send;
 }
 
@@ -1254,6 +1273,18 @@ void USBAudioStream::feedMix(const StereoSample* mix, uint32_t numSamples) {
 		// The samples handed here are already at output scale, so this is only a width reduction.
 		frame[0] = (int16_t)(mix[i].l >> 16);
 		frame[1] = (int16_t)(mix[i].r >> 16);
+		// DIAGNOSTIC. The producer's own frame count, travelling with the audio it belongs to. Whatever reaches
+		// the host carries the number of the frame the engine rendered, so the recording alone says which frames
+		// were delivered and which were dropped on the way. Remove with the rest of the diagnostics.
+		const uint32_t block = w >> kStampBlockShift;
+		if (block != stampBlock) {
+			stampBlock = block;
+			stampLow = encodeStamp(block);
+			stampHigh = encodeStamp(block >> kStampBits);
+		}
+		frame[2] = stampLow;
+		frame[3] = stampHigh;
+		frame[4] = kMarkRendered;
 		w++;
 	}
 	writeFrame = w;
