@@ -31,6 +31,7 @@ volatile uint32_t usbBempNonZeroCount = 0;
 volatile uint32_t usbBempAudioCount = 0;
 volatile uint32_t usbBempBitsSeen = 0;
 volatile uint32_t usbBempAudioStall = 0;
+volatile uint32_t usbBempAudioDeferred = 0;
 volatile uint32_t usbBrdyNonZeroCount = 0;
 volatile uint32_t usbBrdyAudioCount = 0;
 

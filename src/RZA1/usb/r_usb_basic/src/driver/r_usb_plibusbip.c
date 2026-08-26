@@ -1274,6 +1274,7 @@ void usb_pstd_bemp_pipe_process_paudio(uint16_t bitsts)
      * rather than ending the transfer here is what the stock handler does for this pipe range. */
     if ((hw_usb_read_pipectr(USB_NULL, pipe) & USB_INBUFM) == USB_INBUFM)
     {
+        usbBempAudioDeferred++;
         hw_usb_set_bempenb(USB_NULL, pipe);
         return;
     }

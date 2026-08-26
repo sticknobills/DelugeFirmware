@@ -65,6 +65,10 @@ extern volatile uint32_t usbBempAudioCount;
 extern volatile uint32_t usbBempBitsSeen;
 /// Audio-pipe interrupts that found the pipe stalled.
 extern volatile uint32_t usbBempAudioStall;
+/// Audio-pipe interrupts that found the other buffer plane still holding data, and so re-armed instead of ending
+/// the transfer. This branch can only run when two packets are resident at once, which makes it the direct answer
+/// to whether a second plane is ever loaded - a thing no counter on the loading code can say.
+extern volatile uint32_t usbBempAudioDeferred;
 
 /// Every non-zero-pipe BRDY interrupt. This is the other interrupt that carries a transfer forward, and the driver
 /// enables it in place of BEMP whenever a packet does not finish writing in one pass.

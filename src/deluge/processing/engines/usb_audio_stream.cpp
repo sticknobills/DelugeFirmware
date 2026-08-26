@@ -232,6 +232,16 @@ FifoProbe planeProbeFirst = {};
 FifoProbe planeProbeSecond = {};
 bool planeProbeTaken = false;
 
+/// The gaps of the three completions that follow the one-shot load, in order, latched for the same reason.
+///
+/// Two resident packets go out on consecutive frames and only the second empties the pipe, so the completion
+/// covering them arrives later than the steady two frames. Delivery is a metronome at two, so a three here is a
+/// deviation the stream does not otherwise produce. Three of them rather than one: the depth returns to one
+/// straight after, and the gaps either side are what say the deviation belongs to the load.
+uint32_t planeGapAfter[3] = {};
+uint32_t planeGapAfterCount = 0;
+bool planeGapArmed = false;
+
 /// The audio pipe's static configuration - how the endpoint is set up, as against what it is doing. Delivery sits
 /// at exactly one packet every two frames with the task running 1840 times a second and the ring never empty,
 /// which is a shape no amount of CPU explains; these are the registers that decide how many packets the pipe can
@@ -321,6 +331,9 @@ void transferComplete(usb_utr_t* /*ptr*/, uint16_t /*data1*/, uint16_t /*data2*/
 		// Bucketed rather than averaged: a steady two and an alternating one-and-three give the same mean and
 		// mean opposite things about where the packet is being lost.
 		statCompletionGap[gap > 4u ? 4u : gap]++;
+		if (planeGapArmed && planeGapAfterCount < 3u) {
+			planeGapAfter[planeGapAfterCount++] = gap;
+		}
 	}
 	lastCompletionFrame = frameAtCompletion;
 	lastCompletionFrameValid = true;
@@ -367,6 +380,9 @@ void transferComplete(usb_utr_t* /*ptr*/, uint16_t /*data1*/, uint16_t /*data2*/
 			planeProbeFirst = before;
 			planeProbeSecond = after;
 			planeProbeTaken = true;
+			// Armed at the end of this completion, so the next one's gap is the first one latched.
+			planeGapAfterCount = 0;
+			planeGapArmed = true;
 		}
 	}
 }
@@ -756,7 +772,11 @@ void reportStats() {
 	// the second write, which means it did not reach one.
 	char planeLine[160];
 	p = planeLine;
-	emit("AUP fr1:");
+	// dfr is cumulative and never cleared: whether a second plane has *ever* held data is the question, not how
+	// often, and a per-report count of zero would look the same as never having been armed.
+	emit("AUP dfr:");
+	emitDec(usbBempAudioDeferred);
+	emit(" fr1:");
 	emitDec(statFrdyAfterSubmit[1]);
 	emit(" fr0:");
 	emitDec(statFrdyAfterSubmit[0]);
@@ -773,11 +793,23 @@ void reportStats() {
 		emitHex(planeProbeSecond.pipectr);
 		emit(" s:");
 		emitHex(planeProbeSecond.fifosel);
+		emit(" g:");
+		for (uint32_t i = 0; i < 3u; i++) {
+			if (i < planeGapAfterCount) {
+				emitDec(planeGapAfter[i]);
+			}
+			else {
+				emit("-");
+			}
+			if (i < 2u) {
+				emit(",");
+			}
+		}
 	}
 	else {
 		// Dashes rather than zeros: the pair not having been taken and a pair of zero readings are different
 		// findings, which is the confusion this whole build exists to end.
-		emit(" f1---- pc1---- f2---- pc2---- s----");
+		emit(" f1---- pc1---- f2---- pc2---- s---- g:-,-,-");
 	}
 	*p = '\0';
 	Debug::sysexDebugPrint(*Debug::midiDebugCable, planeLine, true);
@@ -842,6 +874,8 @@ void USBAudioStream::routine() {
 		lastCompletionFrameValid = false;
 		secondPlaneLoaded = false;
 		planeProbeTaken = false;
+		planeGapArmed = false;
+		planeGapAfterCount = 0;
 		readFrame = writeFrame;
 		return;
 	}
