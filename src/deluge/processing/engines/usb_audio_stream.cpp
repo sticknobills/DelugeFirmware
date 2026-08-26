@@ -24,6 +24,8 @@
 #include <cstring>
 
 extern "C" {
+#include "OSLikeStuff/timers_interrupts/clock_type.h"
+#include "RZA1/ostm/ostm.h"
 #include "RZA1/system/iodefine.h"
 #include "RZA1/system/iodefines/usb20_iodefine.h"
 #include "RZA1/usb/r_usb_basic/r_usb_basic_if.h"
@@ -151,6 +153,25 @@ uint32_t statFramesDiscarded = 0;
 /// Every entry to buildNextPacket, against statPacketsSent which counts only the path that carries real
 /// audio. The sequence stamp advances once per entry and the host reads it advancing at twice the rate
 /// statPacketsSent reports, so one of the two is wrong about how often the builder runs.
+/// Where in the host's 1 ms frame the buffer plane becomes writable, and how long it stays that way.
+///
+/// Two moments have been tried and both were wrong: the microseconds straight after a write (never open across
+/// 291 polls) and the instant of the frame interrupt (mostly closed, v0.14.0, reverted). It is open on ~30% of
+/// task passes sampled at random phase, so it is open somewhere - and where decides whether a frame-driven
+/// write can ever land.
+///
+/// One bounded burst of just over a frame, roughly once a second, rather than continuous sampling: a 990-byte
+/// copy inside a 1 kHz interrupt is what made the Deluge itself stutter.
+constexpr uint32_t kProbeEveryPasses = 512u;
+constexpr uint32_t kTicksPerUs = DELUGE_CLOCKS_PER / 1000000u;
+constexpr uint32_t kProbeTicks = 1100u * kTicksPerUs;
+constexpr uint32_t kProbeMaxIterations = 60000u;
+constexpr uint32_t kPhaseBuckets = 10u; ///< 100 us each, covering one frame.
+uint32_t probeCountdown = kProbeEveryPasses;
+uint32_t statProbeBursts = 0;
+uint32_t statProbeOpenPhase[kPhaseBuckets] = {};
+uint32_t statProbeOpenDwell[kPhaseBuckets] = {};
+uint32_t statProbeNeverOpen = 0;
 uint32_t statBuilds = 0;
 uint32_t statResyncGenuine = 0;
 uint32_t statResyncOvertaken = 0;
@@ -933,6 +954,33 @@ void reportStats() {
 	*p = '\0';
 	Debug::sysexDebugPrint(*Debug::midiDebugCable, readyLine, true);
 
+	// Own buffer and own line: the AU line already runs well past half of its 256 bytes at full counter width,
+	// and growing a fixed-size debug line past its buffer is the likeliest cause of the freeze on 2026-08-22.
+	{
+		char probeLine[192];
+		p = probeLine;
+		emit("AUQ b");
+		emitDec(statProbeBursts);
+		emit(" none");
+		emitDec(statProbeNeverOpen);
+		emit(" ph");
+		for (uint32_t i = 0; i < kPhaseBuckets; i++) {
+			if (i != 0u) {
+				emit(",");
+			}
+			emitDec(statProbeOpenPhase[i]);
+		}
+		emit(" dw");
+		for (uint32_t i = 0; i < kPhaseBuckets; i++) {
+			if (i != 0u) {
+				emit(",");
+			}
+			emitDec(statProbeOpenDwell[i]);
+		}
+		*p = '\0';
+		Debug::sysexDebugPrint(*Debug::midiDebugCable, probeLine, true);
+	}
+
 	statPacketsSent = 0;
 	statFramesSent = 0;
 	statFramesIn = 0;
@@ -973,6 +1021,55 @@ void reportStats() {
 	statFrdyAfterSubmit[1] = 0;
 	statProbeNotOurs = 0;
 	// usbBempBitsSeen is deliberately not cleared: which pipes are live at all is the question, not how often.
+}
+
+/// One bounded look at the pipe across a whole host frame, at timer resolution.
+///
+/// Reads only - PIPE1CTR and FRMNUM are read at their own addresses without steering the shared FIFO port, so
+/// this cannot disturb MIDI, and nothing here writes a register. Bounded by elapsed time with an iteration cap
+/// behind it: an unbounded loop on a hardware flag is how the machine froze on 2026-08-22.
+void probeWindowPhase() {
+	const uint32_t start = getTimerValue(0);
+	uint16_t lastFrm = readFrameNumber();
+	uint32_t frameStart = 0;
+	bool frameStartValid = false;
+	bool wasOpen = (readPipeCtr() & kPipeCtrBsts) != 0u;
+	uint32_t openedAt = 0;
+	bool sawOpen = false;
+
+	for (uint32_t i = 0; i < kProbeMaxIterations; i++) {
+		const uint32_t now = getTimerValue(0);
+		if ((uint32_t)(now - start) >= kProbeTicks) {
+			break;
+		}
+
+		const uint16_t frm = readFrameNumber();
+		if (frm != lastFrm) {
+			lastFrm = frm;
+			frameStart = now;
+			frameStartValid = true;
+		}
+
+		const bool open = (readPipeCtr() & kPipeCtrBsts) != 0u;
+		if (open && !wasOpen) {
+			openedAt = now;
+			sawOpen = true;
+			if (frameStartValid) {
+				const uint32_t us = (uint32_t)(now - frameStart) / kTicksPerUs;
+				statProbeOpenPhase[us >= (kPhaseBuckets * 100u) ? (kPhaseBuckets - 1u) : (us / 100u)]++;
+			}
+		}
+		else if (!open && wasOpen && sawOpen) {
+			const uint32_t us = (uint32_t)(now - openedAt) / kTicksPerUs;
+			statProbeOpenDwell[us >= (kPhaseBuckets * 100u) ? (kPhaseBuckets - 1u) : (us / 100u)]++;
+		}
+		wasOpen = open;
+	}
+
+	statProbeBursts++;
+	if (!sawOpen) {
+		statProbeNeverOpen++;
+	}
 }
 
 } // namespace
@@ -1027,6 +1124,10 @@ void USBAudioStream::routine() {
 		}
 		else {
 			statExtraNoWindow++;
+		}
+		if (--probeCountdown == 0u) {
+			probeCountdown = kProbeEveryPasses;
+			probeWindowPhase();
 		}
 		endAbandonedTransfer();
 		return;
