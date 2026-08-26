@@ -132,7 +132,6 @@ uint8_t* nextPacketBuffer() {
 usb_utr_t transfer;
 bool transferInitialised = false;
 bool transferInFlight = false;
-bool sofEnabled = false;
 uint32_t frameAccumulator = 0;
 
 /// Stream health, reported over the SysEx debug channel. Silence costs nothing to render, so these only mean
@@ -152,11 +151,6 @@ uint32_t statFramesDiscarded = 0;
 /// Every entry to buildNextPacket, against statPacketsSent which counts only the path that carries real
 /// audio. The sequence stamp advances once per entry and the host reads it advancing at twice the rate
 /// statPacketsSent reports, so one of the two is wrong about how often the builder runs.
-/// Frame-interrupt driven writes: taken, and passed over because no plane was free. The host's own 1 kHz
-/// clock is the only thing in this system that is not downstream of our own output rate.
-uint32_t statSofWritten = 0;
-uint32_t statSofNoWindow = 0;
-uint32_t statSofSeen = 0;
 uint32_t statBuilds = 0;
 uint32_t statResyncGenuine = 0;
 uint32_t statResyncOvertaken = 0;
@@ -308,7 +302,6 @@ uint32_t lastCompletionFrame = 0;
 bool lastCompletionFrameValid = false;
 
 constexpr uint16_t kPipeCtrBsts = 0x8000u; ///< b15: the CPU may access the pipe's FIFO buffer.
-constexpr uint16_t kIntEnbSofe = 0x2000u;  ///< b13: frame-update interrupt, off in device mode by default.
 constexpr uint16_t kFifoCtrBval = 0x8000u; ///< b15: the plane just written holds a complete packet.
 constexpr uint16_t kUseCpuFifo = 0u;       ///< USB_CUSE - the CPU FIFO port, as against either DMA port.
 constexpr uint16_t kFifoError = 0xFFu;     ///< USB_FIFOERROR: the port never became ready.
@@ -376,10 +369,45 @@ void transferComplete(usb_utr_t* /*ptr*/, uint16_t /*data1*/, uint16_t /*data2*/
 	lastCompletionFrame = frameAtCompletion;
 	lastCompletionFrameValid = true;
 
-	// The next packet is not sent from here. Sending from the completion made every write downstream of a
-	// previous write's completion, so delivery could never exceed the rate it was already achieving - measured
-	// settling at 487 packets/s under load against the host's 1000/s, 2026-08-26. The frame interrupt drives
-	// the writes now, off the host's own clock, which is the only rate in this system we do not set ourselves.
+	// Hand the next packet over here rather than waiting for the task to come round again, so a transfer is
+	// outstanding at every instant. This was written to lift delivery above the ~470 packets/s measured against
+	// the host's 1000/s and did not move it at all - the shortfall is not the task's cadence. It earns its place
+	// for what it did do: the abandoned-transfer recovery below went from firing several times a second to never,
+	// on an idle machine.
+	//
+	// The copy this costs the interrupt is ~990 bytes at 1 kHz. Measured effect on the audio engine's own 2.9 ms
+	// deadline: see the underrun and resync counters, which is what the numbers below are for.
+	if (streamActive && transferInitialised) {
+		sendNextPacket();
+		// Measured across the write rather than timed, because what the chip cares about is which frame the write
+		// finished in, not how long it took - a fast write that lands after the SOF is as late as a slow one.
+		const uint32_t delta = (uint32_t)((readFrameNumber() - frameAtCompletion) & kFrameNumberMask);
+		statWriteFrameDelta[delta > 2u ? 2u : delta]++;
+
+		// Bounded rather than open: this runs inside the interrupt, and a loop whose length comes from the
+		// hardware is how the machine froze on 2026-08-22. 256 register reads is a few microseconds against the
+		// audio engine's 2.9 ms deadline, and the underrun and resync counters are what say whether it cost
+		// anything. Reads only - nothing here writes a register.
+		uint32_t iteration = 0;
+		for (; iteration < kReadyPollIterations; iteration++) {
+			const uint16_t ctr = readPipeCtr();
+			if ((ctr & kPipeCtrInBufM) == 0u) {
+				// The packet has already gone. Past this point a writable plane says nothing about whether one
+				// was ever free *while* a packet was pending, which is the question.
+				break;
+			}
+			if ((ctr & kPipeCtrBsts) != 0u) {
+				statPollFound++;
+				if (iteration < statPollFirstIteration) {
+					statPollFirstIteration = iteration;
+				}
+				break;
+			}
+		}
+		if (iteration >= kReadyPollIterations) {
+			statPollMissed++;
+		}
+	}
 }
 
 /// Submits one packet and reports whether the driver accepted it. The flag is only held when it
@@ -539,28 +567,6 @@ void sendNextPacket() {
 /// and the ring's read pointer has one writer by design, which this path would otherwise become the second of.
 /// The cost is a ~990-byte copy plus the FIFO write, a few microseconds against the 1 ms the endpoint is
 /// serviced on - the underrun, resync and recovery counters are what say whether it was affordable.
-/// Writes one packet straight into a free buffer plane. The caller owns the interrupt state: the FIFO port is
-/// shared with MIDI and the readiness check steers it to our pipe, so nothing may run in between.
-bool writeOnePlaneLocked() {
-	// A success returns the port's status word, which always has FRDY set and so is never 0xFF - the error
-	// value cannot collide with a real reading.
-	const uint16_t status = usb_cstd_is_set_frdy_rohan(USB_CFG_PAUDIO_ISO_IN);
-	if (status == kFifoError) {
-		// The window shut between the read that found it open and this one. Nothing built, nothing consumed.
-		statExtraRefused++;
-		return false;
-	}
-
-	const uint32_t frames = buildNextPacket(extraPacket);
-	usb_pstd_write_fifo((uint16_t)(frames * kFrameBytes), kUseCpuFifo, extraPacket);
-	if ((hw_usb_read_fifoctr(nullptr, kUseCpuFifo) & kFifoCtrBval) == 0u) {
-		// 990 bytes into a 1024-byte plane is short of the plane, so the hardware does not commit it by itself.
-		hw_usb_set_bval(nullptr, kUseCpuFifo);
-	}
-	statExtraWritten++;
-	return true;
-}
-
 void writeExtraPlane() {
 	__disable_irq();
 
@@ -571,7 +577,21 @@ void writeExtraPlane() {
 	//
 	// A success returns the port's status word, which always has FRDY set and so is never 0xFF - the error
 	// value cannot collide with a real reading.
-	writeOnePlaneLocked();
+	const uint16_t status = usb_cstd_is_set_frdy_rohan(USB_CFG_PAUDIO_ISO_IN);
+	if (status == kFifoError) {
+		// The window shut between the read that found it open and this one. Nothing built, nothing consumed.
+		statExtraRefused++;
+		__enable_irq();
+		return;
+	}
+
+	const uint32_t frames = buildNextPacket(extraPacket);
+	usb_pstd_write_fifo((uint16_t)(frames * kFrameBytes), kUseCpuFifo, extraPacket);
+	if ((hw_usb_read_fifoctr(nullptr, kUseCpuFifo) & kFifoCtrBval) == 0u) {
+		// 990 bytes into a 1024-byte plane is short of the plane, so the hardware does not commit it by itself.
+		hw_usb_set_bval(nullptr, kUseCpuFifo);
+	}
+	statExtraWritten++;
 
 	__enable_irq();
 }
@@ -744,12 +764,6 @@ void reportStats() {
 	emitDec(statAbandonedEnded);
 	emit(" rs");
 	emitDec(statResyncs);
-	emit(" sofs");
-	emitDec(statSofSeen);
-	emit(" sofw");
-	emitDec(statSofWritten);
-	emit(" sofn");
-	emitDec(statSofNoWindow);
 	emit(" bld");
 	emitDec(statBuilds);
 	emit(" rgen");
@@ -923,9 +937,6 @@ void reportStats() {
 	statFramesSent = 0;
 	statFramesIn = 0;
 	statFramesDiscarded = 0;
-	statSofSeen = 0;
-	statSofWritten = 0;
-	statSofNoWindow = 0;
 	statBuilds = 0;
 	statResyncGenuine = 0;
 	statResyncOvertaken = 0;
@@ -998,19 +1009,9 @@ void USBAudioStream::routine() {
 		pipeConfigRead = false;
 		lastCompletionFrameValid = false;
 		readFrame = writeFrame;
-		if (sofEnabled) {
-			usb_hstd_get_usb_ip_adr(USB_CFG_USE_USBIP)->INTENB0 &= (uint16_t)~kIntEnbSofe;
-			sofEnabled = false;
-		}
 		return;
 	}
 	streamActive = true;
-	// Enabled here rather than at init: a Deluge with nothing plugged in should not pay 1000 interrupts a second
-	// for a stream no host has asked for.
-	if (!sofEnabled && transferInitialised) {
-		usb_hstd_get_usb_ip_adr(USB_CFG_USE_USBIP)->INTENB0 |= kIntEnbSofe;
-		sofEnabled = true;
-	}
 	statAlt1++;
 
 	if (transferInFlight) {
@@ -1021,9 +1022,10 @@ void USBAudioStream::routine() {
 		statReadyState[(((ctr & kPipeCtrBsts) != 0u) ? 2u : 0u) | (((ctr & kPipeCtrInBufM) != 0u) ? 1u : 0u)]++;
 		// Data pending and a plane writable: the second plane can be loaded now, and this is the only moment it
 		// can be. Anything else is either nothing to double up on or a port that would refuse the write.
-		// The frame interrupt owns the writes now. This stays as the readiness sample only: two sources writing
-		// the same FIFO port would race, and the task's rate is exactly what the frame clock replaces.
-		if ((ctr & (kPipeCtrBsts | kPipeCtrInBufM)) != (kPipeCtrBsts | kPipeCtrInBufM)) {
+		if ((ctr & (kPipeCtrBsts | kPipeCtrInBufM)) == (kPipeCtrBsts | kPipeCtrInBufM)) {
+			writeExtraPlane();
+		}
+		else {
 			statExtraNoWindow++;
 		}
 		endAbandonedTransfer();
@@ -1068,28 +1070,6 @@ void USBAudioStream::feedMix(const StereoSample* mix, uint32_t numSamples) {
 }
 
 } // namespace deluge::processing::engines
-
-/// Called from the peripheral interrupt handler on every host frame - 1000 times a second, from the host's own
-/// clock rather than from anything this machine sets.
-///
-/// Interrupts are already off here, so the plane write is called in its locked form. The readiness read is one
-/// register access and returns immediately when no plane is free, which is the common case: the point is to be
-/// present at every frame, not to write at every frame.
-extern "C" void usbAudioStreamStartOfFrame() {
-	using namespace deluge::processing::engines;
-	statSofSeen++;
-	if (!streamActive || !transferInitialised) {
-		return;
-	}
-	const uint16_t ctr = readPipeCtr();
-	if ((ctr & kPipeCtrBsts) == 0u) {
-		statSofNoWindow++;
-		return;
-	}
-	if (writeOnePlaneLocked()) {
-		statSofWritten++;
-	}
-}
 
 extern "C" void usbAudioStreamRoutine() {
 	deluge::processing::engines::USBAudioStream::routine();

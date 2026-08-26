@@ -296,13 +296,11 @@ int usb_pstd_interrupt_handler(uint16_t* type, uint16_t* status)
         /* SOFR Clear */
 #if USB_CFG_USE_USBIP == USB_CFG_IP0
         USB200.INTSTS0 = (uint16_t)~USB_SOFR;
-#else  /* USB_CFG_USE_USBIP == USB_CFG_IP1 */
+#else             /* USB_CFG_USE_USBIP == USB_CFG_IP1 */
         USB201.INTSTS0 = (uint16_t)~USB_SOFR;
-#endif /* USB_CFG_USE_USBIP == USB_CFG_IP1 */
-        // The USB audio stream writes its next packet here. This is the host's own 1 kHz clock, and it is the
-        // only rate in the system that is not downstream of the device's own output - see usb_audio_stream.cpp.
-        usbAudioStreamStartOfFrame();
+#endif            /* USB_CFG_USE_USBIP == USB_CFG_IP1 */
         return 1; // SOFR interrupts don't result in any action when processed. Rohan
+        *type = USB_INT_SOFR;
     }
 
     /***** Processing device state *****/

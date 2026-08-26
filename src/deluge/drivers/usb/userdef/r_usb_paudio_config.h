@@ -40,14 +40,3 @@
 // First 64-byte buffer block. MIDI holds blocks 8-15 and 72-79; double buffering doubles the
 // allocation, so 1024 bytes occupies 16-47, clear of both.
 #define USB_CFG_PAUDIO_BUF_START (16u)
-
-// Called from the peripheral interrupt handler's frame branch, 1000 times a second, to write the
-// next audio packet off the host's own clock. Declared here because that handler already includes
-// this file and is otherwise vendored C.
-#ifdef __cplusplus
-extern "C" {
-#endif
-void usbAudioStreamStartOfFrame(void);
-#ifdef __cplusplus
-}
-#endif
