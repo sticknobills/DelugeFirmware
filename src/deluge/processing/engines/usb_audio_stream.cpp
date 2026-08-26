@@ -197,6 +197,7 @@ bool audioTimerRunning = false;
 /// nothing but the race.
 bool firstPacketSubmitted = false;
 uint32_t statSubmitSkipped = 0;
+uint32_t statPortBorrowed = 0; ///< Writes that had to take the port off another user and give it back.
 uint32_t statBuilds = 0;
 uint32_t statResyncGenuine = 0;
 uint32_t statResyncOvertaken = 0;
@@ -767,6 +768,8 @@ void reportStats() {
 	emitDec(statAbandonedEnded);
 	emit(" rs");
 	emitDec(statResyncs);
+	emit(" brw");
+	emitDec(statPortBorrowed);
 	emit(" ssk");
 	emitDec(statSubmitSkipped);
 	emit(" tf");
@@ -953,6 +956,7 @@ void reportStats() {
 	statFramesIn = 0;
 	statFramesDiscarded = 0;
 	statSubmitSkipped = 0;
+	statPortBorrowed = 0;
 	statTimerFires = 0;
 	statTimerWrote = 0;
 	statTimerShut = 0;
@@ -1036,9 +1040,15 @@ void audioWriteTimerInterrupt(uint32_t /*intSense*/) {
 	usb_regadr_t reg = usb_hstd_get_usb_ip_adr(USB_CFG_USE_USBIP);
 	const uint16_t savedSel = reg->CFIFOSEL;
 	const uint16_t savedShadow = fifoSels[kUseCpuFifo];
+	// Restore only if the port was pointing somewhere else, which is the only case where anything was borrowed.
+	// Restoring unconditionally costs a pipe change on every write, and usb_cstd_is_set_frdy_rohan gives up if
+	// the port is not ready within 100 ns - measured as 753 refusals a second against 37 writes.
+	const bool borrowed = (savedSel & kFifoSelCurPipe) != USB_CFG_PAUDIO_ISO_IN;
 	const uint16_t status = usb_cstd_is_set_frdy_rohan(USB_CFG_PAUDIO_ISO_IN);
 	if (status == kFifoError) {
-		restoreFifoPort(savedSel, savedShadow);
+		if (borrowed) {
+			restoreFifoPort(savedSel, savedShadow);
+		}
 		ENABLE_ALL_INTERRUPTS();
 		statTimerShut++;
 		// Walk the phase forward. The window sits 700-799 us into the host's frame and this timer is free of it,
@@ -1056,7 +1066,10 @@ void audioWriteTimerInterrupt(uint32_t /*intSense*/) {
 	if ((hw_usb_read_fifoctr(nullptr, kUseCpuFifo) & kFifoCtrBval) == 0u) {
 		hw_usb_set_bval(nullptr, kUseCpuFifo);
 	}
-	restoreFifoPort(savedSel, savedShadow);
+	if (borrowed) {
+		restoreFifoPort(savedSel, savedShadow);
+		statPortBorrowed++;
+	}
 	ENABLE_ALL_INTERRUPTS();
 	queueRead++;
 	statTimerWrote++;
