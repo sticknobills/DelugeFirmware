@@ -65,6 +65,15 @@ extern volatile uint32_t usbBempAudioCount;
 extern volatile uint32_t usbBempBitsSeen;
 /// Audio-pipe interrupts that found the pipe stalled.
 extern volatile uint32_t usbBempAudioStall;
+/// Which path each write down the audio pipe took, indexed by the driver's own end-of-write code: 0 end, 1 short
+/// packet, 2 still writing, 3 the FIFO refused the write. Steady-state packets reach the host, so anything in
+/// index 3 belongs to the extra write that tries to load a second plane - and says the FIFO turned it away rather
+/// than absorbing it silently.
+extern volatile uint32_t usbAudioWriteEnd[4];
+/// Audio-pipe transfers the driver tore down rather than completed. The refused-write path above ends here, and a
+/// teardown is not visible from our side: it runs the completion callback like any other ending.
+extern volatile uint32_t usbAudioForcedTerm;
+
 /// Audio-pipe interrupts that found the other buffer plane still holding data, and so re-armed instead of ending
 /// the transfer. This branch can only run when two packets are resident at once, which makes it the direct answer
 /// to whether a second plane is ever loaded - a thing no counter on the loading code can say.

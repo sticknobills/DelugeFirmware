@@ -35,6 +35,7 @@
 #include "RZA1/usb/r_usb_basic/src/hw/inc/r_usb_bitdefine.h"
 #include "RZA1/usb/r_usb_basic/src/hw/inc/r_usb_reg_access.h"
 #include "deluge/drivers/usb/usb_setup_trace.h"
+#include "deluge/drivers/usb/userdef/r_usb_paudio_config.h"
 
 /***********************************************************************************************************************
  Exported global variables (to be accessed by other files)
@@ -601,6 +602,11 @@ uint8_t* usb_pstd_read_fifo(uint16_t count, uint16_t pipemode, uint8_t* read_p)
 void usb_pstd_forced_termination(uint16_t pipe, uint16_t status)
 {
     uint16_t useport;
+
+    if (pipe == USB_CFG_PAUDIO_ISO_IN)
+    {
+        usbAudioForcedTerm++;
+    }
 
     /* PID = NAK */
     usb_cstd_set_nak(USB_NULL, pipe); /* Set NAK */

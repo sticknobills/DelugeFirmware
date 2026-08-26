@@ -770,12 +770,26 @@ void reportStats() {
 	// Fifth line, own buffer for the same reason as the third and fourth. fr1/fr0 are every submit's outcome; the
 	// latched f/pc pair is the second-plane answer, and FRDY (0x2000) still set in f2 says a plane was free after
 	// the second write, which means it did not reach one.
-	char planeLine[160];
+	// 256 rather than 160: every counter on this line is cumulative and none of them is cleared, so it has to be
+	// sized for ten digits apiece rather than for the widths it prints today. Growing a fixed-size debug line past
+	// its buffer is the likeliest cause of the freeze on 2026-08-22.
+	char planeLine[256];
 	p = planeLine;
 	// dfr is cumulative and never cleared: whether a second plane has *ever* held data is the question, not how
 	// often, and a per-report count of zero would look the same as never having been armed.
 	emit("AUP dfr:");
 	emitDec(usbBempAudioDeferred);
+	// Cumulative for the same reason as dfr: whether the FIFO has ever refused a write is the question.
+	emit(" we:");
+	emitDec(usbAudioWriteEnd[0]);
+	emit(",");
+	emitDec(usbAudioWriteEnd[1]);
+	emit(",");
+	emitDec(usbAudioWriteEnd[2]);
+	emit(",");
+	emitDec(usbAudioWriteEnd[3]);
+	emit(" ft:");
+	emitDec(usbAudioForcedTerm);
 	emit(" fr1:");
 	emitDec(statFrdyAfterSubmit[1]);
 	emit(" fr0:");

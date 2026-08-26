@@ -265,6 +265,27 @@ void usb_pstd_buf2fifo(uint16_t pipe, uint16_t useport) // pipe is never 0. Roha
 
     end_flag = usb_pstd_write_data(pipe, useport);
 
+    if (pipe == USB_CFG_PAUDIO_ISO_IN)
+    {
+        /* Observational: which of the driver's own four outcomes this write reached. FIFOERROR is USB_ERROR
+         * rather than a small ordinal, so it is mapped rather than indexed. */
+        switch (end_flag)
+        {
+            case USB_WRITEEND:
+                usbAudioWriteEnd[0]++;
+                break;
+            case USB_WRITESHRT:
+                usbAudioWriteEnd[1]++;
+                break;
+            case USB_WRITING:
+                usbAudioWriteEnd[2]++;
+                break;
+            default:
+                usbAudioWriteEnd[3]++;
+                break;
+        }
+    }
+
     /* Check FIFO access sequence */
     switch (end_flag)
     {
