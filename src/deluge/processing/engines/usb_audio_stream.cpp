@@ -197,7 +197,13 @@ bool audioTimerRunning = false;
 /// nothing but the race.
 bool firstPacketSubmitted = false;
 uint32_t statSubmitSkipped = 0;
-uint32_t statPortBorrowed = 0; ///< Writes that had to take the port off another user and give it back.
+/// readFrame has exactly three writers. The counters say nothing is built and the timer never writes, and the
+/// lead still reads 1 - so something advances it that is not accounted for, or one of these readings is false.
+/// Tagged per site, with both pointers printed raw: the difference is what has been ambiguous.
+uint32_t statReadAdvBuild = 0;  ///< buildNextPacket consuming frames
+uint32_t statReadAdvResync = 0; ///< the resync snapping back to the lead
+uint32_t statReadAdvPark = 0;   ///< the not-streaming branch parking read on write
+uint32_t statPortBorrowed = 0;  ///< Writes that had to take the port off another user and give it back.
 uint32_t statBuilds = 0;
 uint32_t statResyncGenuine = 0;
 uint32_t statResyncOvertaken = 0;
@@ -559,6 +565,7 @@ uint32_t buildNextPacket(uint8_t* buffer) {
 		}
 		statFramesDiscarded += available - kLeadFrames;
 		readFrame = writeFrame - kLeadFrames;
+		statReadAdvResync++;
 		available = kLeadFrames;
 		statResyncs++;
 	}
@@ -586,6 +593,7 @@ uint32_t buildNextPacket(uint8_t* buffer) {
 		memcpy(&buffer[firstRun * kFrameBytes], &ring[0], (send - firstRun) * kFrameBytes);
 	}
 	readFrame = readFrame + send;
+	statReadAdvBuild++;
 
 	statPacketsSent++;
 	statFramesSent += send;
@@ -951,12 +959,40 @@ void reportStats() {
 	*p = '\0';
 	Debug::sysexDebugPrint(*Debug::midiDebugCable, readyLine, true);
 
+	{
+		char ptrLine[160];
+		p = ptrLine;
+		emit("AUD wf");
+		emitDec(writeFrame);
+		emit(" rf");
+		emitDec(readFrame);
+		emit(" qw");
+		emitDec(queueWrite);
+		emit(" qr");
+		emitDec(queueRead);
+		emit(" advB");
+		emitDec(statReadAdvBuild);
+		emit(" advR");
+		emitDec(statReadAdvResync);
+		emit(" advP");
+		emitDec(statReadAdvPark);
+		emit(" alt");
+		emitDec(g_usb_pstd_alt_num[kAudioInterfaceNumber]);
+		emit(" con");
+		emitDec(g_usb_peri_connected);
+		*p = '\0';
+		Debug::sysexDebugPrint(*Debug::midiDebugCable, ptrLine, true);
+	}
+
 	statPacketsSent = 0;
 	statFramesSent = 0;
 	statFramesIn = 0;
 	statFramesDiscarded = 0;
 	statSubmitSkipped = 0;
 	statPortBorrowed = 0;
+	statReadAdvBuild = 0;
+	statReadAdvResync = 0;
+	statReadAdvPark = 0;
 	statTimerFires = 0;
 	statTimerWrote = 0;
 	statTimerShut = 0;
@@ -1145,6 +1181,7 @@ void USBAudioStream::routine() {
 		pipeConfigRead = false;
 		lastCompletionFrameValid = false;
 		readFrame = writeFrame;
+		statReadAdvPark++;
 		queueRead = queueWrite;
 		firstPacketSubmitted = false;
 		stopAudioWriteTimer();
