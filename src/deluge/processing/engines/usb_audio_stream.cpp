@@ -211,6 +211,7 @@ constexpr uint16_t kFrdyWaitTicks = 128u;
 uint32_t statFrdyImmediate = 0;     ///< ready inside the vendored 100 ns
 uint32_t statFrdyLate = 0;          ///< ready only because we waited longer - what the old timeout was discarding
 uint32_t statFrdyNever = 0;         ///< genuinely not ready at all
+uint32_t statCatchUp = 0;           ///< second writes in one fire, recovering a frame whose fire never happened
 constexpr int kAudioWriteTimer = 3; ///< Timer 3 is the only unused MTU2 channel.
 uint32_t statTimerFires = 0;
 uint32_t statTimerWrote = 0;
@@ -872,6 +873,8 @@ void reportStats() {
 	emitDec(statFrdyLate);
 	emit(" frn");
 	emitDec(statFrdyNever);
+	emit(" cup");
+	emitDec(statCatchUp);
 	emit(" sofo");
 	emitDec(sofToWriteTicks * 1000u / kTimerTicksPerMs); ///< the settled offset, in us
 	emit(" tem");
@@ -1088,6 +1091,7 @@ void reportStats() {
 	statFrdyImmediate = 0;
 	statFrdyLate = 0;
 	statFrdyNever = 0;
+	statCatchUp = 0;
 	statTimerEmpty = 0;
 	statQueueBuilt = 0;
 	statBuilds = 0;
@@ -1183,57 +1187,71 @@ void audioWriteTimerInterrupt(uint32_t /*intSense*/) {
 		return;
 	}
 
-	// The FIFO port is shared with MIDI and the readiness check steers it to our pipe, so nothing may run in
-	// between. This interrupt can itself be preempted, so the guard is explicit rather than assumed.
-	DISABLE_ALL_INTERRUPTS();
-	usb_regadr_t reg = usb_hstd_get_usb_ip_adr(USB_CFG_USE_USBIP);
-	const uint16_t savedSel = reg->CFIFOSEL;
-	const uint16_t savedShadow = fifoSels[kUseCpuFifo];
-	// Restore only if the port was pointing somewhere else, which is the only case where anything was borrowed.
-	// Restoring unconditionally costs a pipe change on every write, and usb_cstd_is_set_frdy_rohan gives up if
-	// the port is not ready within 100 ns - measured as 753 refusals a second against 37 writes.
-	const bool borrowed = (savedSel & kFifoSelCurPipe) != USB_CFG_PAUDIO_ISO_IN;
-	uint16_t status = usb_cstd_is_set_frdy_rohan(USB_CFG_PAUDIO_ISO_IN);
-	if (status == kFifoError) {
-		status = extendFifoWait();
-	}
-	else {
-		statFrdyImmediate++;
-	}
-	if (status == kFifoError) {
+	// Up to one extra write per fire, to recover a frame whose fire never happened. 61 of the host's 1000
+	// frames a second produced no timer interrupt at all under load - the handler is delayed past its own next
+	// deadline and two compare matches collapse into one - and one write per fire can never make that up.
+	//
+	// It cannot overrun the host: a plane only becomes free when the host has taken a packet, so the free plane
+	// is the host's clock rather than ours. If nothing is free the second attempt costs one register read.
+	for (uint32_t writesThisFire = 0; writesThisFire < 2u; writesThisFire++) {
+		if (writesThisFire > 0u && queueWrite == queueRead) {
+			break;
+		}
+
+		// The FIFO port is shared with MIDI and the readiness check steers it to our pipe, so nothing may run in
+		// between. This interrupt can itself be preempted, so the guard is explicit rather than assumed.
+		DISABLE_ALL_INTERRUPTS();
+		usb_regadr_t reg = usb_hstd_get_usb_ip_adr(USB_CFG_USE_USBIP);
+		const uint16_t savedSel = reg->CFIFOSEL;
+		const uint16_t savedShadow = fifoSels[kUseCpuFifo];
+		// Restore only if the port was pointing somewhere else, which is the only case where anything was borrowed.
+		// Restoring unconditionally costs a pipe change on every write, and usb_cstd_is_set_frdy_rohan gives up if
+		// the port is not ready within 100 ns - measured as 753 refusals a second against 37 writes.
+		const bool borrowed = (savedSel & kFifoSelCurPipe) != USB_CFG_PAUDIO_ISO_IN;
+		uint16_t status = usb_cstd_is_set_frdy_rohan(USB_CFG_PAUDIO_ISO_IN);
+		if (status == kFifoError) {
+			status = extendFifoWait();
+		}
+		else {
+			statFrdyImmediate++;
+		}
+		if (status == kFifoError) {
+			if (borrowed) {
+				restoreFifoPort(savedSel, savedShadow);
+			}
+			ENABLE_ALL_INTERRUPTS();
+			statTimerShut++;
+			// Nothing writable now, so a second attempt this fire cannot succeed either.
+			// Step the offset from the frame boundary, not the timer's period. Against SOF the window does not
+			// move, so this converges and then stops - unlike a period walk, which corrects a phase error that the
+			// two crystals immediately reintroduce.
+			if (++consecutiveShut >= kShutBeforeStepping) {
+				consecutiveShut = 0;
+				sofToWriteTicks += kPhaseStepTicks;
+				if (sofToWriteTicks > kSofOffsetMax) {
+					sofToWriteTicks = kSofOffsetMin;
+				}
+			}
+			return;
+		}
+
+		QueuedPacket& q = packetQueue[queueRead % kQueueSlots];
+		usb_pstd_write_fifo(q.bytes, kUseCpuFifo, q.data);
+		if ((hw_usb_read_fifoctr(nullptr, kUseCpuFifo) & kFifoCtrBval) == 0u) {
+			hw_usb_set_bval(nullptr, kUseCpuFifo);
+		}
 		if (borrowed) {
 			restoreFifoPort(savedSel, savedShadow);
+			statPortBorrowed++;
 		}
 		ENABLE_ALL_INTERRUPTS();
-		statTimerShut++;
-		// Step the offset from the frame boundary, not the timer's period. Against SOF the window does not
-		// move, so this converges and then stops - unlike a period walk, which corrects a phase error that the
-		// two crystals immediately reintroduce.
-		if (++consecutiveShut >= kShutBeforeStepping) {
-			consecutiveShut = 0;
-			sofToWriteTicks += kPhaseStepTicks;
-			if (sofToWriteTicks > kSofOffsetMax) {
-				sofToWriteTicks = kSofOffsetMin;
-			}
-		}
-		return;
-	}
+		queueRead++;
+		statTimerWrote++;
+		statCatchUp += (writesThisFire > 0u) ? 1u : 0u;
 
-	QueuedPacket& q = packetQueue[queueRead % kQueueSlots];
-	usb_pstd_write_fifo(q.bytes, kUseCpuFifo, q.data);
-	if ((hw_usb_read_fifoctr(nullptr, kUseCpuFifo) & kFifoCtrBval) == 0u) {
-		hw_usb_set_bval(nullptr, kUseCpuFifo);
+		// A write landed, so this offset is the right one. Hold it; SOF re-arms the timer for the next frame.
+		consecutiveShut = 0;
 	}
-	if (borrowed) {
-		restoreFifoPort(savedSel, savedShadow);
-		statPortBorrowed++;
-	}
-	ENABLE_ALL_INTERRUPTS();
-	queueRead++;
-	statTimerWrote++;
-
-	// A write landed, so this offset is the right one. Hold it; SOF re-arms the timer for the next frame.
-	consecutiveShut = 0;
 }
 
 /// Fills the queue from the task, where the copy is affordable.
