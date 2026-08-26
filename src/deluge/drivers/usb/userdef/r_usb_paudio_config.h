@@ -31,7 +31,14 @@
 // an 11-bit field and pipe buffers reach 2048 bytes. Only PIPE1 and PIPE2 can carry isochronous
 // transfers here and PIPE2 is USB MIDI, so a second endpoint cannot be added to widen this.
 // High Speed is what lifts it, and that is a separate piece of work.
-#define USB_CFG_PAUDIO_CHANNELS (11u)
+//
+// DIAGNOSTIC, 2026-08-26: temporarily 2 rather than 11, taking the packet from 990 bytes to 180
+// and changing nothing else - the buffer allocation below is deliberately left at 1024 so packet
+// size is the only variable. Delivery sits at exactly one packet every two frames with the pipe
+// confirmed correctly configured and double-buffered, and whether a fifth-size packet lifts that
+// separates "a 990-byte packet cannot be refilled in time" from "only one packet is ever handed
+// over at a time". Restore to 11u once the answer is in.
+#define USB_CFG_PAUDIO_CHANNELS (2u)
 
 // 11 x 16 bit is 22 bytes per audio frame, so the largest packet is 45 * 22 = 990 bytes. Pipe
 // buffers are allocated in 64-byte units, so 1024 is the smallest that fits.
