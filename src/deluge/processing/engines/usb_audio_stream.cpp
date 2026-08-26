@@ -141,6 +141,17 @@ uint32_t statFramesSent = 0;
 /// to balance: what goes into the ring is either sent or discarded. They do not, and the gap is the fault.
 uint32_t statFramesIn = 0;
 uint32_t statFramesDiscarded = 0;
+/// A resync fires on `available >= kResyncFrames`, and `available` is a masked subtraction that cannot go
+/// negative: if the reader passes the writer by one frame it reads as the whole ring rather than as -1.
+/// These separate the two, which today are the same number and opposite situations. Signed distance from
+/// the writer to the reader, sampled at each resync.
+/// Every entry to buildNextPacket, against statPacketsSent which counts only the path that carries real
+/// audio. The sequence stamp advances once per entry and the host reads it advancing at twice the rate
+/// statPacketsSent reports, so one of the two is wrong about how often the builder runs.
+uint32_t statBuilds = 0;
+uint32_t statResyncGenuine = 0;
+uint32_t statResyncOvertaken = 0;
+int32_t statWorstOvertake = 0;
 uint32_t statReportCountdown = 0;
 
 /// Branch counters. "Nothing was sent" cannot distinguish the task never running, the task
@@ -452,6 +463,7 @@ void stampSequence(uint8_t* buffer, uint32_t frames) {
 /// write - and the sizing, priming, resync and underrun rules must be identical for both. Duplicating them is
 /// how a rule enforced at two sites ends up enforced at one.
 uint32_t buildNextPacket(uint8_t* buffer) {
+	statBuilds++;
 	// Nominal packet size, used only while there is nothing real to send. 44.1 kHz does not divide into 1 ms
 	// frames, so 44 frames with a 45th every tenth packet averages exactly 44100 rather than drifting.
 	uint32_t frames = kFramesPerPacket;
@@ -478,6 +490,18 @@ uint32_t buildNextPacket(uint8_t* buffer) {
 	// The host is not draining us fast enough to keep up. A rate trim cannot recover this in useful time, so
 	// put the read pointer back at the lead and take the one discontinuity.
 	if (available >= kResyncFrames) {
+		// Signed, deliberately: the masked `available` above cannot tell "the ring holds 8191 frames" from "the
+		// reader is one frame past the writer". This can, and the two want opposite responses.
+		const int32_t signedLead = (int32_t)(writeFrame - readFrame);
+		if (signedLead < 0) {
+			statResyncOvertaken++;
+			if (signedLead < statWorstOvertake) {
+				statWorstOvertake = signedLead;
+			}
+		}
+		else {
+			statResyncGenuine++;
+		}
 		statFramesDiscarded += available - kLeadFrames;
 		readFrame = (writeFrame - kLeadFrames) & kRingMask;
 		available = kLeadFrames;
@@ -733,6 +757,14 @@ void reportStats() {
 	emitDec(statAbandonedEnded);
 	emit(" rs");
 	emitDec(statResyncs);
+	emit(" bld");
+	emitDec(statBuilds);
+	emit(" rgen");
+	emitDec(statResyncGenuine);
+	emit(" rovr");
+	emitDec(statResyncOvertaken);
+	emit(" wovr");
+	emitDec((uint32_t)(-statWorstOvertake));
 	emit(" fin");
 	emitDec(statFramesIn);
 	emit(" fdis");
@@ -898,6 +930,11 @@ void reportStats() {
 	statFramesSent = 0;
 	statFramesIn = 0;
 	statFramesDiscarded = 0;
+	statBuilds = 0;
+	statResyncGenuine = 0;
+	statResyncOvertaken = 0;
+	// statWorstOvertake is deliberately not cleared: the furthest the reader has ever got past the writer is
+	// the question, not how far it got in the last second.
 	statAlt1 = 0;
 	statInFlight = 0;
 	statPrimeSilence = 0;
