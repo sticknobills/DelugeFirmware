@@ -178,19 +178,28 @@ volatile uint32_t queueRead = 0;
 /// which is why driving writes from the frame interrupt itself delivered 0.42x. Rather than track the host's
 /// phase with a control loop, the timer walks its own period forward until a write lands and then holds. A
 /// search that stops when it succeeds cannot oscillate; a loop that integrates phase error can.
-/// Deliberately a little SHORT of a millisecond, so the timer runs slightly faster than the host's frame rate.
-///
-/// A free-running timer at a nominal 1 kHz measured 990 fires a second against the host's 1000, and a timer that
-/// runs slow can never catch up: it loses ~10 frames a second however well it is phased, and the host conceals
-/// each one by repeating 244 ms-old audio out of its own input ring. Running fast costs nothing, because a fire
-/// that arrives while the plane is still shut simply writes nothing and comes round again - the plane opening is
-/// the host's own clock, so the write rate self-limits to the host's rather than to ours.
-///
-/// 3% is far more than the crystals can differ by and well under the margin that would risk two writes landing
-/// in one frame, which the shut check already prevents in any case.
-constexpr uint32_t kTimerTicksPerMs = (DELUGE_CLOCKS_PER / 1000u) * 97u / 100u;
+constexpr uint32_t kTimerTicksPerMs = DELUGE_CLOCKS_PER / 1000u;
+
 constexpr uint32_t kPhaseStepTicks = kTimerTicksPerMs / 20u; ///< 50 us
-constexpr int kAudioWriteTimer = 3;                          ///< Timer 3 is the only unused MTU2 channel.
+
+/// b13 of INTENB0: the frame-update interrupt. Off in device mode by default - the driver only ever set it for
+/// host mode - and the peripheral handler's frame branch already existed doing nothing.
+constexpr uint16_t kIntEnbSofe = 0x2000u;
+bool sofEnabled = false;
+
+/// How long after the host's frame boundary to attempt the write.
+///
+/// This is the whole point of clocking from SOF. Three free-running versions of this timer have now been
+/// measured and every one of them lost frames: 990 fires/s at a nominal millisecond, 1006 at 3% short, and
+/// nothing in between tracks the host, because the host's frame clock is its crystal and this timer's is ours.
+/// A search for the window in that reference frame has to re-find it forever. Measured from SOF instead, the
+/// window is stationary - 700-799 us into the frame on 84% of observations, 2026-08-26 - so the offset
+/// converges once and holds.
+uint32_t sofToWriteTicks = (kTimerTicksPerMs * 3u) / 4u; ///< 750 us
+constexpr uint32_t kSofOffsetMin = kTimerTicksPerMs / 10u;
+constexpr uint32_t kSofOffsetMax = (kTimerTicksPerMs * 19u) / 20u;
+uint32_t statSofSeen = 0;
+constexpr int kAudioWriteTimer = 3; ///< Timer 3 is the only unused MTU2 channel.
 uint32_t statTimerFires = 0;
 uint32_t statTimerWrote = 0;
 uint32_t statTimerShut = 0;
@@ -843,6 +852,10 @@ void reportStats() {
 	emitDec(statTimerWrote);
 	emit(" tsh");
 	emitDec(statTimerShut);
+	emit(" sof");
+	emitDec(statSofSeen);
+	emit(" sofo");
+	emitDec(sofToWriteTicks * 1000u / kTimerTicksPerMs); ///< the settled offset, in us
 	emit(" tem");
 	emitDec(statTimerEmpty);
 	emit(" qb");
@@ -1053,6 +1066,7 @@ void reportStats() {
 	statTimerFires = 0;
 	statTimerWrote = 0;
 	statTimerShut = 0;
+	statSofSeen = 0;
 	statTimerEmpty = 0;
 	statQueueBuilt = 0;
 	statBuilds = 0;
@@ -1144,13 +1158,13 @@ void audioWriteTimerInterrupt(uint32_t /*intSense*/) {
 		}
 		ENABLE_ALL_INTERRUPTS();
 		statTimerShut++;
-		// Walk the phase forward. The window sits 700-799 us into the host's frame and this timer is free of it,
-		// so stepping until a write lands finds it without a loop that can oscillate around it.
-		uint16_t next = (uint16_t)(*TGRA[kAudioWriteTimer] + kPhaseStepTicks);
-		if (next > (uint16_t)(kTimerTicksPerMs + kTimerTicksPerMs / 2u)) {
-			next = (uint16_t)kTimerTicksPerMs;
+		// Step the offset from the frame boundary, not the timer's period. Against SOF the window does not
+		// move, so this converges and then stops - unlike a period walk, which corrects a phase error that the
+		// two crystals immediately reintroduce.
+		sofToWriteTicks += kPhaseStepTicks;
+		if (sofToWriteTicks > kSofOffsetMax) {
+			sofToWriteTicks = kSofOffsetMin;
 		}
-		*TGRA[kAudioWriteTimer] = next;
 		return;
 	}
 
@@ -1167,8 +1181,7 @@ void audioWriteTimerInterrupt(uint32_t /*intSense*/) {
 	queueRead++;
 	statTimerWrote++;
 
-	// A write landed, so this phase is the right one. Hold it.
-	*TGRA[kAudioWriteTimer] = (uint16_t)kTimerTicksPerMs;
+	// A write landed, so this offset is the right one. Hold it; SOF re-arms the timer for the next frame.
 }
 
 /// Fills the queue from the task, where the copy is affordable.
@@ -1182,6 +1195,24 @@ void buildQueuedPackets() {
 		queueWrite++;
 		statQueueBuilt++;
 	}
+}
+
+/// Called from the peripheral interrupt handler's frame branch, on the host's own clock, 1000 times a second.
+///
+/// Does no work beyond re-arming the timer: two register writes. v0.14.0 put the ~990-byte ring copy and the
+/// FIFO write in here and starved the audio engine, clipping channels 1-2 to full scale. The task builds the
+/// packets now and the timer only pushes bytes already in memory, so the expensive half of that is gone and the
+/// cheap half happens 750 us from here rather than at the boundary, where the plane is reliably shut.
+extern "C" void usbAudioStreamStartOfFrame(void) {
+	statSofSeen++;
+	if (!audioTimerRunning) {
+		return;
+	}
+	// Zeroing the count is what locks the phase: the timer now measures from the host's frame boundary rather
+	// than from its own last fire, so its crystal sets only the offset's accuracy and never accumulates against
+	// the host's rate.
+	*TCNT[kAudioWriteTimer] = 0;
+	*TGRA[kAudioWriteTimer] = (uint16_t)sofToWriteTicks;
 }
 
 void startAudioWriteTimer() {
@@ -1242,6 +1273,10 @@ void USBAudioStream::routine() {
 		queueRead = queueWrite;
 		firstPacketSubmitted = false;
 		stopAudioWriteTimer();
+		if (sofEnabled) {
+			usb_hstd_get_usb_ip_adr(USB_CFG_USE_USBIP)->INTENB0 &= (uint16_t)~kIntEnbSofe;
+			sofEnabled = false;
+		}
 		return;
 	}
 	streamActive = true;
@@ -1299,6 +1334,10 @@ void USBAudioStream::routine() {
 	// Started only once a host is actually streaming and the driver's own first transfer is set up, so an idle
 	// Deluge pays nothing and the timer never fires against an unconfigured pipe.
 	startAudioWriteTimer();
+	if (!sofEnabled && transferInitialised) {
+		usb_hstd_get_usb_ip_adr(USB_CFG_USE_USBIP)->INTENB0 |= kIntEnbSofe;
+		sofEnabled = true;
+	}
 }
 
 void USBAudioStream::feedMix(const StereoSample* mix, uint32_t numSamples) {
