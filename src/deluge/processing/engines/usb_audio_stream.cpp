@@ -455,16 +455,21 @@ void transferComplete(usb_utr_t* /*ptr*/, uint16_t /*data1*/, uint16_t /*data2*/
 	lastCompletionFrame = frameAtCompletion;
 	lastCompletionFrameValid = true;
 
-	// Hand the next packet over here rather than waiting for the task to come round again, so a transfer is
-	// outstanding at every instant. This was written to lift delivery above the ~470 packets/s measured against
-	// the host's 1000/s and did not move it at all - the shortfall is not the task's cadence. It earns its place
-	// for what it did do: the abandoned-transfer recovery below went from firing several times a second to never,
-	// on an idle machine.
+	// Deliberately does NOT build or submit a packet. It used to, and that made the ring's read pointer shared
+	// between this interrupt and the task: both do readFrame = readFrame + send, and a completion landing inside
+	// the task's build leaves the two claiming the same frames. The result is the same audio built into two
+	// different packets, and because each duplicate displaces a real packet, every frame sent twice costs a frame
+	// that is never sent at all.
 	//
-	// The copy this costs the interrupt is ~990 bytes at 1 kHz. Measured effect on the audio engine's own 2.9 ms
-	// deadline: see the underrun and resync counters, which is what the numbers below are for.
+	// Measured 2026-08-27 with a packet number stamped alongside the producer stamp: 10,179 frames/s duplicated,
+	// 91.8% of it carrying two different packet numbers over the same audio. It read the same on v0.15.0 and
+	// v0.21.0 - not because the fault was in the hardware, as the invariance first suggested, but because this
+	// build path is the half those two share.
+	//
+	// The task is now the only builder. The timer still writes bytes already in memory, which is what an
+	// interrupt can afford; the ~990-byte copy this used to do at 1 kHz is the same cost that starved the audio
+	// engine on v0.14.0.
 	if (streamActive && transferInitialised) {
-		sendNextPacket();
 		// Measured across the write rather than timed, because what the chip cares about is which frame the write
 		// finished in, not how long it took - a fast write that lands after the SOF is as late as a slow one.
 		const uint32_t delta = (uint32_t)((readFrameNumber() - frameAtCompletion) & kFrameNumberMask);
