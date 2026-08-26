@@ -37,6 +37,10 @@ extern uint16_t g_usb_pstd_alt_num[];
 usb_er_t usb_pstd_transfer_start(usb_utr_t* ptr);
 void usb_pstd_forced_termination(uint16_t pipe, uint16_t status);
 usb_regadr_t usb_hstd_get_usb_ip_adr(uint16_t ipno);
+uint16_t usb_cstd_is_set_frdy_rohan(uint16_t pipe);
+uint8_t* usb_pstd_write_fifo(uint16_t count, uint16_t pipemode, uint8_t* write_p);
+void hw_usb_set_bval(usb_utr_t* ptr, uint16_t pipemode);
+uint16_t hw_usb_read_fifoctr(usb_utr_t* ptr, uint16_t pipemode);
 
 // What the driver recorded writing to each pipe's configuration registers. Those registers are only reachable
 // through a shared selector, so these are printed alongside a single hardware read: equal says nothing, unequal
@@ -277,6 +281,18 @@ uint32_t lastCompletionFrame = 0;
 bool lastCompletionFrameValid = false;
 
 constexpr uint16_t kPipeCtrBsts = 0x8000u; ///< b15: the CPU may access the pipe's FIFO buffer.
+constexpr uint16_t kFifoCtrBval = 0x8000u; ///< b15: the plane just written holds a complete packet.
+constexpr uint16_t kUseCpuFifo = 0u;       ///< USB_CUSE - the CPU FIFO port, as against either DMA port.
+constexpr uint16_t kFifoError = 0xFFu;     ///< USB_FIFOERROR: the port never became ready.
+
+/// Its own buffer rather than one of the alternating pair. A direct write copies into the FIFO before it
+/// returns, so this is free again immediately - but the driver reads the pair after submit() returns, and
+/// handing it a buffer this path is refilling is the kind of overlap that is invisible until it is audible.
+alignas(4) uint8_t extraPacket[kMaxPacketBytes] = {};
+
+uint32_t statExtraWritten = 0;  ///< Packets loaded into a second plane from the task.
+uint32_t statExtraRefused = 0;  ///< Windows that closed before the port came ready.
+uint32_t statExtraNoWindow = 0; ///< Task passes with a transfer in flight and no plane writable.
 
 /// Whether a buffer plane is ever writable while a packet is still pending.
 ///
@@ -423,7 +439,12 @@ void stampSequence(uint8_t* buffer, uint32_t frames) {
 /// outstanding, and a completion can only arrive when one is.
 ///
 /// submit() is deliberately the last statement, because the completion for it can arrive before this returns.
-void sendNextPacket() {
+/// Builds one packet into the caller's buffer and returns its size in audio frames.
+///
+/// Split out of sendNextPacket() because two paths now need it - the submit path and the direct second-plane
+/// write - and the sizing, priming, resync and underrun rules must be identical for both. Duplicating them is
+/// how a rule enforced at two sites ends up enforced at one.
+uint32_t buildNextPacket(uint8_t* buffer) {
 	// Nominal packet size, used only while there is nothing real to send. 44.1 kHz does not divide into 1 ms
 	// frames, so 44 frames with a 45th every tenth packet averages exactly 44100 rather than drifting.
 	uint32_t frames = kFramesPerPacket;
@@ -440,11 +461,9 @@ void sendNextPacket() {
 	if (!primed) {
 		if (available < kLeadFrames) {
 			statPrimeSilence++;
-			uint8_t* buffer = nextPacketBuffer();
 			memset(buffer, 0, frames * kFrameBytes);
 			stampSequence(buffer, frames);
-			submit(buffer, frames * kFrameBytes);
-			return;
+			return frames;
 		}
 		primed = true;
 	}
@@ -461,11 +480,9 @@ void sendNextPacket() {
 		// The engine has not produced anything since the last poll. Send correctly sized silence rather than
 		// nothing, so the endpoint keeps answering, and do not advance the read pointer.
 		statUnderruns++;
-		uint8_t* buffer = nextPacketBuffer();
 		memset(buffer, 0, frames * kFrameBytes);
 		stampSequence(buffer, frames);
-		submit(buffer, frames * kFrameBytes);
-		return;
+		return frames;
 	}
 
 	// Send what the engine actually produced. Never a partial audio frame: a host that appends one rotates the
@@ -477,7 +494,6 @@ void sendNextPacket() {
 
 	const uint32_t start = readFrame & kRingMask;
 	const uint32_t firstRun = (start + send > kRingFrames) ? (kRingFrames - start) : send;
-	uint8_t* buffer = nextPacketBuffer();
 	memcpy(buffer, &ring[start * kChannels], firstRun * kFrameBytes);
 	if (firstRun < send) {
 		memcpy(&buffer[firstRun * kFrameBytes], &ring[0], (send - firstRun) * kFrameBytes);
@@ -488,7 +504,57 @@ void sendNextPacket() {
 	statFramesSent += send;
 
 	stampSequence(buffer, send);
-	submit(buffer, send * kFrameBytes);
+	return send;
+}
+
+void sendNextPacket() {
+	uint8_t* buffer = nextPacketBuffer();
+	const uint32_t frames = buildNextPacket(buffer);
+	submit(buffer, frames * kFrameBytes);
+}
+
+/// Loads a second packet straight into the pipe's other buffer plane, bypassing the driver's transfer record.
+///
+/// Measured 2026-08-26: a plane is writable while a packet is still pending on about 18% of task passes, but
+/// never in the microseconds straight after a write - which is the only moment anything had ever looked. That
+/// is why loading the second plane from the completion interrupt was refused thirteen times out of thirteen.
+///
+/// Deliberately not through submit(): usb_pstd_transfer_start() rewrites the driver's per-pipe transfer record
+/// and clears the pipe's buffer-empty status, and doing either mid-flight loses the completion for the packet
+/// already on the wire. Nothing here touches g_p_usb_pipe, so the outstanding transfer stays exactly as it is.
+///
+/// Interrupts are off across the build and the write together. The shared CPU FIFO port is steered by whoever
+/// writes next, so a completion interrupt landing mid-write would send the rest of this packet to MIDI's pipe;
+/// and the ring's read pointer has one writer by design, which this path would otherwise become the second of.
+/// The cost is a ~990-byte copy plus the FIFO write, a few microseconds against the 1 ms the endpoint is
+/// serviced on - the underrun, resync and recovery counters are what say whether it was affordable.
+void writeExtraPlane() {
+	__disable_irq();
+
+	// Readiness first, and only then build. Building first would consume frames from the ring that a refused
+	// write then drops on the floor - a silent gap in the audio, paid for a packet that never went anywhere.
+	// This call also steers the shared FIFO port to our pipe, which the write below relies on; interrupts stay
+	// off from here so nothing steers it away in between.
+	//
+	// A success returns the port's status word, which always has FRDY set and so is never 0xFF - the error
+	// value cannot collide with a real reading.
+	const uint16_t status = usb_cstd_is_set_frdy_rohan(USB_CFG_PAUDIO_ISO_IN);
+	if (status == kFifoError) {
+		// The window shut between the read that found it open and this one. Nothing built, nothing consumed.
+		statExtraRefused++;
+		__enable_irq();
+		return;
+	}
+
+	const uint32_t frames = buildNextPacket(extraPacket);
+	usb_pstd_write_fifo((uint16_t)(frames * kFrameBytes), kUseCpuFifo, extraPacket);
+	if ((hw_usb_read_fifoctr(nullptr, kUseCpuFifo) & kFifoCtrBval) == 0u) {
+		// 990 bytes into a 1024-byte plane is short of the plane, so the hardware does not commit it by itself.
+		hw_usb_set_bval(nullptr, kUseCpuFifo);
+	}
+	statExtraWritten++;
+
+	__enable_irq();
 }
 
 /// Ends a transfer the hardware has already finished with but never reported.
@@ -798,6 +864,12 @@ void reportStats() {
 	emitDec(statPollFound);
 	emit(" pm:");
 	emitDec(statPollMissed);
+	emit(" xw:");
+	emitDec(statExtraWritten);
+	emit(" xr:");
+	emitDec(statExtraRefused);
+	emit(" xn:");
+	emitDec(statExtraNoWindow);
 	emit(" pi:");
 	if (statPollFirstIteration == 0xFFFFFFFFu) {
 		// Dashes rather than a sentinel number: never seen and seen at iteration 4294967295 are different
@@ -834,6 +906,9 @@ void reportStats() {
 	}
 	statPollFound = 0;
 	statPollMissed = 0;
+	statExtraWritten = 0;
+	statExtraRefused = 0;
+	statExtraNoWindow = 0;
 	// statPollFirstIteration is deliberately not cleared: the fastest the window has ever been seen to open is
 	// the question, not how often it did in the last second.
 	statFrdyAfterSubmit[0] = 0;
@@ -887,6 +962,14 @@ void USBAudioStream::routine() {
 		// condition under which "is a plane writable" is the question being asked.
 		const uint16_t ctr = readPipeCtr();
 		statReadyState[(((ctr & kPipeCtrBsts) != 0u) ? 2u : 0u) | (((ctr & kPipeCtrInBufM) != 0u) ? 1u : 0u)]++;
+		// Data pending and a plane writable: the second plane can be loaded now, and this is the only moment it
+		// can be. Anything else is either nothing to double up on or a port that would refuse the write.
+		if ((ctr & (kPipeCtrBsts | kPipeCtrInBufM)) == (kPipeCtrBsts | kPipeCtrInBufM)) {
+			writeExtraPlane();
+		}
+		else {
+			statExtraNoWindow++;
+		}
 		endAbandonedTransfer();
 		return;
 	}
