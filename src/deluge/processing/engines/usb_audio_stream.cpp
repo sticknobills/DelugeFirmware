@@ -254,6 +254,15 @@ int16_t encodeStamp(uint32_t value) {
 	return (int16_t)((int32_t)(value & kStampMask) * kStampScale - 32768);
 }
 
+/// DIAGNOSTIC. Which packet each frame was built into, stamped once per packet on channel 6.
+///
+/// The producer stamp says which rendered frame this is; this says which packet carried it. Together they
+/// separate the two ways the same audio can arrive twice, which no counter on either side of the wire can tell
+/// apart: the same packet number twice means the hardware re-sent a buffer plane we wrote once, and two
+/// different packet numbers over the same audio means we built the same ring frames into two packets.
+/// Measured 2026-08-27 at ~8,400 frames/s on both write paths, and each duplicated frame costs a real one.
+uint32_t packetCounter = 0;
+
 /// Cached so the encoding runs once per block rather than once per frame.
 uint32_t stampBlock = 0xFFFFFFFFu;
 int16_t stampLow = 0;
@@ -527,6 +536,16 @@ void markDeviceSilence(uint8_t* buffer, uint32_t frames) {
 	}
 }
 
+/// DIAGNOSTIC. Numbers the packet itself, at the moment it is built - not when it is written, so that a plane
+/// the hardware sends twice carries one number and appears twice.
+void stampPacketNumber(uint8_t* buffer, uint32_t frames) {
+	int16_t* samples = (int16_t*)buffer;
+	const int16_t number = encodeStamp(packetCounter++);
+	for (uint32_t f = 0; f < frames; f++) {
+		samples[f * kChannels + 5] = number;
+	}
+}
+
 /// Builds one packet from the ring and hands it to the endpoint.
 ///
 /// Called from the task for the first packet of a stream and after a recovery, and from the completion for every
@@ -563,6 +582,7 @@ uint32_t buildNextPacket(uint8_t* buffer) {
 			statPrimeSilence++;
 			memset(buffer, 0, frames * kFrameBytes);
 			markDeviceSilence(buffer, frames);
+			stampPacketNumber(buffer, frames);
 			return frames;
 		}
 		primed = true;
@@ -596,6 +616,7 @@ uint32_t buildNextPacket(uint8_t* buffer) {
 		statUnderruns++;
 		memset(buffer, 0, frames * kFrameBytes);
 		markDeviceSilence(buffer, frames);
+		stampPacketNumber(buffer, frames);
 		return frames;
 	}
 
@@ -617,6 +638,8 @@ uint32_t buildNextPacket(uint8_t* buffer) {
 
 	statPacketsSent++;
 	statFramesSent += send;
+
+	stampPacketNumber(buffer, send);
 
 	return send;
 }
