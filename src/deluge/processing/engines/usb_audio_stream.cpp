@@ -201,6 +201,26 @@ uint32_t stuckPasses = 0;
 uint32_t statAbandonedSeen = 0;
 uint32_t statAbandonedEnded = 0;
 
+/// Where the packet write lands inside the host's frame, and how far apart completions are.
+///
+/// The chip only makes a written packet sendable at the next SOF (hardware manual 28.4.9(4)), and answers an IN
+/// token with a zero-length packet plus an underrun when the buffer is not transmission-enabled - which is the
+/// state FRMNUM's OVRN bit has reported on every reading so far. Writing from the completion should still land
+/// inside the frame and be sendable at the next one, which predicts a packet every frame; the machine delivers
+/// one every two. These two histograms are the difference between those, and neither is inferable from source.
+uint32_t statWriteFrameDelta[3] = {}; ///< Frames between entering the completion and the write returning: 0, 1, 2+.
+uint32_t statCompletionGap[5] = {};   ///< Frames between consecutive completions: 0, 1, 2, 3, 4+.
+uint32_t lastCompletionFrame = 0;
+bool lastCompletionFrameValid = false;
+
+constexpr uint16_t kFrameNumberMask = 0x07FFu; ///< FRMNUM b10-0; b15 is OVRN and b14 CRCE.
+
+/// FRMNUM alone rather than the whole register set, because this runs twice per completion inside the interrupt.
+uint16_t readFrameNumber() {
+	usb_regadr_t reg = usb_hstd_get_usb_ip_adr(USB_CFG_USE_USBIP);
+	return (uint16_t)(reg->FRMNUM & kFrameNumberMask);
+}
+
 void sendNextPacket();
 
 void transferComplete(usb_utr_t* /*ptr*/, uint16_t /*data1*/, uint16_t /*data2*/) {
@@ -208,6 +228,16 @@ void transferComplete(usb_utr_t* /*ptr*/, uint16_t /*data1*/, uint16_t /*data2*/
 	transferInFlight = false;
 	regsAtLastCompletion = readPipeRegisters();
 	regsSnapshotTaken = true;
+
+	const uint16_t frameAtCompletion = readFrameNumber();
+	if (lastCompletionFrameValid) {
+		const uint32_t gap = (uint32_t)((frameAtCompletion - lastCompletionFrame) & kFrameNumberMask);
+		// Bucketed rather than averaged: a steady two and an alternating one-and-three give the same mean and
+		// mean opposite things about where the packet is being lost.
+		statCompletionGap[gap > 4u ? 4u : gap]++;
+	}
+	lastCompletionFrame = frameAtCompletion;
+	lastCompletionFrameValid = true;
 
 	// Hand the next packet over here rather than waiting for the task to come round again, so a transfer is
 	// outstanding at every instant. This was written to lift delivery above the ~470 packets/s measured against
@@ -219,6 +249,10 @@ void transferComplete(usb_utr_t* /*ptr*/, uint16_t /*data1*/, uint16_t /*data2*/
 	// deadline: see the underrun and resync counters, which is what the numbers below are for.
 	if (streamActive && transferInitialised) {
 		sendNextPacket();
+		// Measured across the write rather than timed, because what the chip cares about is which frame the write
+		// finished in, not how long it took - a fast write that lands after the SOF is as late as a slow one.
+		const uint32_t delta = (uint32_t)((readFrameNumber() - frameAtCompletion) & kFrameNumberMask);
+		statWriteFrameDelta[delta > 2u ? 2u : delta]++;
 	}
 }
 
@@ -541,6 +575,29 @@ void reportStats() {
 		Debug::sysexDebugPrint(*Debug::midiDebugCable, cfgLine, true);
 	}
 
+	// Fourth line, own buffer for the same reason as the third. wd is how many frames the write straddled; cg is
+	// how many frames apart consecutive completions landed.
+	char timingLine[128];
+	p = timingLine;
+	emit("AUT wd0:");
+	emitDec(statWriteFrameDelta[0]);
+	emit(" wd1:");
+	emitDec(statWriteFrameDelta[1]);
+	emit(" wd2+:");
+	emitDec(statWriteFrameDelta[2]);
+	emit(" cg0:");
+	emitDec(statCompletionGap[0]);
+	emit(" cg1:");
+	emitDec(statCompletionGap[1]);
+	emit(" cg2:");
+	emitDec(statCompletionGap[2]);
+	emit(" cg3:");
+	emitDec(statCompletionGap[3]);
+	emit(" cg4+:");
+	emitDec(statCompletionGap[4]);
+	*p = '\0';
+	Debug::sysexDebugPrint(*Debug::midiDebugCable, timingLine, true);
+
 	statPacketsSent = 0;
 	statFramesSent = 0;
 	statAlt1 = 0;
@@ -554,6 +611,12 @@ void reportStats() {
 	usbBempAudioCount = 0;
 	usbBrdyNonZeroCount = 0;
 	usbBrdyAudioCount = 0;
+	for (uint32_t i = 0; i < 3; i++) {
+		statWriteFrameDelta[i] = 0;
+	}
+	for (uint32_t i = 0; i < 5; i++) {
+		statCompletionGap[i] = 0;
+	}
 	// usbBempBitsSeen is deliberately not cleared: which pipes are live at all is the question, not how often.
 }
 
@@ -589,6 +652,7 @@ void USBAudioStream::routine() {
 		// The driver reconfigures the pipe on the next SetInterface, so the snapshot is only valid for the stream
 		// it was taken from.
 		pipeConfigRead = false;
+		lastCompletionFrameValid = false;
 		readFrame = writeFrame;
 		return;
 	}
