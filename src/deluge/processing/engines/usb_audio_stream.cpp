@@ -1241,21 +1241,23 @@ void USBAudioStream::routine() {
 		transferInitialised = true;
 	}
 
-	if (firstPacketSubmitted) {
-		// The timer owns the port now. Re-submitting here would race it, and it is not needed: the pipe stays
-		// armed and the timer's writes keep landing whether or not the driver believes a transfer is open.
-		statSubmitSkipped++;
-	}
-	else {
-		// Interrupts off across the driver's own FIFO write for the same reason the timer's write is guarded.
-		DISABLE_ALL_INTERRUPTS();
-		sendNextPacket();
-		ENABLE_ALL_INTERRUPTS();
-		// Only if it actually took. This was set unconditionally, so a submit the driver refused still closed
-		// the branch above for the rest of the stream and no transfer was ever established. submit() records
-		// the driver's own return code in transferInFlight, which is the only thing here that knows.
-		firstPacketSubmitted = transferInFlight;
-	}
+	// Re-armed through the driver every time nothing is in flight, which is what v0.15.0 does and what the
+	// timer route stopped doing. The rule it replaces - one submit per stream, everything after it the timer's -
+	// rested on the pipe staying armed once the driver's transfer had gone. Measured 2026-08-27: it does not.
+	// The timer found the plane shut on 1446 fires out of 1446, with zero submits and zero completions after the
+	// first, because with no transfer in flight no plane ever opens. The window it was written against was only
+	// ever observed while a transfer was outstanding.
+	//
+	// The timer keeps its job: filling the second plane when a window does appear. It is now an addition to a
+	// working transport rather than a replacement for one.
+	//
+	// Interrupts off across the driver's own FIFO write, which is also what keeps the timer out of it: the two
+	// share a FIFO port, and two writers there truncate a packet into a part-frame that rotates the host's
+	// channel mapping permanently.
+	DISABLE_ALL_INTERRUPTS();
+	sendNextPacket();
+	ENABLE_ALL_INTERRUPTS();
+	firstPacketSubmitted = transferInFlight;
 	// Started only once a host is actually streaming and the driver's own first transfer is set up, so an idle
 	// Deluge pays nothing and the timer never fires against an unconfigured pipe.
 	startAudioWriteTimer();
