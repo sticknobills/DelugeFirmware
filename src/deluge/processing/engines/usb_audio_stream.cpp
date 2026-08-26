@@ -183,6 +183,16 @@ uint32_t statTimerShut = 0;
 uint32_t statTimerEmpty = 0;
 uint32_t statQueueBuilt = 0;
 bool audioTimerRunning = false;
+/// The driver's submit path writes the same shared FIFO port as the timer interrupt, and usb_pstd_write_fifo
+/// writes what it is handed with no space check while also changing the port's access width partway through.
+/// Two writers interleaving there truncate a packet, and a part-frame packet rotates the host's channel
+/// mapping - measured as channel 11's constant arriving on channel 1, 34 samples in 60 s on v0.16.0.
+///
+/// So exactly one packet per stream goes through the driver, to establish its transfer; everything after is the
+/// timer's. Writes were landing at 950/s against 2.6 submits/s already, so the driver's path was contributing
+/// nothing but the race.
+bool firstPacketSubmitted = false;
+uint32_t statSubmitSkipped = 0;
 uint32_t statBuilds = 0;
 uint32_t statResyncGenuine = 0;
 uint32_t statResyncOvertaken = 0;
@@ -752,6 +762,8 @@ void reportStats() {
 	emitDec(statAbandonedEnded);
 	emit(" rs");
 	emitDec(statResyncs);
+	emit(" ssk");
+	emitDec(statSubmitSkipped);
 	emit(" tf");
 	emitDec(statTimerFires);
 	emit(" tw");
@@ -935,6 +947,7 @@ void reportStats() {
 	statFramesSent = 0;
 	statFramesIn = 0;
 	statFramesDiscarded = 0;
+	statSubmitSkipped = 0;
 	statTimerFires = 0;
 	statTimerWrote = 0;
 	statTimerShut = 0;
@@ -1093,6 +1106,7 @@ void USBAudioStream::routine() {
 		lastCompletionFrameValid = false;
 		readFrame = writeFrame;
 		queueRead = queueWrite;
+		firstPacketSubmitted = false;
 		stopAudioWriteTimer();
 		return;
 	}
@@ -1126,7 +1140,18 @@ void USBAudioStream::routine() {
 		transferInitialised = true;
 	}
 
-	sendNextPacket();
+	if (firstPacketSubmitted) {
+		// The timer owns the port now. Re-submitting here would race it, and it is not needed: the pipe stays
+		// armed and the timer's writes keep landing whether or not the driver believes a transfer is open.
+		statSubmitSkipped++;
+	}
+	else {
+		// Interrupts off across the driver's own FIFO write for the same reason the timer's write is guarded.
+		DISABLE_ALL_INTERRUPTS();
+		sendNextPacket();
+		ENABLE_ALL_INTERRUPTS();
+		firstPacketSubmitted = true;
+	}
 	// Started only once a host is actually streaming and the driver's own first transfer is set up, so an idle
 	// Deluge pays nothing and the timer never fires against an unconfigured pipe.
 	startAudioWriteTimer();
