@@ -97,6 +97,9 @@ constexpr uint32_t kResyncFrames = kRingFrames - (kRingFrames / 4u);
 /// zeroed once at startup and left alone -- per-track routing fills them in a later cut.
 PLACE_SDRAM_BSS int16_t ring[kRingFrames * kChannels];
 
+/// Free-running, not masked to the ring - they are masked only where they index it. Masked pointers make an
+/// overtaking reader indistinguishable from a full ring, which cost this build a whole session on 2026-08-26.
+///
 /// writeFrame is advanced by the audio routine, readFrame by whoever builds the next packet - the task for the
 /// first of a stream, the completion interrupt for the rest. Each is single-writer and 32-bit aligned, which is
 /// atomic on this core, so no lock is needed between the two.
@@ -473,7 +476,11 @@ uint32_t buildNextPacket(uint8_t* buffer) {
 		frameAccumulator -= 1000;
 	}
 
-	uint32_t available = (writeFrame - readFrame) & kRingMask;
+	// Signed, and the pointers are free-running rather than masked to the ring: a masked subtraction cannot
+	// go negative, so a reader one frame past the writer read as a full ring and triggered a resync that threw
+	// away thousands of frames that never existed. Measured firing 2.5 times a second under load, 2026-08-26.
+	const int32_t available32 = (int32_t)(writeFrame - readFrame);
+	uint32_t available = (available32 > 0) ? (uint32_t)available32 : 0u;
 
 	// Hold the first packets back until there is a window's worth of slack, so the very first late render does
 	// not produce a gap the host has to hear.
@@ -492,7 +499,7 @@ uint32_t buildNextPacket(uint8_t* buffer) {
 	if (available >= kResyncFrames) {
 		// Signed, deliberately: the masked `available` above cannot tell "the ring holds 8191 frames" from "the
 		// reader is one frame past the writer". This can, and the two want opposite responses.
-		const int32_t signedLead = (int32_t)(writeFrame - readFrame);
+		const int32_t signedLead = available32;
 		if (signedLead < 0) {
 			statResyncOvertaken++;
 			if (signedLead < statWorstOvertake) {
@@ -503,12 +510,12 @@ uint32_t buildNextPacket(uint8_t* buffer) {
 			statResyncGenuine++;
 		}
 		statFramesDiscarded += available - kLeadFrames;
-		readFrame = (writeFrame - kLeadFrames) & kRingMask;
+		readFrame = writeFrame - kLeadFrames;
 		available = kLeadFrames;
 		statResyncs++;
 	}
 
-	if (available == 0) {
+	if (available == 0u) {
 		// The engine has not produced anything since the last poll. Send correctly sized silence rather than
 		// nothing, so the endpoint keeps answering, and do not advance the read pointer.
 		statUnderruns++;
@@ -530,7 +537,7 @@ uint32_t buildNextPacket(uint8_t* buffer) {
 	if (firstRun < send) {
 		memcpy(&buffer[firstRun * kFrameBytes], &ring[0], (send - firstRun) * kFrameBytes);
 	}
-	readFrame = (readFrame + send) & kRingMask;
+	readFrame = readFrame + send;
 
 	statPacketsSent++;
 	statFramesSent += send;
@@ -770,7 +777,7 @@ void reportStats() {
 	emit(" fdis");
 	emitDec(statFramesDiscarded);
 	emit(" lead");
-	emitDec((writeFrame - readFrame) & kRingMask);
+	emitDec((uint32_t)(int32_t)(writeFrame - readFrame));
 	*p = '\0';
 	Debug::sysexDebugPrint(*Debug::midiDebugCable, line, true);
 
@@ -1059,7 +1066,7 @@ void USBAudioStream::feedMix(const StereoSample* mix, uint32_t numSamples) {
 		frame[1] = (int16_t)(mix[i].r >> 16);
 		w++;
 	}
-	writeFrame = w & kRingMask;
+	writeFrame = w;
 }
 
 } // namespace deluge::processing::engines
