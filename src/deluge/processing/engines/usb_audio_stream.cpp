@@ -180,13 +180,7 @@ volatile uint32_t queueRead = 0;
 /// search that stops when it succeeds cannot oscillate; a loop that integrates phase error can.
 constexpr uint32_t kTimerTicksPerMs = DELUGE_CLOCKS_PER / 1000u;
 constexpr uint32_t kPhaseStepTicks = kTimerTicksPerMs / 20u; ///< 50 us
-
-/// How many 50 us retries one frame may spend hunting a writable plane before giving the frame up. Twelve is
-/// 600 us, so the hunt stays inside the frame it belongs to and cannot run into the next one.
-constexpr uint32_t kMaxTimerRetries = 12u;
-uint32_t timerRetries = 0;
-uint32_t statTimerGaveUp = 0;
-constexpr int kAudioWriteTimer = 3; ///< Timer 3 is the only unused MTU2 channel.
+constexpr int kAudioWriteTimer = 3;                          ///< Timer 3 is the only unused MTU2 channel.
 uint32_t statTimerFires = 0;
 uint32_t statTimerWrote = 0;
 uint32_t statTimerShut = 0;
@@ -839,8 +833,6 @@ void reportStats() {
 	emitDec(statTimerWrote);
 	emit(" tsh");
 	emitDec(statTimerShut);
-	emit(" tgu");
-	emitDec(statTimerGaveUp);
 	emit(" tem");
 	emitDec(statTimerEmpty);
 	emit(" qb");
@@ -1051,7 +1043,6 @@ void reportStats() {
 	statTimerFires = 0;
 	statTimerWrote = 0;
 	statTimerShut = 0;
-	statTimerGaveUp = 0;
 	statTimerEmpty = 0;
 	statQueueBuilt = 0;
 	statBuilds = 0;
@@ -1143,23 +1134,13 @@ void audioWriteTimerInterrupt(uint32_t /*intSense*/) {
 		}
 		ENABLE_ALL_INTERRUPTS();
 		statTimerShut++;
-		// Come back in 50 us, not in a millisecond and 50 us. TGRA is the period, so adding a step to it used to
-		// mean a shut plane cost an entire host frame as well as the write - and since this timer free-runs on
-		// the Deluge's crystal while the window it is hunting belongs to the host's, the phase drifts out
-		// continuously and the search has to re-find it for as long as the stream lasts. That was 40 misses a
-		// second, every one of them a packet the host never got: 955 packets built against the host's 1000, and
-		// the host conceals each shortfall by repeating 244 ms-old audio out of its own input ring.
-		//
-		// Retrying inside the frame costs a FRDY check per attempt and keeps the frame.
-		if (++timerRetries > kMaxTimerRetries) {
-			// The plane has been shut for most of the frame, so the host is not draining us and spinning here
-			// only takes CPU from the engine. Give the frame up and resume the normal period.
-			timerRetries = 0;
-			*TGRA[kAudioWriteTimer] = (uint16_t)kTimerTicksPerMs;
-			statTimerGaveUp++;
-			return;
+		// Walk the phase forward. The window sits 700-799 us into the host's frame and this timer is free of it,
+		// so stepping until a write lands finds it without a loop that can oscillate around it.
+		uint16_t next = (uint16_t)(*TGRA[kAudioWriteTimer] + kPhaseStepTicks);
+		if (next > (uint16_t)(kTimerTicksPerMs + kTimerTicksPerMs / 2u)) {
+			next = (uint16_t)kTimerTicksPerMs;
 		}
-		*TGRA[kAudioWriteTimer] = (uint16_t)kPhaseStepTicks;
+		*TGRA[kAudioWriteTimer] = next;
 		return;
 	}
 
@@ -1176,8 +1157,7 @@ void audioWriteTimerInterrupt(uint32_t /*intSense*/) {
 	queueRead++;
 	statTimerWrote++;
 
-	// A write landed, so this phase is the right one. Hold it, and forget the retries that found it.
-	timerRetries = 0;
+	// A write landed, so this phase is the right one. Hold it.
 	*TGRA[kAudioWriteTimer] = (uint16_t)kTimerTicksPerMs;
 }
 
