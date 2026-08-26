@@ -148,6 +148,24 @@ uint32_t statSubmits = 0;
 uint32_t statLastErr = 0xFFFF;
 uint32_t statSecondPlaneLoads = 0; ///< Should read 1 per stream. More than that means the depth is growing.
 
+/// Stamped into channel 3 of every audio frame of every packet, so the host's own recording says which packets
+/// actually arrived rather than the driver saying which it thinks it sent.
+///
+/// Delivery runs at exactly half the host's frame rate and cpl, sub and pkt all agree with each other - but those
+/// are all our side of the wire. A host substitutes silence for a packet that never lands, so a contiguous
+/// sequence in the recording and a sequence missing every other value look identical in every counter we have.
+/// This is the first instrument here that reads what the host received rather than what we submitted.
+uint16_t packetSequence = 0;
+
+/// Set for the one packet that loads the pipe's second buffer plane, which stamps channel 4 as well.
+///
+/// The plane-loading build was inert and its counter only proved the code path ran, not that the write reached a
+/// second plane - the distinction the whole question turns on. If a packet tagged this way never appears in the
+/// recording, the second write was clobbered or discarded; if it appears, the write reached a plane that the
+/// hardware went on to transmit.
+bool taggingSecondPlane = false;
+constexpr int16_t kSecondPlaneMark = 0x7FFF;
+
 /// The audio pipe's own state, straight off the hardware. Five readings of the driver source have produced one
 /// right answer and four wrong ones on this stream; these registers are what the chip itself says.
 struct PipeRegisters {
@@ -290,6 +308,7 @@ void transferComplete(usb_utr_t* /*ptr*/, uint16_t /*data1*/, uint16_t /*data2*/
 		if (!secondPlaneLoaded) {
 			secondPlaneLoaded = true;
 			statSecondPlaneLoads++;
+			taggingSecondPlane = true;
 			sendNextPacket();
 		}
 	}
@@ -307,6 +326,23 @@ void submit(const uint8_t* data, uint32_t bytes) {
 	// Always USB_OK in practice - every guard in that function is compiled out - so this records the
 	// code rather than relying on it. Kept as one call site so the flag cannot be set in two places.
 	transferInFlight = (err == USB_OK);
+}
+
+/// Writes this packet's sequence number into channel 3 of every audio frame, and marks channel 4 when this is the
+/// packet that loads the second buffer plane.
+///
+/// Channels 3 upwards already carry the diagnostic constants and nothing real, so this costs no audio. Channels 1
+/// and 2 are untouched - the mix has to stay listenable for the recording to be worth anything else.
+void stampSequence(uint8_t* buffer, uint32_t frames) {
+	int16_t* samples = (int16_t*)buffer;
+	const int16_t sequence = (int16_t)(packetSequence & 0x7FFFu);
+	const int16_t mark = taggingSecondPlane ? kSecondPlaneMark : (int16_t)((3u + 1u) * 2000u);
+	for (uint32_t f = 0; f < frames; f++) {
+		samples[f * kChannels + 2] = sequence;
+		samples[f * kChannels + 3] = mark;
+	}
+	packetSequence++;
+	taggingSecondPlane = false;
 }
 
 /// Builds one packet from the ring and hands it to the endpoint.
@@ -335,6 +371,7 @@ void sendNextPacket() {
 			statPrimeSilence++;
 			uint8_t* buffer = nextPacketBuffer();
 			memset(buffer, 0, frames * kFrameBytes);
+			stampSequence(buffer, frames);
 			submit(buffer, frames * kFrameBytes);
 			return;
 		}
@@ -355,6 +392,7 @@ void sendNextPacket() {
 		statUnderruns++;
 		uint8_t* buffer = nextPacketBuffer();
 		memset(buffer, 0, frames * kFrameBytes);
+		stampSequence(buffer, frames);
 		submit(buffer, frames * kFrameBytes);
 		return;
 	}
@@ -378,6 +416,7 @@ void sendNextPacket() {
 	statPacketsSent++;
 	statFramesSent += send;
 
+	stampSequence(buffer, send);
 	submit(buffer, send * kFrameBytes);
 }
 
