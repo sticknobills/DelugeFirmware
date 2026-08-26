@@ -98,10 +98,6 @@ volatile uint32_t readFrame = 0;
 bool ringCleared = false;
 bool primed = false;
 
-/// Whether the pipe's second buffer plane has been loaded for this stream. One shot: each completion refills one
-/// plane, so loading the second once is what takes the depth from one to two and keeps it there.
-bool secondPlaneLoaded = false;
-
 /// Whether a host currently has the streaming interface selected. Read by the producer so that a machine with
 /// nothing plugged in does not pay for the conversion, and set in one place so the two sides cannot disagree.
 bool streamActive = false;
@@ -146,7 +142,6 @@ uint32_t statPrimeSilence = 0;
 uint32_t statCompletes = 0;
 uint32_t statSubmits = 0;
 uint32_t statLastErr = 0xFFFF;
-uint32_t statSecondPlaneLoads = 0; ///< Should read 1 per stream. More than that means the depth is growing.
 
 /// Stamped into channel 3 of every audio frame of every packet, so the host's own recording says which packets
 /// actually arrived rather than the driver saying which it thinks it sent.
@@ -157,19 +152,10 @@ uint32_t statSecondPlaneLoads = 0; ///< Should read 1 per stream. More than that
 /// This is the first instrument here that reads what the host received rather than what we submitted.
 uint16_t packetSequence = 0;
 
-/// Set for the one packet that loads the pipe's second buffer plane, which stamps channel 4 as well.
-///
-/// The plane-loading build was inert and its counter only proved the code path ran, not that the write reached a
-/// second plane - the distinction the whole question turns on. If a packet tagged this way never appears in the
-/// recording, the second write was clobbered or discarded; if it appears, the write reached a plane that the
-/// hardware went on to transmit.
-bool taggingSecondPlane = false;
-
 /// The capture path dithers every sample by +/-1, so all three of these have to survive that. The scale puts a
 /// step of 8 between consecutive sequence numbers, and the two marks sit far from each other and far from the
 /// zero the host writes when it substitutes silence for a packet that never arrived.
 constexpr int16_t kSequenceScale = 8;
-constexpr int16_t kSecondPlaneMark = 0x7FF0;
 constexpr int16_t kNormalMark = 8000;
 
 /// The audio pipe's own state, straight off the hardware. Five readings of the driver source have produced one
@@ -222,25 +208,6 @@ bool fifoProbeIsOurs(const FifoProbe& probe) {
 /// flight at a time, so this reads all-1 unless the depth ever actually grows.
 uint32_t statFrdyAfterSubmit[2] = {};
 uint32_t statProbeNotOurs = 0;
-
-/// The readings either side of the one packet that loads the second plane, latched rather than counted.
-///
-/// It happens once per stream, and the marker built for the same question last session fired outside the
-/// recording window - where zero of them is indistinguishable from it never having happened. These are held from
-/// the moment they are taken and printed on every report after it, so no window can miss them.
-FifoProbe planeProbeFirst = {};
-FifoProbe planeProbeSecond = {};
-bool planeProbeTaken = false;
-
-/// The gaps of the three completions that follow the one-shot load, in order, latched for the same reason.
-///
-/// Two resident packets go out on consecutive frames and only the second empties the pipe, so the completion
-/// covering them arrives later than the steady two frames. Delivery is a metronome at two, so a three here is a
-/// deviation the stream does not otherwise produce. Three of them rather than one: the depth returns to one
-/// straight after, and the gaps either side are what say the deviation belongs to the load.
-uint32_t planeGapAfter[3] = {};
-uint32_t planeGapAfterCount = 0;
-bool planeGapArmed = false;
 
 /// The audio pipe's static configuration - how the endpoint is set up, as against what it is doing. Delivery sits
 /// at exactly one packet every two frames with the task running 1840 times a second and the ring never empty,
@@ -331,9 +298,6 @@ void transferComplete(usb_utr_t* /*ptr*/, uint16_t /*data1*/, uint16_t /*data2*/
 		// Bucketed rather than averaged: a steady two and an alternating one-and-three give the same mean and
 		// mean opposite things about where the packet is being lost.
 		statCompletionGap[gap > 4u ? 4u : gap]++;
-		if (planeGapArmed && planeGapAfterCount < 3u) {
-			planeGapAfter[planeGapAfterCount++] = gap;
-		}
 	}
 	lastCompletionFrame = frameAtCompletion;
 	lastCompletionFrameValid = true;
@@ -352,38 +316,6 @@ void transferComplete(usb_utr_t* /*ptr*/, uint16_t /*data1*/, uint16_t /*data2*/
 		// finished in, not how long it took - a fast write that lands after the SOF is as late as a slow one.
 		const uint32_t delta = (uint32_t)((readFrameNumber() - frameAtCompletion) & kFrameNumberMask);
 		statWriteFrameDelta[delta > 2u ? 2u : delta]++;
-
-		// Load the pipe's second buffer plane too, once per stream, which takes the depth from one packet to two.
-		//
-		// Measured 2026-08-26: the write always finishes inside the frame it started (wd1 zero across ~1100
-		// packets), and a packet still reaches the host exactly two frames after the previous one (cg2 total, cg1
-		// and cg3 zero). The turnaround is fixed, so refilling faster cannot touch it - the frame in between has
-		// nothing loaded to send, and FRMNUM's OVRN bit reads set on every sample, which the hardware manual
-		// defines as an IN token answered with a zero-length packet. Manual 28.4.9(4) and figure 28.11: data ready
-		// before the token gives a packet every frame, data prepared after it gives exactly the interleaved
-		// zero-length packets measured here.
-		//
-		// Here rather than in the task because submit() is the last statement of sendNextPacket() and a completion
-		// can arrive before it returns - two calls from the task can be split by this interrupt, two calls from
-		// inside it cannot, since a second completion on the same pipe cannot preempt this handler.
-		//
-		// Once per stream: from then on each completion refills exactly one plane and the depth holds at two.
-		if (!secondPlaneLoaded) {
-			secondPlaneLoaded = true;
-			statSecondPlaneLoads++;
-			// Either side of the second write, so the pair says what that write changed rather than what the state
-			// happened to be. The first is taken after this completion's own refill has already gone in.
-			const FifoProbe before = readFifoProbe();
-			taggingSecondPlane = true;
-			sendNextPacket();
-			const FifoProbe after = readFifoProbe();
-			planeProbeFirst = before;
-			planeProbeSecond = after;
-			planeProbeTaken = true;
-			// Armed at the end of this completion, so the next one's gap is the first one latched.
-			planeGapAfterCount = 0;
-			planeGapArmed = true;
-		}
 	}
 }
 
@@ -422,13 +354,12 @@ void stampSequence(uint8_t* buffer, uint32_t frames) {
 	// 12 bits of sequence at 8x fills the 15-bit range, which wraps every ~8 s at 500 packets/s - the decoder
 	// takes the step modulo that.
 	const int16_t sequence = (int16_t)((packetSequence & 0x0FFFu) * kSequenceScale);
-	const int16_t mark = taggingSecondPlane ? kSecondPlaneMark : kNormalMark;
+	const int16_t mark = kNormalMark;
 	for (uint32_t f = 0; f < frames; f++) {
 		samples[f * kChannels + 2] = sequence;
 		samples[f * kChannels + 3] = mark;
 	}
 	packetSequence++;
-	taggingSecondPlane = false;
 }
 
 /// Builds one packet from the ring and hands it to the endpoint.
@@ -762,8 +693,6 @@ void reportStats() {
 	emitDec(statCompletionGap[3]);
 	emit(" cg4+:");
 	emitDec(statCompletionGap[4]);
-	emit(" p2:");
-	emitDec(statSecondPlaneLoads);
 	*p = '\0';
 	Debug::sysexDebugPrint(*Debug::midiDebugCable, timingLine, true);
 
@@ -796,35 +725,6 @@ void reportStats() {
 	emitDec(statFrdyAfterSubmit[0]);
 	emit(" bad:");
 	emitDec(statProbeNotOurs);
-	if (planeProbeTaken) {
-		emit(" f1:");
-		emitHex(planeProbeFirst.fifoctr);
-		emit(" pc1:");
-		emitHex(planeProbeFirst.pipectr);
-		emit(" f2:");
-		emitHex(planeProbeSecond.fifoctr);
-		emit(" pc2:");
-		emitHex(planeProbeSecond.pipectr);
-		emit(" s:");
-		emitHex(planeProbeSecond.fifosel);
-		emit(" g:");
-		for (uint32_t i = 0; i < 3u; i++) {
-			if (i < planeGapAfterCount) {
-				emitDec(planeGapAfter[i]);
-			}
-			else {
-				emit("-");
-			}
-			if (i < 2u) {
-				emit(",");
-			}
-		}
-	}
-	else {
-		// Dashes rather than zeros: the pair not having been taken and a pair of zero readings are different
-		// findings, which is the confusion this whole build exists to end.
-		emit(" f1---- pc1---- f2---- pc2---- s---- g:-,-,-");
-	}
 	*p = '\0';
 	Debug::sysexDebugPrint(*Debug::midiDebugCable, planeLine, true);
 
@@ -886,10 +786,6 @@ void USBAudioStream::routine() {
 		// it was taken from.
 		pipeConfigRead = false;
 		lastCompletionFrameValid = false;
-		secondPlaneLoaded = false;
-		planeProbeTaken = false;
-		planeGapArmed = false;
-		planeGapAfterCount = 0;
 		readFrame = writeFrame;
 		return;
 	}
