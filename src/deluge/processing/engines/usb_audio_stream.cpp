@@ -50,6 +50,10 @@ uint16_t hw_usb_read_fifoctr(usb_utr_t* ptr, uint16_t pipemode);
 // What the driver recorded writing to each pipe's configuration registers. Those registers are only reachable
 // through a shared selector, so these are printed alongside a single hardware read: equal says nothing, unequal
 // would say the configuration never landed.
+// The driver's shadow of the shared FIFO port selector. Restoring the port after borrowing it needs both this
+// and the register itself put back, or the driver's own next call believes the port is already where it wants.
+extern uint16_t fifoSels[];
+
 extern uint16_t pipeCfgs[];
 extern uint16_t pipeBufs[];
 extern uint16_t pipeMaxPs[];
@@ -244,6 +248,7 @@ PipeRegisters readPipeRegisters() {
 /// CFIFOCTR and CFIFOSEL bits, named here rather than by including the driver's private headers.
 constexpr uint16_t kFifoCtrFrdy = 0x2000u;    ///< b13: a buffer plane is free to be written into.
 constexpr uint16_t kFifoSelCurPipe = 0x000Fu; ///< b2-0: which pipe the shared CPU FIFO port points at.
+constexpr uint16_t kFifoSelIsel = 0x0020u;    ///< b5: read or write direction of that port.
 
 /// What the CPU-side FIFO port says immediately after a packet has been written and committed.
 ///
@@ -996,6 +1001,23 @@ void reportStats() {
 /// Does no building and touches neither the ring nor the sequence counter: those belong to the task, because a
 /// ~990-byte copy out of the ring inside a 1 kHz interrupt is what starved the audio engine on v0.14.0. All this
 /// does is steer the shared FIFO port and push bytes that are already sitting in memory.
+/// Puts the shared FIFO port back exactly as it was found.
+///
+/// usb_cstd_is_set_frdy_rohan re-points the port at our pipe and never restores it. That is harmless when only
+/// the driver's own single-threaded paths use it, and not harmless at all from a 1 kHz interrupt: landing inside
+/// a MIDI FIFO write leaves the rest of MIDI's bytes going into our pipe, which reaches the host as a part-frame
+/// packet and rotates its channel mapping. Measured as channel constants arriving on channel 1, ~40 samples a
+/// minute. The port's access width lives in the same register, so restoring it wholesale covers that too.
+void restoreFifoPort(uint16_t savedSel, uint16_t savedShadow) {
+	usb_regadr_t reg = usb_hstd_get_usb_ip_adr(USB_CFG_USE_USBIP);
+	fifoSels[kUseCpuFifo] = savedShadow;
+	uint16_t seen;
+	do {
+		reg->CFIFOSEL = savedSel;
+		seen = reg->CFIFOSEL;
+	} while ((seen & (kFifoSelIsel | kFifoSelCurPipe)) != (savedSel & (kFifoSelIsel | kFifoSelCurPipe)));
+}
+
 void audioWriteTimerInterrupt(uint32_t /*intSense*/) {
 	timerClearCompareMatchTGRA(kAudioWriteTimer);
 	statTimerFires++;
@@ -1011,8 +1033,12 @@ void audioWriteTimerInterrupt(uint32_t /*intSense*/) {
 	// The FIFO port is shared with MIDI and the readiness check steers it to our pipe, so nothing may run in
 	// between. This interrupt can itself be preempted, so the guard is explicit rather than assumed.
 	DISABLE_ALL_INTERRUPTS();
+	usb_regadr_t reg = usb_hstd_get_usb_ip_adr(USB_CFG_USE_USBIP);
+	const uint16_t savedSel = reg->CFIFOSEL;
+	const uint16_t savedShadow = fifoSels[kUseCpuFifo];
 	const uint16_t status = usb_cstd_is_set_frdy_rohan(USB_CFG_PAUDIO_ISO_IN);
 	if (status == kFifoError) {
+		restoreFifoPort(savedSel, savedShadow);
 		ENABLE_ALL_INTERRUPTS();
 		statTimerShut++;
 		// Walk the phase forward. The window sits 700-799 us into the host's frame and this timer is free of it,
@@ -1030,6 +1056,7 @@ void audioWriteTimerInterrupt(uint32_t /*intSense*/) {
 	if ((hw_usb_read_fifoctr(nullptr, kUseCpuFifo) & kFifoCtrBval) == 0u) {
 		hw_usb_set_bval(nullptr, kUseCpuFifo);
 	}
+	restoreFifoPort(savedSel, savedShadow);
 	ENABLE_ALL_INTERRUPTS();
 	queueRead++;
 	statTimerWrote++;
