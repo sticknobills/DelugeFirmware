@@ -1209,6 +1209,14 @@ void USBAudioStream::routine() {
 	streamActive = true;
 	statAlt1++;
 
+	// Unconditionally, before any branch. This used to live inside the in-flight branch alone, which gave the
+	// task a state it could never leave: once a transfer ended without a new one starting, every pass took the
+	// other branch, the queue was never refilled, and the timer starved on it forever. Measured 2026-08-26
+	// evening as inf0 / qb0 / tw0 with the ring lead climbing past 1.2 million frames, and again 2026-08-27 with
+	// 0.45 s of unique audio delivered in 30 s. Keeping packets ready is the task's job in every state, not only
+	// in the one where the driver happens to be busy.
+	buildQueuedPackets();
+
 	if (transferInFlight) {
 		statInFlight++;
 		// Sampled here rather than at the top of the routine: a transfer is outstanding, which is the only
@@ -1220,9 +1228,6 @@ void USBAudioStream::routine() {
 		if ((ctr & (kPipeCtrBsts | kPipeCtrInBufM)) != (kPipeCtrBsts | kPipeCtrInBufM)) {
 			statExtraNoWindow++;
 		}
-		// The timer interrupt owns the writes now; the task's job is to keep packets ready for it. Building here
-		// rather than there is the whole point: this copy is what could not be afforded inside an interrupt.
-		buildQueuedPackets();
 		endAbandonedTransfer();
 		return;
 	}
@@ -1246,7 +1251,10 @@ void USBAudioStream::routine() {
 		DISABLE_ALL_INTERRUPTS();
 		sendNextPacket();
 		ENABLE_ALL_INTERRUPTS();
-		firstPacketSubmitted = true;
+		// Only if it actually took. This was set unconditionally, so a submit the driver refused still closed
+		// the branch above for the rest of the stream and no transfer was ever established. submit() records
+		// the driver's own return code in transferInFlight, which is the only thing here that knows.
+		firstPacketSubmitted = transferInFlight;
 	}
 	// Started only once a host is actually streaming and the driver's own first transfer is set up, so an idle
 	// Deluge pays nothing and the timer never fires against an unconfigured pipe.
