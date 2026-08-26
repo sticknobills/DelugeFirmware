@@ -164,7 +164,13 @@ uint16_t packetSequence = 0;
 /// recording, the second write was clobbered or discarded; if it appears, the write reached a plane that the
 /// hardware went on to transmit.
 bool taggingSecondPlane = false;
-constexpr int16_t kSecondPlaneMark = 0x7FFF;
+
+/// The capture path dithers every sample by +/-1, so all three of these have to survive that. The scale puts a
+/// step of 8 between consecutive sequence numbers, and the two marks sit far from each other and far from the
+/// zero the host writes when it substitutes silence for a packet that never arrived.
+constexpr int16_t kSequenceScale = 8;
+constexpr int16_t kSecondPlaneMark = 0x7FF0;
+constexpr int16_t kNormalMark = 8000;
 
 /// The audio pipe's own state, straight off the hardware. Five readings of the driver source have produced one
 /// right answer and four wrong ones on this stream; these registers are what the chip itself says.
@@ -335,8 +341,12 @@ void submit(const uint8_t* data, uint32_t bytes) {
 /// and 2 are untouched - the mix has to stay listenable for the recording to be worth anything else.
 void stampSequence(uint8_t* buffer, uint32_t frames) {
 	int16_t* samples = (int16_t*)buffer;
-	const int16_t sequence = (int16_t)(packetSequence & 0x7FFFu);
-	const int16_t mark = taggingSecondPlane ? kSecondPlaneMark : (int16_t)((3u + 1u) * 2000u);
+	// Scaled, because the capture path is not bit-exact: every constant channel comes back dithered by +/-1 LSB,
+	// and an unscaled counter cannot tell that wobble from a real step to the next packet. A step of 8 survives it.
+	// 12 bits of sequence at 8x fills the 15-bit range, which wraps every ~8 s at 500 packets/s - the decoder
+	// takes the step modulo that.
+	const int16_t sequence = (int16_t)((packetSequence & 0x0FFFu) * kSequenceScale);
+	const int16_t mark = taggingSecondPlane ? kSecondPlaneMark : kNormalMark;
 	for (uint32_t f = 0; f < frames; f++) {
 		samples[f * kChannels + 2] = sequence;
 		samples[f * kChannels + 3] = mark;
