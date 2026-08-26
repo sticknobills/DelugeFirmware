@@ -37,6 +37,15 @@ extern uint16_t g_usb_pstd_alt_num[];
 usb_er_t usb_pstd_transfer_start(usb_utr_t* ptr);
 void usb_pstd_forced_termination(uint16_t pipe, uint16_t status);
 usb_regadr_t usb_hstd_get_usb_ip_adr(uint16_t ipno);
+
+// What the driver recorded writing to each pipe's configuration registers. Those registers are only reachable
+// through a shared selector, so these are printed alongside a single hardware read: equal says nothing, unequal
+// would say the configuration never landed.
+extern uint16_t pipeCfgs[];
+extern uint16_t pipeBufs[];
+extern uint16_t pipeMaxPs[];
+void __disable_irq(void);
+void __enable_irq(void);
 }
 
 namespace {
@@ -137,6 +146,38 @@ PipeRegisters readPipeRegisters() {
 	return PipeRegisters{*pipectr, reg->BEMPENB, reg->NRDYSTS, reg->FRMNUM};
 }
 
+/// The audio pipe's static configuration - how the endpoint is set up, as against what it is doing. Delivery sits
+/// at exactly one packet every two frames with the task running 1840 times a second and the ring never empty,
+/// which is a shape no amount of CPU explains; these are the registers that decide how many packets the pipe can
+/// hold at once and how much FIFO it owns, and they have never been read.
+struct PipeConfig {
+	uint16_t pipecfg;  ///< Type, direction, and DBLB - whether the pipe is double-buffered or holds one packet.
+	uint16_t pipebuf;  ///< Which 64-byte FIFO block the pipe starts at, and how many blocks it owns.
+	uint16_t pipemaxp; ///< Largest packet the hardware will send in one transaction.
+	uint16_t pipeperi; ///< Isochronous interval and the buffer-flush bit.
+};
+
+PipeConfig pipeConfig = {};
+bool pipeConfigRead = false;
+
+/// Steers the chip's shared pipe selector to the audio pipe, reads its configuration, and puts the selector back.
+///
+/// Interrupts are off across the sequence and the previous selection is restored, because the driver's own send
+/// path steers the same register - leaving it pointing elsewhere would corrupt the next write rather than this
+/// read. Called once per stream rather than per report for the same reason: the configuration cannot change
+/// without the driver rewriting it, and the shadow copies below report that for free.
+void readPipeConfig() {
+	usb_regadr_t reg = usb_hstd_get_usb_ip_adr(USB_CFG_USE_USBIP);
+	__disable_irq();
+	const uint16_t previousSelection = reg->PIPESEL;
+	reg->PIPESEL = USB_CFG_PAUDIO_ISO_IN;
+	const PipeConfig read = {reg->PIPECFG, reg->PIPEBUF, reg->PIPEMAXP, reg->PIPEPERI};
+	reg->PIPESEL = previousSelection;
+	__enable_irq();
+	pipeConfig = read;
+	pipeConfigRead = true;
+}
+
 /// PIPEnCTR bits and the driver's transfer-status codes, named here rather than by including the driver's private
 /// headers, which do not compile as C++.
 constexpr uint16_t kPipeCtrInBufM = 0x4000u; ///< The IN buffer still holds data for the host.
@@ -168,9 +209,11 @@ void transferComplete(usb_utr_t* /*ptr*/, uint16_t /*data1*/, uint16_t /*data2*/
 	regsAtLastCompletion = readPipeRegisters();
 	regsSnapshotTaken = true;
 
-	// Hand the next packet over here rather than waiting for the task to come round again. Needing a second pass
-	// to notice the completion is what capped delivery at ~460 packets/s against the 1000/s the host polls at;
-	// from here it is one pass per packet and the cadence is the host's, not the scheduler's.
+	// Hand the next packet over here rather than waiting for the task to come round again, so a transfer is
+	// outstanding at every instant. This was written to lift delivery above the ~470 packets/s measured against
+	// the host's 1000/s and did not move it at all - the shortfall is not the task's cadence. It earns its place
+	// for what it did do: the abandoned-transfer recovery below went from firing several times a second to never,
+	// on an idle machine.
 	//
 	// The copy this costs the interrupt is ~990 bytes at 1 kHz. Measured effect on the audio engine's own 2.9 ms
 	// deadline: see the underrun and resync counters, which is what the numbers below are for.
@@ -369,6 +412,12 @@ void reportStats() {
 	}
 	statReportCountdown = 1000;
 
+	// Once the host has actually selected the streaming interface: before that the driver has not configured the
+	// pipe, so an earlier read would report the state of an endpoint that does not exist yet.
+	if (!pipeConfigRead && streamActive && transferInitialised) {
+		readPipeConfig();
+	}
+
 	// Sized for every counter at its full width rather than for the line as it reads today. Growing this line past
 	// its buffer is the likeliest cause of the freeze on 2026-08-22.
 	char line[256];
@@ -467,6 +516,31 @@ void reportStats() {
 	*p = '\0';
 	Debug::sysexDebugPrint(*Debug::midiDebugCable, regLine, true);
 
+	// Third line rather than more fields on the second: that one already runs near half its buffer at full counter
+	// width, and growing a fixed-size debug line past its buffer is the likeliest cause of the freeze on 2026-08-22.
+	if (pipeConfigRead) {
+		char cfgLine[128];
+		p = cfgLine;
+		emit("AUC cf");
+		emitHex(pipeConfig.pipecfg);
+		emit(" bf");
+		emitHex(pipeConfig.pipebuf);
+		emit(" mp");
+		emitHex(pipeConfig.pipemaxp);
+		emit(" pr");
+		emitHex(pipeConfig.pipeperi);
+		// Read fresh every report, unlike the hardware values above: if the driver reconfigures the pipe mid-stream
+		// these move and the snapshot does not, which is the only way to notice without steering the selector again.
+		emit(" Dcf");
+		emitHex(pipeCfgs[USB_CFG_PAUDIO_ISO_IN]);
+		emit(" Dbf");
+		emitHex(pipeBufs[USB_CFG_PAUDIO_ISO_IN]);
+		emit(" Dmp");
+		emitHex(pipeMaxPs[USB_CFG_PAUDIO_ISO_IN]);
+		*p = '\0';
+		Debug::sysexDebugPrint(*Debug::midiDebugCable, cfgLine, true);
+	}
+
 	statPacketsSent = 0;
 	statFramesSent = 0;
 	statAlt1 = 0;
@@ -512,6 +586,9 @@ void USBAudioStream::routine() {
 		frameAccumulator = 0;
 		primed = false;
 		streamActive = false;
+		// The driver reconfigures the pipe on the next SetInterface, so the snapshot is only valid for the stream
+		// it was taken from.
+		pipeConfigRead = false;
 		readFrame = writeFrame;
 		return;
 	}
