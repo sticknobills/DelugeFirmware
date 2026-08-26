@@ -178,7 +178,17 @@ volatile uint32_t queueRead = 0;
 /// which is why driving writes from the frame interrupt itself delivered 0.42x. Rather than track the host's
 /// phase with a control loop, the timer walks its own period forward until a write lands and then holds. A
 /// search that stops when it succeeds cannot oscillate; a loop that integrates phase error can.
-constexpr uint32_t kTimerTicksPerMs = DELUGE_CLOCKS_PER / 1000u;
+/// Deliberately a little SHORT of a millisecond, so the timer runs slightly faster than the host's frame rate.
+///
+/// A free-running timer at a nominal 1 kHz measured 990 fires a second against the host's 1000, and a timer that
+/// runs slow can never catch up: it loses ~10 frames a second however well it is phased, and the host conceals
+/// each one by repeating 244 ms-old audio out of its own input ring. Running fast costs nothing, because a fire
+/// that arrives while the plane is still shut simply writes nothing and comes round again - the plane opening is
+/// the host's own clock, so the write rate self-limits to the host's rather than to ours.
+///
+/// 3% is far more than the crystals can differ by and well under the margin that would risk two writes landing
+/// in one frame, which the shut check already prevents in any case.
+constexpr uint32_t kTimerTicksPerMs = (DELUGE_CLOCKS_PER / 1000u) * 97u / 100u;
 constexpr uint32_t kPhaseStepTicks = kTimerTicksPerMs / 20u; ///< 50 us
 constexpr int kAudioWriteTimer = 3;                          ///< Timer 3 is the only unused MTU2 channel.
 uint32_t statTimerFires = 0;
