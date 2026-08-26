@@ -98,13 +98,30 @@ volatile uint32_t readFrame = 0;
 bool ringCleared = false;
 bool primed = false;
 
+/// Whether the pipe's second buffer plane has been loaded for this stream. One shot: each completion refills one
+/// plane, so loading the second once is what takes the depth from one to two and keeps it there.
+bool secondPlaneLoaded = false;
+
 /// Whether a host currently has the streaming interface selected. Read by the producer so that a machine with
 /// nothing plugged in does not pay for the conversion, and set in one place so the two sides cannot disagree.
 bool streamActive = false;
 
-/// Copied out of the ring before submitting, because the driver reads this memory after the call returns and
-/// the producer must stay free to write. One buffer suffices: only one transfer is ever in flight.
-alignas(4) uint8_t packet[kMaxPacketBytes] = {};
+/// Copied out of the ring before submitting, because the driver reads this memory after the call returns and the
+/// producer must stay free to write.
+///
+/// Two of them, alternating. The pipe is double-buffered and delivery is measured at a fixed two frames from
+/// completion to next packet, so keeping two packets loaded is the only way to fill every frame - and that means
+/// two submissions can be outstanding, which one staging buffer cannot serve.
+alignas(4) uint8_t packets[2][kMaxPacketBytes] = {};
+uint32_t packetSlot = 0;
+
+/// The staging buffer the next packet is built into. Alternated per submission rather than per completion, so the
+/// buffer handed to the driver is never the one being refilled.
+uint8_t* nextPacketBuffer() {
+	uint8_t* p = packets[packetSlot];
+	packetSlot ^= 1u;
+	return p;
+}
 
 usb_utr_t transfer;
 bool transferInitialised = false;
@@ -129,6 +146,7 @@ uint32_t statPrimeSilence = 0;
 uint32_t statCompletes = 0;
 uint32_t statSubmits = 0;
 uint32_t statLastErr = 0xFFFF;
+uint32_t statSecondPlaneLoads = 0; ///< Should read 1 per stream. More than that means the depth is growing.
 
 /// The audio pipe's own state, straight off the hardware. Five readings of the driver source have produced one
 /// right answer and four wrong ones on this stream; these registers are what the chip itself says.
@@ -253,6 +271,27 @@ void transferComplete(usb_utr_t* /*ptr*/, uint16_t /*data1*/, uint16_t /*data2*/
 		// finished in, not how long it took - a fast write that lands after the SOF is as late as a slow one.
 		const uint32_t delta = (uint32_t)((readFrameNumber() - frameAtCompletion) & kFrameNumberMask);
 		statWriteFrameDelta[delta > 2u ? 2u : delta]++;
+
+		// Load the pipe's second buffer plane too, once per stream, which takes the depth from one packet to two.
+		//
+		// Measured 2026-08-26: the write always finishes inside the frame it started (wd1 zero across ~1100
+		// packets), and a packet still reaches the host exactly two frames after the previous one (cg2 total, cg1
+		// and cg3 zero). The turnaround is fixed, so refilling faster cannot touch it - the frame in between has
+		// nothing loaded to send, and FRMNUM's OVRN bit reads set on every sample, which the hardware manual
+		// defines as an IN token answered with a zero-length packet. Manual 28.4.9(4) and figure 28.11: data ready
+		// before the token gives a packet every frame, data prepared after it gives exactly the interleaved
+		// zero-length packets measured here.
+		//
+		// Here rather than in the task because submit() is the last statement of sendNextPacket() and a completion
+		// can arrive before it returns - two calls from the task can be split by this interrupt, two calls from
+		// inside it cannot, since a second completion on the same pipe cannot preempt this handler.
+		//
+		// Once per stream: from then on each completion refills exactly one plane and the depth holds at two.
+		if (!secondPlaneLoaded) {
+			secondPlaneLoaded = true;
+			statSecondPlaneLoads++;
+			sendNextPacket();
+		}
 	}
 }
 
@@ -294,8 +333,9 @@ void sendNextPacket() {
 	if (!primed) {
 		if (available < kLeadFrames) {
 			statPrimeSilence++;
-			memset(packet, 0, frames * kFrameBytes);
-			submit(packet, frames * kFrameBytes);
+			uint8_t* buffer = nextPacketBuffer();
+			memset(buffer, 0, frames * kFrameBytes);
+			submit(buffer, frames * kFrameBytes);
 			return;
 		}
 		primed = true;
@@ -313,8 +353,9 @@ void sendNextPacket() {
 		// The engine has not produced anything since the last poll. Send correctly sized silence rather than
 		// nothing, so the endpoint keeps answering, and do not advance the read pointer.
 		statUnderruns++;
-		memset(packet, 0, frames * kFrameBytes);
-		submit(packet, frames * kFrameBytes);
+		uint8_t* buffer = nextPacketBuffer();
+		memset(buffer, 0, frames * kFrameBytes);
+		submit(buffer, frames * kFrameBytes);
 		return;
 	}
 
@@ -327,16 +368,17 @@ void sendNextPacket() {
 
 	const uint32_t start = readFrame & kRingMask;
 	const uint32_t firstRun = (start + send > kRingFrames) ? (kRingFrames - start) : send;
-	memcpy(packet, &ring[start * kChannels], firstRun * kFrameBytes);
+	uint8_t* buffer = nextPacketBuffer();
+	memcpy(buffer, &ring[start * kChannels], firstRun * kFrameBytes);
 	if (firstRun < send) {
-		memcpy(&packet[firstRun * kFrameBytes], &ring[0], (send - firstRun) * kFrameBytes);
+		memcpy(&buffer[firstRun * kFrameBytes], &ring[0], (send - firstRun) * kFrameBytes);
 	}
 	readFrame = (readFrame + send) & kRingMask;
 
 	statPacketsSent++;
 	statFramesSent += send;
 
-	submit(packet, send * kFrameBytes);
+	submit(buffer, send * kFrameBytes);
 }
 
 /// Ends a transfer the hardware has already finished with but never reported.
@@ -595,6 +637,8 @@ void reportStats() {
 	emitDec(statCompletionGap[3]);
 	emit(" cg4+:");
 	emitDec(statCompletionGap[4]);
+	emit(" p2:");
+	emitDec(statSecondPlaneLoads);
 	*p = '\0';
 	Debug::sysexDebugPrint(*Debug::midiDebugCable, timingLine, true);
 
@@ -653,6 +697,7 @@ void USBAudioStream::routine() {
 		// it was taken from.
 		pipeConfigRead = false;
 		lastCompletionFrameValid = false;
+		secondPlaneLoaded = false;
 		readFrame = writeFrame;
 		return;
 	}
