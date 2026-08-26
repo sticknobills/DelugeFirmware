@@ -60,7 +60,7 @@
 #endif /* defined(USB_CFG_PMSC_USE) */
 
 #if ((USB_CFG_DTC == USB_CFG_ENABLE) || (USB_CFG_DMA == USB_CFG_ENABLE))
-#include "drivers/usb/r_usb_basic/src/hw/inc/r_usb_dmac.h"
+#include "RZA1/usb/r_usb_basic/src/hw/inc/r_usb_dmac.h"
 #endif /* ((USB_CFG_DTC == USB_CFG_ENABLE) || (USB_CFG_DMA == USB_CFG_ENABLE)) */
 
 /**********************************************************************************************************************

@@ -67,10 +67,18 @@
  * USB_CFG_ENABLE       : Uses DMA
  * USB_CFG_DISABLE      : Does not use DMA
  */
-// I can only get DMA working for one pipe. Look at usb_pstd_pipe2fport(). This sets the DMA channel per pipe, for up to
-// two pipes. So long as only one of these pipes is used, it'll work. Something's stopping both from working together.
-// But, even if I fixed it, using DMA for just 2 pipes still wouldn't be all that helpful.
-#define USB_CFG_DMA USB_CFG_DISABLE
+// Rohan's note, kept because it is the reason this is safe: "I can only get DMA working for one pipe. Look at
+// usb_pstd_pipe2fport(). This sets the DMA channel per pipe, for up to two pipes. So long as only one of these
+// pipes is used, it'll work. Something's stopping both from working together. But, even if I fixed it, using DMA
+// for just 2 pipes still wouldn't be all that helpful."
+//
+// Audio is exactly the single-pipe case he says works. usb_pstd_pipe2fport() is restricted below so only the
+// isochronous audio pipe takes a DMA port; USB MIDI keeps the CPU FIFO and is untouched.
+//
+// Why it is needed rather than an optimisation: the CPU is granted buffer access only while the pipe is empty.
+// PIPE1CTR reads BSTS 1 at every completion and 0 the moment one packet is written, so a second write from the
+// CPU is refused - measured 2026-08-26, thirteen attempts and thirteen refusals.
+#define USB_CFG_DMA USB_CFG_ENABLE
 
 /** [DMA Channel setting(USB0 module Send transfer)]
  * USB_CFG_CH0          : Uses DMAC0

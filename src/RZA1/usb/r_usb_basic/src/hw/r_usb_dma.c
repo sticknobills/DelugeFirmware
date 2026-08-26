@@ -38,7 +38,7 @@
 #if ((USB_CFG_DTC == USB_CFG_ENABLE) || (USB_CFG_DMA == USB_CFG_ENABLE))
 #include "RZA1/cache/cache.h"
 #include "RZA1/intc/devdrv_intc.h" /* INTC Driver Header   */
-#include "drivers/usb/r_usb_basic/src/hw/inc/r_usb_dmac.h"
+#include "RZA1/usb/r_usb_basic/src/hw/inc/r_usb_dmac.h"
 
 /***********************************************************************************************************************
  Exported global functions (to be accessed by other files)

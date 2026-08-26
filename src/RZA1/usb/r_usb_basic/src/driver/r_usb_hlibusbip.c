@@ -44,7 +44,7 @@
 #include "deluge/io/midi/midi_engine.h"
 
 #if ((USB_CFG_DTC == USB_CFG_ENABLE) || (USB_CFG_DMA == USB_CFG_ENABLE))
-#include "drivers/usb/r_usb_basic/src/hw/inc/r_usb_dmac.h"
+#include "RZA1/usb/r_usb_basic/src/hw/inc/r_usb_dmac.h"
 #endif /* ((USB_CFG_DTC == USB_CFG_ENABLE) || (USB_CFG_DMA == USB_CFG_ENABLE)) */
 
 #if ((USB_CFG_MODE & USB_CFG_HOST) == USB_CFG_HOST)
@@ -379,16 +379,9 @@ uint16_t usb_hstd_pipe2fport(usb_utr_t* ptr, uint16_t pipe)
 {
     uint16_t fifo_mode = USB_CUSE;
 
-#if ((USB_CFG_DTC == USB_CFG_ENABLE) || (USB_CFG_DMA == USB_CFG_ENABLE))
-    if (USB_PIPE1 == pipe)
-    {
-        fifo_mode = USB_D0DMA;
-    }
-    if (USB_PIPE2 == pipe)
-    {
-        fifo_mode = USB_D1DMA;
-    }
-#endif /* ((USB_CFG_DTC == USB_CFG_ENABLE) || (USB_CFG_DMA == USB_CFG_ENABLE)) */
+    /* DMA is enabled for the peripheral audio pipe only. Host mode stays on the CPU FIFO, which is what it used
+     * when DMA was disabled outright, so USB MIDI host is unaffected. This function is the only thing that
+     * selects a port for the host, so returning CUSE here makes every host DMA branch unreachable. */
 
     return fifo_mode;
 } /* End of function usb_hstd_pipe2fport() */
@@ -909,7 +902,10 @@ void usb_hstd_receive_start(usb_utr_t* ptr, uint16_t pipe)
 
             break;
 
-#if ((USB_CFG_DTC == USB_CFG_ENABLE) || (USB_CFG_DMA == USB_CFG_ENABLE))
+/* Unreachable and uncompilable, same as the send-side branch in r_usb_hdriver.c:
+ * usb_hstd_pipe2fport() never returns a DMA port now that DMA belongs to the peripheral
+ * audio pipe alone, and this reads g_usb_hstd_data_cnt, which this fork removed. */
+#if 0
         /* D1FIFO DMA */
         case USB_D1DMA:
         /* D0FIFO DMA */
@@ -1350,7 +1346,10 @@ void usb_hstd_brdy_pipe_process(usb_utr_t* ptr, uint16_t bitsts)
                 useport = usb_hstd_pipe2fport(ptr, i);
                 if ((USB_D0DMA == useport) || (USB_D1DMA == useport))
                 {
-#if ((USB_CFG_DTC == USB_CFG_ENABLE) || (USB_CFG_DMA == USB_CFG_ENABLE))
+/* Unreachable and uncompilable, same as the send-side branch in r_usb_hdriver.c:
+ * usb_hstd_pipe2fport() never returns a DMA port now that DMA belongs to the peripheral
+ * audio pipe alone, and this reads g_usb_hstd_data_cnt, which this fork removed. */
+#if 0
                     dma_ch = usb_dma_ref_ch_no(ip, useport);
 
                     maxps = g_usb_cstd_dma_fifo[ip][dma_ch];

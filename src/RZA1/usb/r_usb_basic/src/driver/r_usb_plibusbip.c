@@ -95,13 +95,12 @@ uint16_t usb_pstd_pipe2fport(uint16_t pipe)
     uint16_t fifo_mode = USB_CUSE;
 
 #if ((USB_CFG_DTC == USB_CFG_ENABLE) || (USB_CFG_DMA == USB_CFG_ENABLE))
-    if (USB_PIPE1 == pipe)
+    /* Only the audio pipe takes a DMA port. Two pipes on DMA concurrently do not work here - see the note in
+     * r_usb_basic_config.h - and USB MIDI holds PIPE2, so leaving it on the CPU FIFO is what keeps this to the
+     * single-pipe case that does. */
+    if (USB_CFG_PAUDIO_ISO_IN == pipe)
     {
         fifo_mode = USB_D0DMA;
-    }
-    if (USB_PIPE2 == pipe)
-    {
-        fifo_mode = USB_D1DMA;
     }
 #endif /* ((USB_CFG_DTC == USB_CFG_ENABLE) || (USB_CFG_DMA == USB_CFG_ENABLE)) */
 

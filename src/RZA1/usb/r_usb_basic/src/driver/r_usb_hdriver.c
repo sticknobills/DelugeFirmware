@@ -1462,6 +1462,10 @@ void usb_hstd_send_start(usb_utr_t* ptr, uint16_t pipe)
             break;
 
 #if ((USB_CFG_DTC == USB_CFG_ENABLE) || (USB_CFG_DMA == USB_CFG_ENABLE))
+/* Unreachable: usb_hstd_pipe2fport() never returns a DMA port. It also cannot compile - it reads
+ * g_usb_hstd_data_cnt, which this fork removed (see line 125) - so it is compiled out rather than
+ * given a resurrected global that nothing maintains. */
+#if 0
         /* D0FIFO DMA */
         case USB_D0DMA:
         /* D1FIFO DMA */
@@ -1498,6 +1502,7 @@ void usb_hstd_send_start(usb_utr_t* ptr, uint16_t pipe)
             usb_cstd_set_buf(ptr, pipe); /* Set BUF */
 
             break;
+#endif /* 0 - unreachable host DMA branch, see above */
 #endif /* ((USB_CFG_DTC == USB_CFG_ENABLE) || (USB_CFG_DMA == USB_CFG_ENABLE)) */
 
         default:

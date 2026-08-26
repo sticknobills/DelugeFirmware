@@ -89,7 +89,7 @@ enum UartItemType {
 // DMA --------------------------------------------------------------------------
 /*
 DMA channels:
-0:
+0: USB audio TX - USB_CFG_USB0_DMA_TX in r_usb_basic_config.h
 1:
 2: SD host - defined in sd_cfg.h
 3:
