@@ -137,6 +137,10 @@ uint32_t statUnderruns = 0;
 uint32_t statResyncs = 0;
 uint32_t statPacketsSent = 0;
 uint32_t statFramesSent = 0;
+/// Frames the audio routine wrote in, and frames a resync threw away. With statFramesSent these three have
+/// to balance: what goes into the ring is either sent or discarded. They do not, and the gap is the fault.
+uint32_t statFramesIn = 0;
+uint32_t statFramesDiscarded = 0;
 uint32_t statReportCountdown = 0;
 
 /// Branch counters. "Nothing was sent" cannot distinguish the task never running, the task
@@ -474,6 +478,7 @@ uint32_t buildNextPacket(uint8_t* buffer) {
 	// The host is not draining us fast enough to keep up. A rate trim cannot recover this in useful time, so
 	// put the read pointer back at the lead and take the one discontinuity.
 	if (available >= kResyncFrames) {
+		statFramesDiscarded += available - kLeadFrames;
 		readFrame = (writeFrame - kLeadFrames) & kRingMask;
 		available = kLeadFrames;
 		statResyncs++;
@@ -728,6 +733,10 @@ void reportStats() {
 	emitDec(statAbandonedEnded);
 	emit(" rs");
 	emitDec(statResyncs);
+	emit(" fin");
+	emitDec(statFramesIn);
+	emit(" fdis");
+	emitDec(statFramesDiscarded);
 	emit(" lead");
 	emitDec((writeFrame - readFrame) & kRingMask);
 	*p = '\0';
@@ -887,6 +896,8 @@ void reportStats() {
 
 	statPacketsSent = 0;
 	statFramesSent = 0;
+	statFramesIn = 0;
+	statFramesDiscarded = 0;
 	statAlt1 = 0;
 	statInFlight = 0;
 	statPrimeSilence = 0;
@@ -1000,6 +1011,8 @@ void USBAudioStream::feedMix(const StereoSample* mix, uint32_t numSamples) {
 	// makes that safe is the pointers rather than the scheduler: one writer each, 32-bit aligned, and each is
 	// advanced only after its own data is in place, which is the ordinary single-producer/single-consumer ring.
 	// Both sides run on the same core, so there is no cache to reconcile - only the compiler, which volatile holds.
+
+	statFramesIn += numSamples;
 
 	uint32_t w = writeFrame;
 	for (uint32_t i = 0; i < numSamples; i++) {
