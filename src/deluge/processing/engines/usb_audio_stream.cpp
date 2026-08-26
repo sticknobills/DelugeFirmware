@@ -199,6 +199,18 @@ uint32_t sofToWriteTicks = (kTimerTicksPerMs * 3u) / 4u; ///< 750 us
 constexpr uint32_t kSofOffsetMin = kTimerTicksPerMs / 10u;
 constexpr uint32_t kSofOffsetMax = (kTimerTicksPerMs * 19u) / 20u;
 uint32_t statSofSeen = 0;
+
+/// Only leave a working offset after several frames of failure. The first cut stepped on every miss and wrapped
+/// at the top, so it cycled instead of converging - it reported 649 us against a window measured at 700-799.
+uint32_t consecutiveShut = 0;
+constexpr uint32_t kShutBeforeStepping = 4u;
+
+/// How long to keep waiting for the FIFO to report itself ready, in ticks of the 29.6 ns superfast timer.
+/// 128 ticks is ~3.8 us - well inside the frame, and bounded.
+constexpr uint16_t kFrdyWaitTicks = 128u;
+uint32_t statFrdyImmediate = 0;     ///< ready inside the vendored 100 ns
+uint32_t statFrdyLate = 0;          ///< ready only because we waited longer - what the old timeout was discarding
+uint32_t statFrdyNever = 0;         ///< genuinely not ready at all
 constexpr int kAudioWriteTimer = 3; ///< Timer 3 is the only unused MTU2 channel.
 uint32_t statTimerFires = 0;
 uint32_t statTimerWrote = 0;
@@ -854,6 +866,12 @@ void reportStats() {
 	emitDec(statTimerShut);
 	emit(" sof");
 	emitDec(statSofSeen);
+	emit(" fri");
+	emitDec(statFrdyImmediate);
+	emit(" frl");
+	emitDec(statFrdyLate);
+	emit(" frn");
+	emitDec(statFrdyNever);
 	emit(" sofo");
 	emitDec(sofToWriteTicks * 1000u / kTimerTicksPerMs); ///< the settled offset, in us
 	emit(" tem");
@@ -1067,6 +1085,9 @@ void reportStats() {
 	statTimerWrote = 0;
 	statTimerShut = 0;
 	statSofSeen = 0;
+	statFrdyImmediate = 0;
+	statFrdyLate = 0;
+	statFrdyNever = 0;
 	statTimerEmpty = 0;
 	statQueueBuilt = 0;
 	statBuilds = 0;
@@ -1129,6 +1150,27 @@ void restoreFifoPort(uint16_t savedSel, uint16_t savedShadow) {
 	} while ((seen & (kFifoSelIsel | kFifoSelCurPipe)) != (savedSel & (kFifoSelIsel | kFifoSelCurPipe)));
 }
 
+/// Keeps waiting where the vendored call gives up.
+///
+/// usb_cstd_is_set_frdy_rohan re-points the shared FIFO port at our pipe and then allows FRDY just 5 ticks of
+/// the 29.6 ns timer - 100 ns - to assert. The port change is already done by the time it returns an error, so
+/// this carries on polling the same register. If a large share of writes are rescued here, the "plane shut"
+/// this build has been chasing was never the plane: it was a timeout too short for the port change to settle,
+/// and it read as a stable 16-19% loss on every version of this timer, free-running or SOF-clocked.
+uint16_t extendFifoWait() {
+	volatile uint16_t* const ctr = (volatile uint16_t*)&(USB201.CFIFOCTR);
+	const uint16_t start = *TCNT[TIMER_SYSTEM_SUPERFAST];
+	while ((uint16_t)(*TCNT[TIMER_SYSTEM_SUPERFAST] - start) < kFrdyWaitTicks) {
+		const uint16_t buffer = *ctr;
+		if ((buffer & kFifoCtrFrdy) != 0u) {
+			statFrdyLate++;
+			return buffer;
+		}
+	}
+	statFrdyNever++;
+	return kFifoError;
+}
+
 void audioWriteTimerInterrupt(uint32_t /*intSense*/) {
 	timerClearCompareMatchTGRA(kAudioWriteTimer);
 	statTimerFires++;
@@ -1151,7 +1193,13 @@ void audioWriteTimerInterrupt(uint32_t /*intSense*/) {
 	// Restoring unconditionally costs a pipe change on every write, and usb_cstd_is_set_frdy_rohan gives up if
 	// the port is not ready within 100 ns - measured as 753 refusals a second against 37 writes.
 	const bool borrowed = (savedSel & kFifoSelCurPipe) != USB_CFG_PAUDIO_ISO_IN;
-	const uint16_t status = usb_cstd_is_set_frdy_rohan(USB_CFG_PAUDIO_ISO_IN);
+	uint16_t status = usb_cstd_is_set_frdy_rohan(USB_CFG_PAUDIO_ISO_IN);
+	if (status == kFifoError) {
+		status = extendFifoWait();
+	}
+	else {
+		statFrdyImmediate++;
+	}
 	if (status == kFifoError) {
 		if (borrowed) {
 			restoreFifoPort(savedSel, savedShadow);
@@ -1161,9 +1209,12 @@ void audioWriteTimerInterrupt(uint32_t /*intSense*/) {
 		// Step the offset from the frame boundary, not the timer's period. Against SOF the window does not
 		// move, so this converges and then stops - unlike a period walk, which corrects a phase error that the
 		// two crystals immediately reintroduce.
-		sofToWriteTicks += kPhaseStepTicks;
-		if (sofToWriteTicks > kSofOffsetMax) {
-			sofToWriteTicks = kSofOffsetMin;
+		if (++consecutiveShut >= kShutBeforeStepping) {
+			consecutiveShut = 0;
+			sofToWriteTicks += kPhaseStepTicks;
+			if (sofToWriteTicks > kSofOffsetMax) {
+				sofToWriteTicks = kSofOffsetMin;
+			}
 		}
 		return;
 	}
@@ -1182,6 +1233,7 @@ void audioWriteTimerInterrupt(uint32_t /*intSense*/) {
 	statTimerWrote++;
 
 	// A write landed, so this offset is the right one. Hold it; SOF re-arms the timer for the next frame.
+	consecutiveShut = 0;
 }
 
 /// Fills the queue from the task, where the copy is affordable.
