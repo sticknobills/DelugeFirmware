@@ -160,11 +160,9 @@ uint32_t statFramesDiscarded = 0;
 /// task passes sampled at random phase, so it is open somewhere - and where decides whether a frame-driven
 /// write can ever land.
 ///
-/// One bounded burst of just over a frame, roughly eight times a second, rather than continuous sampling: a
-/// 990-byte copy inside a 1 kHz interrupt is what made the Deluge itself stutter. At 64 passes that is ~1% of
-/// the task's time; the first cut at 512 gave only 20 opening transitions in 50 s, which is not enough to tell
-/// a bimodal distribution from noise.
-constexpr uint32_t kProbeEveryPasses = 64u;
+/// One bounded burst of just over a frame, roughly once a second, rather than continuous sampling: a 990-byte
+/// copy inside a 1 kHz interrupt is what made the Deluge itself stutter.
+constexpr uint32_t kProbeEveryPasses = 512u;
 constexpr uint32_t kTicksPerUs = DELUGE_CLOCKS_PER / 1000000u;
 constexpr uint32_t kProbeTicks = 1100u * kTicksPerUs;
 constexpr uint32_t kProbeMaxIterations = 60000u;
