@@ -25,10 +25,13 @@
 
 extern "C" {
 #include "OSLikeStuff/timers_interrupts/clock_type.h"
+#include "OSLikeStuff/timers_interrupts/timers_interrupts.h"
+#include "RZA1/mtu/mtu.h"
 #include "RZA1/ostm/ostm.h"
 #include "RZA1/system/iodefine.h"
 #include "RZA1/system/iodefines/usb20_iodefine.h"
 #include "RZA1/usb/r_usb_basic/r_usb_basic_if.h"
+#include "definitions.h"
 #include "deluge/drivers/usb/usb_setup_trace.h"
 #include "deluge/drivers/usb/userdef/r_usb_paudio_config.h"
 
@@ -153,25 +156,33 @@ uint32_t statFramesDiscarded = 0;
 /// Every entry to buildNextPacket, against statPacketsSent which counts only the path that carries real
 /// audio. The sequence stamp advances once per entry and the host reads it advancing at twice the rate
 /// statPacketsSent reports, so one of the two is wrong about how often the builder runs.
-/// Where in the host's 1 ms frame the buffer plane becomes writable, and how long it stays that way.
+/// Packets built by the task and waiting for the timer interrupt to push them into the pipe.
 ///
-/// Two moments have been tried and both were wrong: the microseconds straight after a write (never open across
-/// 291 polls) and the instant of the frame interrupt (mostly closed, v0.14.0, reverted). It is open on ~30% of
-/// task passes sampled at random phase, so it is open somewhere - and where decides whether a frame-driven
-/// write can ever land.
-///
-/// One bounded burst of just over a frame, roughly once a second, rather than continuous sampling: a 990-byte
-/// copy inside a 1 kHz interrupt is what made the Deluge itself stutter.
-constexpr uint32_t kProbeEveryPasses = 512u;
-constexpr uint32_t kTicksPerUs = DELUGE_CLOCKS_PER / 1000000u;
-constexpr uint32_t kProbeTicks = 1100u * kTicksPerUs;
-constexpr uint32_t kProbeMaxIterations = 60000u;
-constexpr uint32_t kPhaseBuckets = 10u; ///< 100 us each, covering one frame.
-uint32_t probeCountdown = kProbeEveryPasses;
-uint32_t statProbeBursts = 0;
-uint32_t statProbeOpenPhase[kPhaseBuckets] = {};
-uint32_t statProbeOpenDwell[kPhaseBuckets] = {};
-uint32_t statProbeNeverOpen = 0;
+/// The build is a ~990-byte copy out of the ring, and v0.14.0 showed this machine cannot afford that inside a
+/// 1 kHz interrupt. So the task builds - it already has the headroom - and the interrupt does nothing but the
+/// FIFO write. Single producer (task), single consumer (timer interrupt), free-running indices.
+constexpr uint32_t kQueueSlots = 4u;
+struct QueuedPacket {
+	alignas(4) uint8_t data[kMaxPacketBytes];
+	uint16_t bytes;
+};
+QueuedPacket packetQueue[kQueueSlots];
+volatile uint32_t queueWrite = 0;
+volatile uint32_t queueRead = 0;
+
+/// The window opens 700-799 us into the host's frame on 84% of observations, and never at the frame boundary -
+/// which is why driving writes from the frame interrupt itself delivered 0.42x. Rather than track the host's
+/// phase with a control loop, the timer walks its own period forward until a write lands and then holds. A
+/// search that stops when it succeeds cannot oscillate; a loop that integrates phase error can.
+constexpr uint32_t kTimerTicksPerMs = DELUGE_CLOCKS_PER / 1000u;
+constexpr uint32_t kPhaseStepTicks = kTimerTicksPerMs / 20u; ///< 50 us
+constexpr int kAudioWriteTimer = 3;                          ///< Timer 3 is the only unused MTU2 channel.
+uint32_t statTimerFires = 0;
+uint32_t statTimerWrote = 0;
+uint32_t statTimerShut = 0;
+uint32_t statTimerEmpty = 0;
+uint32_t statQueueBuilt = 0;
+bool audioTimerRunning = false;
 uint32_t statBuilds = 0;
 uint32_t statResyncGenuine = 0;
 uint32_t statResyncOvertaken = 0;
@@ -573,50 +584,6 @@ void sendNextPacket() {
 	submit(buffer, frames * kFrameBytes);
 }
 
-/// Loads a second packet straight into the pipe's other buffer plane, bypassing the driver's transfer record.
-///
-/// Measured 2026-08-26: a plane is writable while a packet is still pending on about 18% of task passes, but
-/// never in the microseconds straight after a write - which is the only moment anything had ever looked. That
-/// is why loading the second plane from the completion interrupt was refused thirteen times out of thirteen.
-///
-/// Deliberately not through submit(): usb_pstd_transfer_start() rewrites the driver's per-pipe transfer record
-/// and clears the pipe's buffer-empty status, and doing either mid-flight loses the completion for the packet
-/// already on the wire. Nothing here touches g_p_usb_pipe, so the outstanding transfer stays exactly as it is.
-///
-/// Interrupts are off across the build and the write together. The shared CPU FIFO port is steered by whoever
-/// writes next, so a completion interrupt landing mid-write would send the rest of this packet to MIDI's pipe;
-/// and the ring's read pointer has one writer by design, which this path would otherwise become the second of.
-/// The cost is a ~990-byte copy plus the FIFO write, a few microseconds against the 1 ms the endpoint is
-/// serviced on - the underrun, resync and recovery counters are what say whether it was affordable.
-void writeExtraPlane() {
-	__disable_irq();
-
-	// Readiness first, and only then build. Building first would consume frames from the ring that a refused
-	// write then drops on the floor - a silent gap in the audio, paid for a packet that never went anywhere.
-	// This call also steers the shared FIFO port to our pipe, which the write below relies on; interrupts stay
-	// off from here so nothing steers it away in between.
-	//
-	// A success returns the port's status word, which always has FRDY set and so is never 0xFF - the error
-	// value cannot collide with a real reading.
-	const uint16_t status = usb_cstd_is_set_frdy_rohan(USB_CFG_PAUDIO_ISO_IN);
-	if (status == kFifoError) {
-		// The window shut between the read that found it open and this one. Nothing built, nothing consumed.
-		statExtraRefused++;
-		__enable_irq();
-		return;
-	}
-
-	const uint32_t frames = buildNextPacket(extraPacket);
-	usb_pstd_write_fifo((uint16_t)(frames * kFrameBytes), kUseCpuFifo, extraPacket);
-	if ((hw_usb_read_fifoctr(nullptr, kUseCpuFifo) & kFifoCtrBval) == 0u) {
-		// 990 bytes into a 1024-byte plane is short of the plane, so the hardware does not commit it by itself.
-		hw_usb_set_bval(nullptr, kUseCpuFifo);
-	}
-	statExtraWritten++;
-
-	__enable_irq();
-}
-
 /// Ends a transfer the hardware has already finished with but never reported.
 ///
 /// An isochronous IN the device is not ready for ends with a not-ready event rather than the buffer-empty one that
@@ -785,6 +752,16 @@ void reportStats() {
 	emitDec(statAbandonedEnded);
 	emit(" rs");
 	emitDec(statResyncs);
+	emit(" tf");
+	emitDec(statTimerFires);
+	emit(" tw");
+	emitDec(statTimerWrote);
+	emit(" tsh");
+	emitDec(statTimerShut);
+	emit(" tem");
+	emitDec(statTimerEmpty);
+	emit(" qb");
+	emitDec(statQueueBuilt);
 	emit(" bld");
 	emitDec(statBuilds);
 	emit(" rgen");
@@ -954,37 +931,15 @@ void reportStats() {
 	*p = '\0';
 	Debug::sysexDebugPrint(*Debug::midiDebugCable, readyLine, true);
 
-	// Own buffer and own line: the AU line already runs well past half of its 256 bytes at full counter width,
-	// and growing a fixed-size debug line past its buffer is the likeliest cause of the freeze on 2026-08-22.
-	{
-		char probeLine[192];
-		p = probeLine;
-		emit("AUQ b");
-		emitDec(statProbeBursts);
-		emit(" none");
-		emitDec(statProbeNeverOpen);
-		emit(" ph");
-		for (uint32_t i = 0; i < kPhaseBuckets; i++) {
-			if (i != 0u) {
-				emit(",");
-			}
-			emitDec(statProbeOpenPhase[i]);
-		}
-		emit(" dw");
-		for (uint32_t i = 0; i < kPhaseBuckets; i++) {
-			if (i != 0u) {
-				emit(",");
-			}
-			emitDec(statProbeOpenDwell[i]);
-		}
-		*p = '\0';
-		Debug::sysexDebugPrint(*Debug::midiDebugCable, probeLine, true);
-	}
-
 	statPacketsSent = 0;
 	statFramesSent = 0;
 	statFramesIn = 0;
 	statFramesDiscarded = 0;
+	statTimerFires = 0;
+	statTimerWrote = 0;
+	statTimerShut = 0;
+	statTimerEmpty = 0;
+	statQueueBuilt = 0;
 	statBuilds = 0;
 	statResyncGenuine = 0;
 	statResyncOvertaken = 0;
@@ -1023,53 +978,84 @@ void reportStats() {
 	// usbBempBitsSeen is deliberately not cleared: which pipes are live at all is the question, not how often.
 }
 
-/// One bounded look at the pipe across a whole host frame, at timer resolution.
+/// Pushes one pre-built packet into the pipe, from the timer interrupt.
 ///
-/// Reads only - PIPE1CTR and FRMNUM are read at their own addresses without steering the shared FIFO port, so
-/// this cannot disturb MIDI, and nothing here writes a register. Bounded by elapsed time with an iteration cap
-/// behind it: an unbounded loop on a hardware flag is how the machine froze on 2026-08-22.
-void probeWindowPhase() {
-	const uint32_t start = getTimerValue(0);
-	uint16_t lastFrm = readFrameNumber();
-	uint32_t frameStart = 0;
-	bool frameStartValid = false;
-	bool wasOpen = (readPipeCtr() & kPipeCtrBsts) != 0u;
-	uint32_t openedAt = 0;
-	bool sawOpen = false;
+/// Does no building and touches neither the ring nor the sequence counter: those belong to the task, because a
+/// ~990-byte copy out of the ring inside a 1 kHz interrupt is what starved the audio engine on v0.14.0. All this
+/// does is steer the shared FIFO port and push bytes that are already sitting in memory.
+void audioWriteTimerInterrupt(uint32_t /*intSense*/) {
+	timerClearCompareMatchTGRA(kAudioWriteTimer);
+	statTimerFires++;
 
-	for (uint32_t i = 0; i < kProbeMaxIterations; i++) {
-		const uint32_t now = getTimerValue(0);
-		if ((uint32_t)(now - start) >= kProbeTicks) {
-			break;
-		}
-
-		const uint16_t frm = readFrameNumber();
-		if (frm != lastFrm) {
-			lastFrm = frm;
-			frameStart = now;
-			frameStartValid = true;
-		}
-
-		const bool open = (readPipeCtr() & kPipeCtrBsts) != 0u;
-		if (open && !wasOpen) {
-			openedAt = now;
-			sawOpen = true;
-			if (frameStartValid) {
-				const uint32_t us = (uint32_t)(now - frameStart) / kTicksPerUs;
-				statProbeOpenPhase[us >= (kPhaseBuckets * 100u) ? (kPhaseBuckets - 1u) : (us / 100u)]++;
-			}
-		}
-		else if (!open && wasOpen && sawOpen) {
-			const uint32_t us = (uint32_t)(now - openedAt) / kTicksPerUs;
-			statProbeOpenDwell[us >= (kPhaseBuckets * 100u) ? (kPhaseBuckets - 1u) : (us / 100u)]++;
-		}
-		wasOpen = open;
+	if (!streamActive || !transferInitialised) {
+		return;
+	}
+	if (queueWrite == queueRead) {
+		statTimerEmpty++;
+		return;
 	}
 
-	statProbeBursts++;
-	if (!sawOpen) {
-		statProbeNeverOpen++;
+	// The FIFO port is shared with MIDI and the readiness check steers it to our pipe, so nothing may run in
+	// between. This interrupt can itself be preempted, so the guard is explicit rather than assumed.
+	DISABLE_ALL_INTERRUPTS();
+	const uint16_t status = usb_cstd_is_set_frdy_rohan(USB_CFG_PAUDIO_ISO_IN);
+	if (status == kFifoError) {
+		ENABLE_ALL_INTERRUPTS();
+		statTimerShut++;
+		// Walk the phase forward. The window sits 700-799 us into the host's frame and this timer is free of it,
+		// so stepping until a write lands finds it without a loop that can oscillate around it.
+		uint16_t next = (uint16_t)(*TGRA[kAudioWriteTimer] + kPhaseStepTicks);
+		if (next > (uint16_t)(kTimerTicksPerMs + kTimerTicksPerMs / 2u)) {
+			next = (uint16_t)kTimerTicksPerMs;
+		}
+		*TGRA[kAudioWriteTimer] = next;
+		return;
 	}
+
+	QueuedPacket& q = packetQueue[queueRead % kQueueSlots];
+	usb_pstd_write_fifo(q.bytes, kUseCpuFifo, q.data);
+	if ((hw_usb_read_fifoctr(nullptr, kUseCpuFifo) & kFifoCtrBval) == 0u) {
+		hw_usb_set_bval(nullptr, kUseCpuFifo);
+	}
+	ENABLE_ALL_INTERRUPTS();
+	queueRead++;
+	statTimerWrote++;
+
+	// A write landed, so this phase is the right one. Hold it.
+	*TGRA[kAudioWriteTimer] = (uint16_t)kTimerTicksPerMs;
+}
+
+/// Fills the queue from the task, where the copy is affordable.
+void buildQueuedPackets() {
+	while ((uint32_t)(queueWrite - queueRead) < kQueueSlots) {
+		QueuedPacket& q = packetQueue[queueWrite % kQueueSlots];
+		const uint32_t frames = buildNextPacket(q.data);
+		q.bytes = (uint16_t)(frames * kFrameBytes);
+		// The slot's contents must be visible before the index that publishes it.
+		__asm volatile("DSB" ::: "memory");
+		queueWrite++;
+		statQueueBuilt++;
+	}
+}
+
+void startAudioWriteTimer() {
+	if (audioTimerRunning) {
+		return;
+	}
+	setupTimerWithInterruptHandler(kAudioWriteTimer, 1, audioWriteTimerInterrupt, 5);
+	*TGRA[kAudioWriteTimer] = (uint16_t)kTimerTicksPerMs;
+	R_INTC_Enable(INTC_ID_TGIA[kAudioWriteTimer]);
+	enableTimer(kAudioWriteTimer);
+	audioTimerRunning = true;
+}
+
+void stopAudioWriteTimer() {
+	if (!audioTimerRunning) {
+		return;
+	}
+	disableTimer(kAudioWriteTimer);
+	R_INTC_Disable(INTC_ID_TGIA[kAudioWriteTimer]);
+	audioTimerRunning = false;
 }
 
 } // namespace
@@ -1106,6 +1092,8 @@ void USBAudioStream::routine() {
 		pipeConfigRead = false;
 		lastCompletionFrameValid = false;
 		readFrame = writeFrame;
+		queueRead = queueWrite;
+		stopAudioWriteTimer();
 		return;
 	}
 	streamActive = true;
@@ -1119,16 +1107,12 @@ void USBAudioStream::routine() {
 		statReadyState[(((ctr & kPipeCtrBsts) != 0u) ? 2u : 0u) | (((ctr & kPipeCtrInBufM) != 0u) ? 1u : 0u)]++;
 		// Data pending and a plane writable: the second plane can be loaded now, and this is the only moment it
 		// can be. Anything else is either nothing to double up on or a port that would refuse the write.
-		if ((ctr & (kPipeCtrBsts | kPipeCtrInBufM)) == (kPipeCtrBsts | kPipeCtrInBufM)) {
-			writeExtraPlane();
-		}
-		else {
+		if ((ctr & (kPipeCtrBsts | kPipeCtrInBufM)) != (kPipeCtrBsts | kPipeCtrInBufM)) {
 			statExtraNoWindow++;
 		}
-		if (--probeCountdown == 0u) {
-			probeCountdown = kProbeEveryPasses;
-			probeWindowPhase();
-		}
+		// The timer interrupt owns the writes now; the task's job is to keep packets ready for it. Building here
+		// rather than there is the whole point: this copy is what could not be afforded inside an interrupt.
+		buildQueuedPackets();
 		endAbandonedTransfer();
 		return;
 	}
@@ -1143,6 +1127,9 @@ void USBAudioStream::routine() {
 	}
 
 	sendNextPacket();
+	// Started only once a host is actually streaming and the driver's own first transfer is set up, so an idle
+	// Deluge pays nothing and the timer never fires against an unconfigured pipe.
+	startAudioWriteTimer();
 }
 
 void USBAudioStream::feedMix(const StereoSample* mix, uint32_t numSamples) {
