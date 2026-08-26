@@ -276,9 +276,39 @@ uint32_t statCompletionGap[5] = {};   ///< Frames between consecutive completion
 uint32_t lastCompletionFrame = 0;
 bool lastCompletionFrameValid = false;
 
+constexpr uint16_t kPipeCtrBsts = 0x8000u; ///< b15: the CPU may access the pipe's FIFO buffer.
+
+/// Whether a buffer plane is ever writable while a packet is still pending.
+///
+/// Everything measured so far read the pipe immediately after a write, which is one instant of a two-frame
+/// cycle. DMA does not bypass this - its request line is "transmit FIFO empty", so the hardware asks for a
+/// write only when it would accept one. If a plane never becomes writable while a packet is outstanding, DMA
+/// is never asked and cannot help; if one opens briefly, DMA catches a window an interrupt-driven CPU write
+/// cannot. That is the whole question, and it decides whether the DMA work is worth doing.
+///
+/// Indexed (BSTS << 1) | INBUFM: 0 neither, 1 data pending and the CPU locked out, 2 empty and writable,
+/// 3 data pending and writable - which is the state being looked for.
+uint32_t statReadyState[4] = {};
+
+/// The same question at a resolution the task cannot reach. The task runs ~1840 times a second against a
+/// 2 ms cycle, so it samples roughly four times per packet and a window of a few microseconds would fall
+/// between its passes. This polls in a bounded loop straight after the write instead.
+constexpr uint32_t kReadyPollIterations = 256u;
+uint32_t statPollFound = 0;                    ///< Polls where a plane became writable while one was pending.
+uint32_t statPollMissed = 0;                   ///< Polls where it never did.
+uint32_t statPollFirstIteration = 0xFFFFFFFFu; ///< Fewest iterations taken to see it. Latched, never cleared.
+
 constexpr uint16_t kFrameNumberMask = 0x07FFu; ///< FRMNUM b10-0; b15 is OVRN and b14 CRCE.
 
 /// FRMNUM alone rather than the whole register set, because this runs twice per completion inside the interrupt.
+/// PIPEnCTR alone. Directly addressable, so unlike the configuration registers this needs no steering of the
+/// shared pipe selector and is safe to read from an interrupt at any rate.
+uint16_t readPipeCtr() {
+	usb_regadr_t reg = usb_hstd_get_usb_ip_adr(USB_CFG_USE_USBIP);
+	volatile uint16_t* pipectr = &reg->PIPE1CTR + (USB_CFG_PAUDIO_ISO_IN - 1);
+	return *pipectr;
+}
+
 uint16_t readFrameNumber() {
 	usb_regadr_t reg = usb_hstd_get_usb_ip_adr(USB_CFG_USE_USBIP);
 	return (uint16_t)(reg->FRMNUM & kFrameNumberMask);
@@ -316,6 +346,30 @@ void transferComplete(usb_utr_t* /*ptr*/, uint16_t /*data1*/, uint16_t /*data2*/
 		// finished in, not how long it took - a fast write that lands after the SOF is as late as a slow one.
 		const uint32_t delta = (uint32_t)((readFrameNumber() - frameAtCompletion) & kFrameNumberMask);
 		statWriteFrameDelta[delta > 2u ? 2u : delta]++;
+
+		// Bounded rather than open: this runs inside the interrupt, and a loop whose length comes from the
+		// hardware is how the machine froze on 2026-08-22. 256 register reads is a few microseconds against the
+		// audio engine's 2.9 ms deadline, and the underrun and resync counters are what say whether it cost
+		// anything. Reads only - nothing here writes a register.
+		uint32_t iteration = 0;
+		for (; iteration < kReadyPollIterations; iteration++) {
+			const uint16_t ctr = readPipeCtr();
+			if ((ctr & kPipeCtrInBufM) == 0u) {
+				// The packet has already gone. Past this point a writable plane says nothing about whether one
+				// was ever free *while* a packet was pending, which is the question.
+				break;
+			}
+			if ((ctr & kPipeCtrBsts) != 0u) {
+				statPollFound++;
+				if (iteration < statPollFirstIteration) {
+					statPollFirstIteration = iteration;
+				}
+				break;
+			}
+		}
+		if (iteration >= kReadyPollIterations) {
+			statPollMissed++;
+		}
 	}
 }
 
@@ -728,6 +782,34 @@ void reportStats() {
 	*p = '\0';
 	Debug::sysexDebugPrint(*Debug::midiDebugCable, planeLine, true);
 
+	// Sixth line, own buffer for the reason the others carry. ts is the task-side 2x2 over the whole cycle;
+	// pf/pm/pi is the bounded poll straight after the write, at a resolution the task cannot reach.
+	char readyLine[192];
+	p = readyLine;
+	emit("AUW ts0:");
+	emitDec(statReadyState[0]);
+	emit(" ts1:");
+	emitDec(statReadyState[1]);
+	emit(" ts2:");
+	emitDec(statReadyState[2]);
+	emit(" ts3:");
+	emitDec(statReadyState[3]);
+	emit(" pf:");
+	emitDec(statPollFound);
+	emit(" pm:");
+	emitDec(statPollMissed);
+	emit(" pi:");
+	if (statPollFirstIteration == 0xFFFFFFFFu) {
+		// Dashes rather than a sentinel number: never seen and seen at iteration 4294967295 are different
+		// findings, and confusing the two is what this build exists to avoid.
+		emit("----");
+	}
+	else {
+		emitDec(statPollFirstIteration);
+	}
+	*p = '\0';
+	Debug::sysexDebugPrint(*Debug::midiDebugCable, readyLine, true);
+
 	statPacketsSent = 0;
 	statFramesSent = 0;
 	statAlt1 = 0;
@@ -747,6 +829,13 @@ void reportStats() {
 	for (uint32_t i = 0; i < 5; i++) {
 		statCompletionGap[i] = 0;
 	}
+	for (uint32_t i = 0; i < 4; i++) {
+		statReadyState[i] = 0;
+	}
+	statPollFound = 0;
+	statPollMissed = 0;
+	// statPollFirstIteration is deliberately not cleared: the fastest the window has ever been seen to open is
+	// the question, not how often it did in the last second.
 	statFrdyAfterSubmit[0] = 0;
 	statFrdyAfterSubmit[1] = 0;
 	statProbeNotOurs = 0;
@@ -794,6 +883,10 @@ void USBAudioStream::routine() {
 
 	if (transferInFlight) {
 		statInFlight++;
+		// Sampled here rather than at the top of the routine: a transfer is outstanding, which is the only
+		// condition under which "is a plane writable" is the question being asked.
+		const uint16_t ctr = readPipeCtr();
+		statReadyState[(((ctr & kPipeCtrBsts) != 0u) ? 2u : 0u) | (((ctr & kPipeCtrInBufM) != 0u) ? 1u : 0u)]++;
 		endAbandonedTransfer();
 		return;
 	}
