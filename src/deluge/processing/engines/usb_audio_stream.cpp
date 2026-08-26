@@ -74,9 +74,12 @@ static_assert(kMaxPacketBytes <= USB_CFG_PAUDIO_BUF_BYTES,
 
 /// Frames held between the audio routine and this task. A power of two so the wrap is a mask.
 ///
-/// The producer writes a whole render window at once and windows reach 128 frames, so the ring only has to
-/// outrun a burst rather than hold latency. 1024 leaves eight bursts of margin for 22 KB of SDRAM.
-constexpr uint32_t kRingFrames = 1024u;
+/// Sized to outlast a stalled drain, not a single render burst. Under a dense song the task rate falls far
+/// enough that the ring reaches the resync threshold ~60 times a second and discards 14.5 ms each time, which
+/// is audible. 8192 frames is 186 ms of SDRAM headroom for 176 KB, and costs no latency: the lead below sets
+/// that, not the ring. It does raise how far behind the stream can drift before a resync, so a drain deficit
+/// that is sustained rather than bursty will show as lag here instead of glitching.
+constexpr uint32_t kRingFrames = 8192u;
 constexpr uint32_t kRingMask = kRingFrames - 1u;
 
 /// How far ahead of the host the ring tries to stay before the first packet goes out.
