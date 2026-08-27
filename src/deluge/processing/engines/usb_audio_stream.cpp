@@ -139,6 +139,41 @@ volatile uint32_t readFrame = 0;
 bool ringCleared = false;
 bool primed = false;
 
+/// What the host is owed, counted on the host's own clock rather than on ours.
+///
+/// The engine's crystal and the Mac's audio clock differ - measured at ~61 ppm on 2026-08-27 (evening), with
+/// the engine slow. Following the ring instead of the host means delivering the engine's rate, which is 2.7
+/// frames a second short of what the host consumes; macOS covers that by splicing 9-26 frames of quarter-
+/// second-old audio into its input ring roughly every four seconds, and that splice is what is audible. The
+/// drift itself is inaudible. Paying it here, one frame at a time, is not.
+///
+/// 44.1 frames per SOF exactly: 44 plus a thousandth accumulator, so this never drifts against the host by
+/// arithmetic on top of drifting by crystal.
+uint32_t hostOwedFrames = 0;
+uint32_t hostOwedRemainder = 0;
+/// Frames handed to the builder, real and repeated alike. Free-running like the ring pointers, and the
+/// difference against hostOwedFrames is taken signed for the same reason.
+uint32_t framesDelivered = 0;
+
+/// At most this many frames may be conjured into one packet. A single repeated frame is 23 us and inaudible;
+/// a long run of them would be a held note, so a genuine engine stall must show as an under-run rather than
+/// be papered over. The drift needs about two a second and the cap allows nearly two thousand.
+constexpr uint32_t kMaxRepeatFrames = 4u;
+
+/// Below this the ring is losing to the host and one frame per packet is held to bring it back. Half the
+/// cushion, so ordinary jitter - the level swings 196-325 around 256 - never reaches it and only a real rate
+/// difference does.
+constexpr uint32_t kLeadLowWater = kLeadFrames / 2u;
+
+/// Only drop when the ring is genuinely running away rather than merely jittering. The operating lead swings
+/// 196-325 around a 256 set-point, so the threshold has to sit well clear of that or every jitter peak reads
+/// as drift - which it did in simulation, at 35 drops/s with the clocks locked.
+constexpr uint32_t kDriftSlackFrames = 1024u;
+
+int16_t lastFrame[kChannels] = {};
+uint32_t statRepeatFrames = 0;
+uint32_t statDropFrames = 0;
+
 /// Whether a host currently has the streaming interface selected. Read by the producer so that a machine with
 /// nothing plugged in does not pay for the conversion, and set in one place so the two sides cannot disagree.
 bool streamActive = false;
@@ -168,9 +203,6 @@ uint32_t frameAccumulator = 0;
 /// Stream health, reported over the SysEx debug channel. Silence costs nothing to render, so these only mean
 /// anything once real audio is flowing -- which is exactly what makes them the first evidence on T3.
 uint32_t statUnderruns = 0;
-/// Builds that found the ring below the cushion and sent a short packet. Read against statUnderruns: this is
-/// what an under-run turns into once the builder stops draining to empty, and it costs nothing audible.
-uint32_t statLeadShort = 0;
 uint32_t statResyncs = 0;
 uint32_t statPacketsSent = 0;
 uint32_t statFramesSent = 0;
@@ -675,9 +707,8 @@ uint32_t buildNextPacket(uint8_t* buffer) {
 	// Hold the first packets back until there is a window's worth of slack, so the very first late render does
 	// not produce a gap the host has to hear.
 	if (!primed) {
-		// One packet above the cushion, not level with it: the builder below sends `available - kLeadFrames`,
-		// so starting exactly at the cushion means the first packet has nothing to send and falls into the
-		// recovery branch. Simulated 2026-08-27 - the set-point is only reachable from above.
+		// One packet above the cushion, so the stream opens with a full packet's worth of slack under it and
+		// the first late render is absorbed rather than heard.
 		if (available < kLeadFrames + kMaxFramesPerPacket) {
 			statPrimeSilence++;
 			memset(buffer, 0, frames * kFrameBytes);
@@ -686,6 +717,14 @@ uint32_t buildNextPacket(uint8_t* buffer) {
 			return frames;
 		}
 		primed = true;
+		// Start the accounting here rather than at configuration. Everything before this point is priming
+		// silence, and counting the host's demand across it would open the stream owing thousands of frames.
+		// Racing the SOF interrupt by at most one frame-start, which lands as a one-off 1 ms offset in the
+		// debt and is absorbed by the first packet. It cannot accumulate: the debt is a difference that
+		// returns to zero every packet, not a running total.
+		hostOwedFrames = 0;
+		hostOwedRemainder = 0;
+		framesDelivered = 0;
 	}
 
 	// The host is not draining us fast enough to keep up. A rate trim cannot recover this in useful time, so
@@ -710,66 +749,95 @@ uint32_t buildNextPacket(uint8_t* buffer) {
 		statResyncs++;
 	}
 
-	if (available == 0u) {
-		// The engine has not produced anything since the last poll. Send correctly sized silence rather than
-		// nothing, so the endpoint keeps answering, and do not advance the read pointer.
+	// Send what the HOST is owed, not what the ring happens to hold.
+	//
+	// Following the ring delivers the engine's rate. The two clocks differ by ~61 ppm, so that is 2.7 frames a
+	// second short, and macOS conceals the shortfall by splicing quarter-second-old audio at its buffer
+	// boundaries - measured at 0.25 events/s, 9-26 frames each, and it is the only thing still audible on this
+	// stream. Simulated across +/-200 ppm before flashing: the host is never left owed more than one packet,
+	// against 819 frames/s short under the ring-following law at the drift actually measured.
+	//
+	// kLeadFrames stops being the set-point here and goes back to being what keeps `available` from reaching
+	// zero. The cushion is dug into freely when the host is owed frames - that is what a cushion is for - and
+	// only a genuinely empty ring produces a repeat.
+	const int32_t debt = (int32_t)(hostOwedFrames - framesDelivered);
+	uint32_t want = (debt > 0) ? (uint32_t)debt : 0u;
+	if (want > kMaxFramesPerPacket) {
+		want = kMaxFramesPerPacket;
+	}
+
+	// Drift is corrected from the ring's LEVEL, before it runs dry rather than after. One frame per packet in
+	// either direction - 23 us of authority against a deadband hundreds of frames wide, so there is nothing
+	// here for a control loop to oscillate around. The first cut of this only repeated once the ring had
+	// already emptied, which is too late: it let the level fall to zero and then held it there.
+	if (available > kLeadFrames + kDriftSlackFrames) {
+		// The engine is faster than the host. Skip one frame rather than let the ring run to a resync, which
+		// discards 134 ms in one go.
+		readFrame++;
+		available--;
+		statDropFrames++;
+	}
+
+	uint32_t send = want;
+	uint32_t repeat = 0u;
+	if (available < kLeadLowWater && send > 0u) {
+		// The engine is slower than the host. Hand back one frame fewer than the ring gave and hold the last
+		// one in its place, so the level climbs instead of draining.
+		send--;
+		repeat = 1u;
+	}
+	if (send > available) {
+		// The ring is emptier than the packet the host is owed - a real under-run, not drift. Send what there
+		// is and hold the rest, but count it: this is the alarm that says the engine stopped producing.
+		repeat += send - available;
+		send = available;
+		statUnderruns++;
+	}
+	if (repeat > kMaxRepeatFrames) {
+		repeat = kMaxRepeatFrames;
+	}
+	if (send == 0u && repeat == 0u) {
+		// Owed nothing and holding nothing. buildQueuedPackets refuses to build a packet with no debt behind
+		// it, so this is unreachable while streaming - but a packet on the wire may never be a partial frame,
+		// and a silent one of the right size is the only safe thing left.
 		statUnderruns++;
 		memset(buffer, 0, frames * kFrameBytes);
 		markDeviceSilence(buffer, frames);
 		stampPacketNumber(buffer, frames);
+		framesDelivered += frames;
 		return frames;
 	}
 
-	// Leave kLeadFrames in the ring rather than draining it. This is the whole difference between a lead that
-	// is a starting value and a lead that is a set-point: sending `available` empties the ring by construction
-	// on every single packet, so the next build before the engine's next burst finds nothing and substitutes
-	// silence. Measured at 26.8 inserted silences a second on v0.29.0 at the best host buffer - 81% of every
-	// interruption in the stream, and more than the host drops by a factor of eight.
-	//
-	// Sending `available - kLeadFrames` is self-regulating and needs no controller: the lead settles at
-	// kLeadFrames and each packet then carries exactly what the engine produced since the last one. The long
-	// run rate is production, so this cannot drift into a resync the way a fixed packet size would.
-	//
 	// Never a partial audio frame: a host that appends one rotates the channel mapping permanently and
 	// silently.
-	uint32_t send;
-	if (available > kLeadFrames) {
-		send = available - kLeadFrames;
-	}
-	else {
-		// Below the cushion, which after priming means the engine genuinely stalled. Take an eighth, so the
-		// ring refills over the next few milliseconds instead of being held flat - and send real audio either
-		// way. A short packet is worth having; a silent one is the defect this whole change exists to remove.
-		//
-		// An eighth rather than a half: simulated at both, and a half drains faster than the engine produces
-		// at any lead above ~98 frames, so it settles at its own equilibrium and fights the set-point instead
-		// of restoring it. That is the same mistake as kLeadFrames not being read in the steady-state path,
-		// one layer in.
-		send = available >> 3u;
-		if (send == 0u) {
-			send = 1u;
-		}
-		statLeadShort++;
-	}
-	if (send > kMaxFramesPerPacket) {
-		send = kMaxFramesPerPacket;
-	}
-
 	const uint32_t start = readFrame & kRingMask;
 	const uint32_t firstRun = (start + send > kRingFrames) ? (kRingFrames - start) : send;
 	memcpy(buffer, &ring[start * kChannels], firstRun * kFrameBytes);
 	if (firstRun < send) {
 		memcpy(&buffer[firstRun * kFrameBytes], &ring[0], (send - firstRun) * kFrameBytes);
 	}
+	if (send > 0u) {
+		memcpy(lastFrame, &buffer[(send - 1u) * kFrameBytes], kFrameBytes);
+	}
 	readFrame = readFrame + send;
 	statReadAdvBuild++;
 
+	// Hold the last frame for as many as the host is owed beyond what the ring had. Repeating the newest frame
+	// rather than inserting silence keeps the waveform continuous, which is the entire point: the fault being
+	// removed is a discontinuity, not a missing quantity.
+	for (uint32_t i = 0; i < repeat; i++) {
+		memcpy(&buffer[(send + i) * kFrameBytes], lastFrame, kFrameBytes);
+	}
+	statRepeatFrames += repeat;
+
+	const uint32_t total = send + repeat;
+	framesDelivered += total;
 	statPacketsSent++;
 	statFramesSent += send;
 
-	stampPacketNumber(buffer, send);
+	stampPacketNumber(buffer, total);
 
-	return send;
+	return total;
 }
 
 void sendNextPacket() {
@@ -946,8 +1014,10 @@ void reportStats() {
 	emitDec(usbBrdyAudioCount);
 	emit(" ur");
 	emitDec(statUnderruns);
-	emit(" lsh");
-	emitDec(statLeadShort);
+	emit(" rep");
+	emitDec(statRepeatFrames);
+	emit(" drp");
+	emitDec(statDropFrames);
 	emit(" nrs");
 	emitDec(statAbandonedSeen);
 	emit(" nre");
@@ -1227,9 +1297,10 @@ void reportStats() {
 	statAlt1 = 0;
 	statInFlight = 0;
 	statPrimeSilence = 0;
-	// Per-interval, unlike statUnderruns beside it on the line: the question is how often the builder is short
-	// right now, not how many times it has ever been.
-	statLeadShort = 0;
+	// Per-interval, unlike statUnderruns beside it on the line: the question is the current drift rate, not
+	// how many frames have ever been conjured or skipped.
+	statRepeatFrames = 0;
+	statDropFrames = 0;
 	statCompletes = 0;
 	statSubmits = 0;
 	statAbandonedSeen = 0;
@@ -1381,6 +1452,12 @@ void audioWriteTimerInterrupt(uint32_t /*intSense*/) {
 /// Fills the queue from the task, where the copy is affordable.
 void buildQueuedPackets() {
 	while ((uint32_t)(queueWrite - queueRead) < kQueueSlots) {
+		// Paced by what the host is owed rather than by free queue slots. The queue is four deep and the debt
+		// accrues 44.1 frames a millisecond, so without this the first packet of a refill takes the entire
+		// debt and the next three are built owing nothing.
+		if (primed && (int32_t)(hostOwedFrames - framesDelivered) <= 0) {
+			break;
+		}
 		QueuedPacket& q = packetQueue[queueWrite % kQueueSlots];
 		const uint32_t frames = buildNextPacket(q.data);
 		q.bytes = (uint16_t)(frames * kFrameBytes);
@@ -1418,6 +1495,15 @@ extern "C" void usbAudioStreamStartOfFrame(void) {
 		}
 		sofToWriteTicks = sweepOffsetTicks(sweepBin);
 	}
+	// 44.1 frames per frame-start, exactly. This is the only clock in the system that is the host's, which is
+	// what makes it the right thing to owe against.
+	hostOwedFrames += 44u;
+	hostOwedRemainder += 100u;
+	if (hostOwedRemainder >= 1000u) {
+		hostOwedRemainder -= 1000u;
+		hostOwedFrames++;
+	}
+
 	*TCNT[kAudioWriteTimer] = 0;
 	*TGRA[kAudioWriteTimer] = (uint16_t)sofToWriteTicks;
 }
