@@ -111,9 +111,13 @@ Macro definitions
 // A device-to-host stream signals its rate by varying packet size, so no feedback endpoint.
 #define AUDIO_EP_ATTRIBUTES 0x05
 
-// 44.1 kHz does not divide into 1 ms frames, so packets carry 44 or 45 audio frames. The
-// endpoint must be sized for the larger one.
-#define AUDIO_MAX_PACKET_SIZE (((AUDIO_SAMPLE_RATE / 1000) + 1) * AUDIO_NUM_CHANNELS * AUDIO_SUBFRAME_BYTES)
+// A Full Speed isochronous endpoint carries at most 1023 bytes per frame, so the endpoint is sized
+// for as many whole audio frames as fit - 46 at eleven channels, not the 45 the sample rate implies.
+// Break-even is 44100 / frames-per-packet writes a second, so every extra frame the packet can hold
+// lowers the write rate the transmit path has to sustain: 980/s at 45 frames, 959/s at 46.
+#define AUDIO_FRAME_BYTES (AUDIO_NUM_CHANNELS * AUDIO_SUBFRAME_BYTES)
+#define AUDIO_ISO_LIMIT_BYTES 1023
+#define AUDIO_MAX_PACKET_SIZE ((AUDIO_ISO_LIMIT_BYTES / AUDIO_FRAME_BYTES) * AUDIO_FRAME_BYTES)
 /***********************************************************************************************************************
 Exported global variables (to be accessed by other files)
 ***********************************************************************************************************************/

@@ -76,7 +76,19 @@ constexpr uint32_t kSampleRate = 44100;
 /// averages to exactly 44100 rather than drifting 100 samples a second.
 constexpr uint32_t kFramesPerPacket = kSampleRate / 1000;
 constexpr uint32_t kFrameRemainder = kSampleRate % 1000;
-constexpr uint32_t kMaxPacketBytes = (kFramesPerPacket + 1) * kFrameBytes;
+
+/// The cap on a real packet is the endpoint's, not the sample rate's: a Full Speed isochronous endpoint carries
+/// 1023 bytes, which is 46 whole audio frames at eleven channels rather than 45.
+///
+/// That one frame moves break-even. The transmit path must land 44100 / kMaxFramesPerPacket writes a second to
+/// carry what the engine renders - 980/s at 45 frames, 959/s at 46 - and it measures 900-904 under load. Derived
+/// from kFrameBytes rather than written down, so changing the channel count moves this with it.
+constexpr uint32_t kIsoLimitBytes = 1023;
+constexpr uint32_t kMaxFramesPerPacket = kIsoLimitBytes / kFrameBytes;
+constexpr uint32_t kMaxPacketBytes = kMaxFramesPerPacket * kFrameBytes;
+
+static_assert(kMaxFramesPerPacket > kFramesPerPacket,
+              "A packet must hold more than the nominal frame count or the stream can never keep up");
 
 static_assert(kMaxPacketBytes <= USB_CFG_PAUDIO_BUF_BYTES,
               "Audio packet does not fit the pipe buffer declared in r_usb_paudio_config.h");
@@ -660,8 +672,8 @@ uint32_t buildNextPacket(uint8_t* buffer) {
 	// Send what the engine actually produced. Never a partial audio frame: a host that appends one rotates the
 	// channel mapping permanently and silently.
 	uint32_t send = available;
-	if (send > kFramesPerPacket + 1u) {
-		send = kFramesPerPacket + 1u;
+	if (send > kMaxFramesPerPacket) {
+		send = kMaxFramesPerPacket;
 	}
 
 	const uint32_t start = readFrame & kRingMask;
