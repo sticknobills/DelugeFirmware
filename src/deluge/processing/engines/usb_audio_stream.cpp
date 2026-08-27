@@ -110,14 +110,9 @@ constexpr uint32_t kRingMask = kRingFrames - 1u;
 /// How far ahead of the host the ring tries to stay before the first packet goes out.
 ///
 /// This is the stream's latency and the only thing standing between an engine that ran late and an audible
-/// gap. A DAW compensates for a reported latency and does not care about a few ms.
-///
-/// 512 frames, ~11.6 ms, since 2026-08-27. It was 128 - one worst-case render window - which was right while
-/// the ring was overflowing and wrong the moment it stopped. The engine refills in 128-frame bursts every
-/// 2.9 ms and the transmit path drains smoothly, so one late burst empties a 128-frame lead outright:
-/// measured at 24 ring under-runs a second, putting 2.8% substituted silence into the stream. Four render
-/// windows of cushion costs 8.7 ms of latency that nothing here cares about.
-constexpr uint32_t kLeadFrames = 512u;
+/// gap. 128 frames is ~2.9 ms -- one worst-case render window. A DAW compensates for a reported latency and
+/// does not care about a few ms, so this starts far tighter than the 768 frames the CV sockets need.
+constexpr uint32_t kLeadFrames = 128u;
 
 /// Past this the host is not draining us and the ring is heading for a lap. Snap back to the lead instead:
 /// one discontinuity, immediately recovered, rather than a wrap that silently reorders a second of audio.
