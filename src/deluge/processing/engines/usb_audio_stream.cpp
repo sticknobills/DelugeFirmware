@@ -199,36 +199,43 @@ QueuedPacket packetQueue[kQueueSlots];
 volatile uint32_t queueWrite = 0;
 volatile uint32_t queueRead = 0;
 
-/// The window opens 700-799 us into the host's frame on 84% of observations, and never at the frame boundary -
-/// which is why driving writes from the frame interrupt itself delivered 0.42x. Rather than track the host's
-/// phase with a control loop, the timer walks its own period forward until a write lands and then holds. A
-/// search that stops when it succeeds cannot oscillate; a loop that integrates phase error can.
+/// How often to try the write, and the single number that sets the write rate.
+///
+/// This was written as an *offset* into the host's frame, on the strength of a window measured at 700-799 us.
+/// It is not one: the timer is cleared by its own compare match (timerControlSetup(timerNo, 1, scale) in
+/// timers_interrupts.c), so the value is the retry period, and the number of attempts per frame is 1000/it.
+/// Every reading this build ever took of "the window" was confounded with how many times it was trying.
+///
+/// Swept across the whole frame on hardware, 2026-08-27 (evening), 4 passes:
+///
+///     100 us  997 writes/s   7.8 attempts/frame        600 us  691/s   1.0
+///     200 us  998 writes/s   4.1 attempts/frame        700 us  712/s   1.0
+///     400 us  990 writes/s   2.0 attempts/frame        800 us  926/s   0.9
+///     500 us  872 writes/s   1.4 attempts/frame        950 us  467/s   0.6
+///
+/// Attempts win; position does not. 400 us takes the same write rate as 100 us for a quarter of the interrupt
+/// load, against a break-even of 700 writes/s at eight channels.
 constexpr uint32_t kTimerTicksPerMs = DELUGE_CLOCKS_PER / 1000u;
-
-constexpr uint32_t kPhaseStepTicks = kTimerTicksPerMs / 20u; ///< 50 us
 
 /// b13 of INTENB0: the frame-update interrupt. Off in device mode by default - the driver only ever set it for
 /// host mode - and the peripheral handler's frame branch already existed doing nothing.
 constexpr uint16_t kIntEnbSofe = 0x2000u;
 bool sofEnabled = false;
 
-/// How long after the host's frame boundary to attempt the write.
-///
-/// This is the whole point of clocking from SOF. Three free-running versions of this timer have now been
-/// measured and every one of them lost frames: 990 fires/s at a nominal millisecond, 1006 at 3% short, and
-/// nothing in between tracks the host, because the host's frame clock is its crystal and this timer's is ours.
-/// A search for the window in that reference frame has to re-find it forever. Measured from SOF instead, the
-/// window is stationary - 700-799 us into the frame on 84% of observations, 2026-08-26 - so the offset
-/// converges once and holds.
-uint32_t sofToWriteTicks = (kTimerTicksPerMs * 3u) / 4u; ///< 750 us
-constexpr uint32_t kSofOffsetMin = kTimerTicksPerMs / 10u;
-constexpr uint32_t kSofOffsetMax = (kTimerTicksPerMs * 19u) / 20u;
+uint32_t sofToWriteTicks = (kTimerTicksPerMs * 2u) / 5u; ///< 400 us
 uint32_t statSofSeen = 0;
 
-/// Only leave a working offset after several frames of failure. The first cut stepped on every miss and wrapped
-/// at the top, so it cycled instead of converging - it reported 649 us against a window measured at 700-799.
-uint32_t consecutiveShut = 0;
-constexpr uint32_t kShutBeforeStepping = 4u;
+/// The adaptive walk is gone, and it was working against the stream the whole time.
+///
+/// It stepped the period *up* by 50 us after four consecutive failures and wrapped at the top. Past ~400 us a
+/// longer period means fewer attempts per frame, which means more failures, which means another step: positive
+/// feedback, not a search. It is the best explanation this build has for v0.27.0 degrading as it streams -
+/// forced teardowns 2 -> 1,194 while writes fell 872/s -> 695/s within one session - and for both captures
+/// tonight finding it parked at 699 and 649 us, in the trough of the sweep above.
+///
+/// Still clocked from SOF, which is what the zeroing in usbAudioStreamStartOfFrame() is for: the period is
+/// ours but the phase is the host's, so the attempts stay spread across the frame rather than drifting into a
+/// beat against it.
 
 /// DIAGNOSTIC, and it must not ship. Marches the write offset through the whole frame and records how many
 /// fires wrote at each, so the window is swept rather than read off wherever the adaptive walk happened to
@@ -239,7 +246,7 @@ constexpr uint32_t kShutBeforeStepping = 4u;
 /// useless as evidence for exactly that reason. This settles which way the causation runs.
 ///
 /// While this is on, the adaptive walk is disabled: two things must not move the offset at once.
-constexpr bool kSweepOffsets = true;
+constexpr bool kSweepOffsets = false;
 constexpr uint32_t kSweepFirstUs = 100u;
 constexpr uint32_t kSweepStepUs = 50u;
 constexpr uint32_t kSweepBins = 18u;         ///< 100 us to 950 us inclusive
@@ -1347,17 +1354,8 @@ void audioWriteTimerInterrupt(uint32_t /*intSense*/) {
 			}
 			ENABLE_ALL_INTERRUPTS();
 			statTimerShut++;
-			// Nothing writable now, so a second attempt this fire cannot succeed either.
-			// Step the offset from the frame boundary, not the timer's period. Against SOF the window does not
-			// move, so this converges and then stops - unlike a period walk, which corrects a phase error that the
-			// two crystals immediately reintroduce.
-			if (!kSweepOffsets && ++consecutiveShut >= kShutBeforeStepping) {
-				consecutiveShut = 0;
-				sofToWriteTicks += kPhaseStepTicks;
-				if (sofToWriteTicks > kSofOffsetMax) {
-					sofToWriteTicks = kSofOffsetMin;
-				}
-			}
+			// Nothing writable now, so a second attempt this fire cannot succeed either. The next attempt is
+			// kTimerTicksPerMs/2.5 away rather than a whole frame, which is the entire fix.
 			return;
 		}
 
@@ -1377,9 +1375,6 @@ void audioWriteTimerInterrupt(uint32_t /*intSense*/) {
 			sweepWrites[sweepBin]++;
 		}
 		statCatchUp += (writesThisFire > 0u) ? 1u : 0u;
-
-		// A write landed, so this offset is the right one. Hold it; SOF re-arms the timer for the next frame.
-		consecutiveShut = 0;
 	}
 }
 
