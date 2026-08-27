@@ -31,7 +31,13 @@
 // an 11-bit field and pipe buffers reach 2048 bytes. Only PIPE1 and PIPE2 can carry isochronous
 // transfers here and PIPE2 is USB MIDI, so a second endpoint cannot be added to widen this.
 // High Speed is what lifts it, and that is a separate piece of work.
-#define USB_CFG_PAUDIO_CHANNELS (11u)
+//
+// Eight, not eleven, since 2026-08-27, and the reason is packet arithmetic rather than the ceiling. A packet
+// holds 1023 / (channels * 2) whole audio frames, so the transmit path must land 44100 / that many writes a
+// second: 959/s at eleven channels, 700/s at eight. It measures 921/s under load. Eleven cannot keep up and
+// eight has 30% to spare. Eleven remains the target; raising this back is one constant plus the write rate
+// to sustain it.
+#define USB_CFG_PAUDIO_CHANNELS (8u)
 
 // 11 x 16 bit is 22 bytes per audio frame, so the largest packet is 45 * 22 = 990 bytes. Pipe
 // buffers are allocated in 64-byte units, so 1024 is the smallest that fits.

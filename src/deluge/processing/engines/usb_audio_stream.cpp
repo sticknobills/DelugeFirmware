@@ -90,6 +90,10 @@ constexpr uint32_t kMaxPacketBytes = kMaxFramesPerPacket * kFrameBytes;
 static_assert(kMaxFramesPerPacket > kFramesPerPacket,
               "A packet must hold more than the nominal frame count or the stream can never keep up");
 
+/// The diagnostics write channels 3-6 by fixed offset into the audio frame, so a smaller frame would put the
+/// producer stamp and the packet number outside it. Fails the build rather than corrupting the frame quietly.
+static_assert(kChannels >= 6, "Channels 3-6 carry the producer stamp, the mark and the packet number");
+
 static_assert(kMaxPacketBytes <= USB_CFG_PAUDIO_BUF_BYTES,
               "Audio packet does not fit the pipe buffer declared in r_usb_paudio_config.h");
 
