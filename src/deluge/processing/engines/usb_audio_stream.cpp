@@ -640,7 +640,10 @@ uint32_t buildNextPacket(uint8_t* buffer) {
 	// Hold the first packets back until there is a window's worth of slack, so the very first late render does
 	// not produce a gap the host has to hear.
 	if (!primed) {
-		if (available < kLeadFrames) {
+		// One packet above the cushion, not level with it: the builder below sends `available - kLeadFrames`,
+		// so starting exactly at the cushion means the first packet has nothing to send and falls into the
+		// recovery branch. Simulated 2026-08-27 - the set-point is only reachable from above.
+		if (available < kLeadFrames + kMaxFramesPerPacket) {
 			statPrimeSilence++;
 			memset(buffer, 0, frames * kFrameBytes);
 			markDeviceSilence(buffer, frames);
@@ -699,12 +702,17 @@ uint32_t buildNextPacket(uint8_t* buffer) {
 		send = available - kLeadFrames;
 	}
 	else {
-		// Below the cushion, after a stall or a bunched-up run of builds. Take half, so the lead climbs back
-		// over the next few packets instead of being drained flat again - and send real audio either way. A
-		// short packet is worth having; a silent one is the defect this whole change exists to remove.
-		send = available / 2u;
+		// Below the cushion, which after priming means the engine genuinely stalled. Take an eighth, so the
+		// ring refills over the next few milliseconds instead of being held flat - and send real audio either
+		// way. A short packet is worth having; a silent one is the defect this whole change exists to remove.
+		//
+		// An eighth rather than a half: simulated at both, and a half drains faster than the engine produces
+		// at any lead above ~98 frames, so it settles at its own equilibrium and fights the set-point instead
+		// of restoring it. That is the same mistake as kLeadFrames not being read in the steady-state path,
+		// one layer in.
+		send = available >> 3u;
 		if (send == 0u) {
-			send = available;
+			send = 1u;
 		}
 		statLeadShort++;
 	}
@@ -903,6 +911,8 @@ void reportStats() {
 	emitDec(usbBrdyAudioCount);
 	emit(" ur");
 	emitDec(statUnderruns);
+	emit(" lsh");
+	emitDec(statLeadShort);
 	emit(" nrs");
 	emitDec(statAbandonedSeen);
 	emit(" nre");
@@ -1156,6 +1166,9 @@ void reportStats() {
 	statAlt1 = 0;
 	statInFlight = 0;
 	statPrimeSilence = 0;
+	// Per-interval, unlike statUnderruns beside it on the line: the question is how often the builder is short
+	// right now, not how many times it has ever been.
+	statLeadShort = 0;
 	statCompletes = 0;
 	statSubmits = 0;
 	statAbandonedSeen = 0;
