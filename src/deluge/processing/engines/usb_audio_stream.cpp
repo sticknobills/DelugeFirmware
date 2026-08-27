@@ -107,12 +107,18 @@ static_assert(kMaxPacketBytes <= USB_CFG_PAUDIO_BUF_BYTES,
 constexpr uint32_t kRingFrames = 8192u;
 constexpr uint32_t kRingMask = kRingFrames - 1u;
 
-/// How far ahead of the host the ring tries to stay before the first packet goes out.
+/// How far ahead of the host the ring stays, at every moment -- not just before the first packet goes out.
 ///
 /// This is the stream's latency and the only thing standing between an engine that ran late and an audible
-/// gap. 128 frames is ~2.9 ms -- one worst-case render window. A DAW compensates for a reported latency and
-/// does not care about a few ms, so this starts far tighter than the 768 frames the CV sockets need.
-constexpr uint32_t kLeadFrames = 128u;
+/// gap. A DAW compensates for a reported latency and does not care about a few ms.
+///
+/// 256 frames, ~5.8 ms, two worst-case render windows. Raising this from 128 to 512 on 2026-08-27 changed
+/// nothing, because until the builder below was changed it was not a set-point at all: it was read in the
+/// priming check and the resync snap-back and nowhere in the steady-state path, so the lead started here and
+/// decayed to zero on the first packet. The builder now holds it, which is what makes the number mean
+/// something. Two windows rather than one because several builds can bunch up inside a single 2.9 ms gap
+/// between the engine's 128-frame bursts, and one window is emptied by exactly that.
+constexpr uint32_t kLeadFrames = 256u;
 
 /// Past this the host is not draining us and the ring is heading for a lap. Snap back to the lead instead:
 /// one discontinuity, immediately recovered, rather than a wrap that silently reorders a second of audio.
@@ -162,6 +168,9 @@ uint32_t frameAccumulator = 0;
 /// Stream health, reported over the SysEx debug channel. Silence costs nothing to render, so these only mean
 /// anything once real audio is flowing -- which is exactly what makes them the first evidence on T3.
 uint32_t statUnderruns = 0;
+/// Builds that found the ring below the cushion and sent a short packet. Read against statUnderruns: this is
+/// what an under-run turns into once the builder stops draining to empty, and it costs nothing audible.
+uint32_t statLeadShort = 0;
 uint32_t statResyncs = 0;
 uint32_t statPacketsSent = 0;
 uint32_t statFramesSent = 0;
@@ -673,9 +682,32 @@ uint32_t buildNextPacket(uint8_t* buffer) {
 		return frames;
 	}
 
-	// Send what the engine actually produced. Never a partial audio frame: a host that appends one rotates the
-	// channel mapping permanently and silently.
-	uint32_t send = available;
+	// Leave kLeadFrames in the ring rather than draining it. This is the whole difference between a lead that
+	// is a starting value and a lead that is a set-point: sending `available` empties the ring by construction
+	// on every single packet, so the next build before the engine's next burst finds nothing and substitutes
+	// silence. Measured at 26.8 inserted silences a second on v0.29.0 at the best host buffer - 81% of every
+	// interruption in the stream, and more than the host drops by a factor of eight.
+	//
+	// Sending `available - kLeadFrames` is self-regulating and needs no controller: the lead settles at
+	// kLeadFrames and each packet then carries exactly what the engine produced since the last one. The long
+	// run rate is production, so this cannot drift into a resync the way a fixed packet size would.
+	//
+	// Never a partial audio frame: a host that appends one rotates the channel mapping permanently and
+	// silently.
+	uint32_t send;
+	if (available > kLeadFrames) {
+		send = available - kLeadFrames;
+	}
+	else {
+		// Below the cushion, after a stall or a bunched-up run of builds. Take half, so the lead climbs back
+		// over the next few packets instead of being drained flat again - and send real audio either way. A
+		// short packet is worth having; a silent one is the defect this whole change exists to remove.
+		send = available / 2u;
+		if (send == 0u) {
+			send = available;
+		}
+		statLeadShort++;
+	}
 	if (send > kMaxFramesPerPacket) {
 		send = kMaxFramesPerPacket;
 	}
@@ -818,7 +850,13 @@ void reportStats() {
 
 	// Sized for every counter at its full width rather than for the line as it reads today. Growing this line past
 	// its buffer is the likeliest cause of the freeze on 2026-08-22.
-	char line[256];
+	//
+	// 512 rather than 256: it was already claiming to be sized for full width and was not. Measured at 243 bytes
+	// of 256 on 2026-08-27, with `ur`, `rs` and `frm` cumulative and still climbing - a long enough stream would
+	// have smashed the stack on its own, once a second, with no code change at all. 42 fields at a five-character
+	// tag and ten digits apiece is 630 worst case; 512 covers every width these counters reach in practice and
+	// leaves room for the next one.
+	char line[512];
 	char* p = line;
 	auto emit = [&p](const char* t) {
 		while (*t != '\0') {
