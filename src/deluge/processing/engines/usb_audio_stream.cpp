@@ -230,6 +230,34 @@ uint32_t statSofSeen = 0;
 uint32_t consecutiveShut = 0;
 constexpr uint32_t kShutBeforeStepping = 4u;
 
+/// DIAGNOSTIC, and it must not ship. Marches the write offset through the whole frame and records how many
+/// fires wrote at each, so the window is swept rather than read off wherever the adaptive walk happened to
+/// park. The walk chooses the offset in response to the very shuts being measured, so every reading taken
+/// while it is running is of a point it selected - which is not a measurement of the window at all.
+///
+/// Three captures give offset 799 -> 939 writes/s, 699 -> 720, 649 -> 649. Monotonic, three points, and
+/// useless as evidence for exactly that reason. This settles which way the causation runs.
+///
+/// While this is on, the adaptive walk is disabled: two things must not move the offset at once.
+constexpr bool kSweepOffsets = true;
+constexpr uint32_t kSweepFirstUs = 100u;
+constexpr uint32_t kSweepStepUs = 50u;
+constexpr uint32_t kSweepBins = 18u;         ///< 100 us to 950 us inclusive
+constexpr uint32_t kSweepDwellFrames = 500u; ///< half a second per bin, ~9 s per pass
+
+uint32_t sweepBin = 0;
+uint32_t sweepFrameCount = 0;
+uint32_t sweepPasses = 0;
+/// Cumulative across passes and deliberately never cleared: the question is the shape of the whole sweep, and
+/// one pass of 500 frames per bin is too few to read a rate off. sweepFires is the denominator, and the two
+/// have to be read together or not at all.
+uint32_t sweepFires[kSweepBins] = {};
+uint32_t sweepWrites[kSweepBins] = {};
+
+uint32_t sweepOffsetTicks(uint32_t bin) {
+	return (kSweepFirstUs + bin * kSweepStepUs) * kTimerTicksPerMs / 1000u;
+}
+
 /// How long to keep waiting for the FIFO to report itself ready, in ticks of the 29.6 ns superfast timer.
 /// 128 ticks is ~3.8 us - well inside the frame, and bounded.
 constexpr uint16_t kFrdyWaitTicks = 128u;
@@ -1080,6 +1108,32 @@ void reportStats() {
 	*p = '\0';
 	Debug::sysexDebugPrint(*Debug::midiDebugCable, planeLine, true);
 
+	// DIAGNOSTIC, removed with kSweepOffsets. One field per offset bin, writes/fires, cumulative across passes.
+	// Both halves are printed because a ratio alone cannot show a bin that never ran - and a bin that never ran
+	// is the failure this whole line exists to make visible.
+	if (kSweepOffsets) {
+		// 512 for the same reason the AU line is, computed rather than guessed: 18 bins at a three-digit offset
+		// and ten digits apiece either side of the slash is 495 bytes worst case. Static rather than stack -
+		// this report already carries ~1.6 KB of buffers in one frame, and the sweep is not worth a stack
+		// overflow on a path that runs once a second. Single caller, no reentrancy.
+		static char sweepLine[512];
+		p = sweepLine;
+		emit("AUS p");
+		emitDec(sweepPasses);
+		emit(" b");
+		emitDec(sweepBin);
+		for (uint32_t i = 0; i < kSweepBins; i++) {
+			emit(" ");
+			emitDec(kSweepFirstUs + i * kSweepStepUs);
+			emit(":");
+			emitDec(sweepWrites[i]);
+			emit("/");
+			emitDec(sweepFires[i]);
+		}
+		*p = '\0';
+		Debug::sysexDebugPrint(*Debug::midiDebugCable, sweepLine, true);
+	}
+
 	// Sixth line, own buffer for the reason the others carry. ts is the task-side 2x2 over the whole cycle;
 	// pf/pm/pi is the bounded poll straight after the write, at a resolution the task cannot reach.
 	char readyLine[192];
@@ -1249,6 +1303,11 @@ void audioWriteTimerInterrupt(uint32_t /*intSense*/) {
 	if (!streamActive || !transferInitialised) {
 		return;
 	}
+	// Counted before the queue check, so the denominator is every fire this bin got rather than every fire that
+	// happened to find work. A bin whose fires differ from the others is not comparable and sweep.py says so.
+	if (kSweepOffsets && sweepBin < kSweepBins) {
+		sweepFires[sweepBin]++;
+	}
 	if (queueWrite == queueRead) {
 		statTimerEmpty++;
 		return;
@@ -1292,7 +1351,7 @@ void audioWriteTimerInterrupt(uint32_t /*intSense*/) {
 			// Step the offset from the frame boundary, not the timer's period. Against SOF the window does not
 			// move, so this converges and then stops - unlike a period walk, which corrects a phase error that the
 			// two crystals immediately reintroduce.
-			if (++consecutiveShut >= kShutBeforeStepping) {
+			if (!kSweepOffsets && ++consecutiveShut >= kShutBeforeStepping) {
 				consecutiveShut = 0;
 				sofToWriteTicks += kPhaseStepTicks;
 				if (sofToWriteTicks > kSofOffsetMax) {
@@ -1314,6 +1373,9 @@ void audioWriteTimerInterrupt(uint32_t /*intSense*/) {
 		ENABLE_ALL_INTERRUPTS();
 		queueRead++;
 		statTimerWrote++;
+		if (kSweepOffsets && sweepBin < kSweepBins) {
+			sweepWrites[sweepBin]++;
+		}
 		statCatchUp += (writesThisFire > 0u) ? 1u : 0u;
 
 		// A write landed, so this offset is the right one. Hold it; SOF re-arms the timer for the next frame.
@@ -1348,6 +1410,19 @@ extern "C" void usbAudioStreamStartOfFrame(void) {
 	// Zeroing the count is what locks the phase: the timer now measures from the host's frame boundary rather
 	// than from its own last fire, so its crystal sets only the offset's accuracy and never accumulates against
 	// the host's rate.
+	if (kSweepOffsets) {
+		// Advanced here rather than from the timer, so each bin gets exactly kSweepDwellFrames of the host's
+		// frames whether or not the writes in it succeeded. Dwelling by successful writes would give the good
+		// offsets more frames than the bad ones and bias the very comparison being made.
+		if (++sweepFrameCount >= kSweepDwellFrames) {
+			sweepFrameCount = 0;
+			if (++sweepBin >= kSweepBins) {
+				sweepBin = 0;
+				sweepPasses++;
+			}
+		}
+		sofToWriteTicks = sweepOffsetTicks(sweepBin);
+	}
 	*TCNT[kAudioWriteTimer] = 0;
 	*TGRA[kAudioWriteTimer] = (uint16_t)sofToWriteTicks;
 }
