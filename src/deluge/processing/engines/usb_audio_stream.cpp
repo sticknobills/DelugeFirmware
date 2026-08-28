@@ -120,9 +120,16 @@ constexpr uint32_t kRingMask = kRingFrames - 1u;
 /// between the engine's 128-frame bursts, and one window is emptied by exactly that.
 constexpr uint32_t kLeadFrames = 256u;
 
-/// Past this the host is not draining us and the ring is heading for a lap. Snap back to the lead instead:
-/// one discontinuity, immediately recovered, rather than a wrap that silently reorders a second of audio.
-constexpr uint32_t kResyncFrames = kRingFrames - (kRingFrames / 4u);
+/// Past this the writer is about to lap the reader, which silently reorders a second of audio. Everything short
+/// of it is caught up rather than discarded: the builder sends `available - kLeadFrames` capped at
+/// kMaxFramesPerPacket, draining 63,000 frames a second against the 44,100 the engine produces, so even a full
+/// ring returns to the set-point in about 0.4 s with no audio thrown away.
+///
+/// At three quarters of the ring this fired first and binned the backlog instead. A kit load starves the task
+/// for longer than the ring's 186 ms, and the recovery discarded up to 113,639 frames in a 1.7 s interval while
+/// the engine kept feeding 44,100 a second throughout - measured 2026-08-28. The margin left above the threshold
+/// is one lead plus one packet, which is what the build after the check may consume before the writer reaches it.
+constexpr uint32_t kResyncFrames = kRingFrames - kLeadFrames - kMaxFramesPerPacket;
 
 /// Interleaved, one frame per host audio frame. Only channels 0 and 1 are ever written, so the rest are
 /// zeroed once at startup and left alone -- per-track routing fills them in a later cut.
