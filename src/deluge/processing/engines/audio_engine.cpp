@@ -1116,6 +1116,12 @@ void routine() {
 	}
 	audioRoutineLocked = false;
 	routineBeenCalled = true;
+
+	// Outside the lock, so nothing reached from here can be refused a nested audio routine. A card load hand-runs
+	// this task by id and no other registered task gets a pass, so without this the USB stream is unserviced for
+	// the whole load: the engine kept rendering 44,100 frames/s while packets written fell 990 -> 419/s and the
+	// ring backed up until it was discarded. Measured 2026-08-28.
+	deluge::processing::engines::USBAudioStream::service();
 }
 
 int32_t getNumSamplesLeftToOutputFromPreviousRender() {

@@ -31,7 +31,16 @@ namespace deluge::processing::engines {
 class USBAudioStream {
 public:
 	/// Submits the next packet if the previous one has completed. Safe to call when no host is streaming.
+	///
+	/// The scheduler's entry point: the diagnostics report from here, then the transport is serviced.
 	static void routine();
+
+	/// The transport half of routine(), without the SysEx diagnostics.
+	///
+	/// Called from the audio engine as well as the scheduler, because a card load hand-runs the audio task by id
+	/// and no other registered task gets a pass until it finishes. This is the only servicing the stream sees
+	/// across a kit load.
+	static void service();
 
 	/// Hands the finished main mix to the stream, from the output stage that already walks these samples.
 	///

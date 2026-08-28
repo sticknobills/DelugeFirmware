@@ -1456,7 +1456,12 @@ namespace deluge::processing::engines {
 void USBAudioStream::routine() {
 	drainSetupTrace();
 	reportStats();
+	service();
+}
 
+/// Split from routine() so the audio engine can service the transport without also emitting a SysEx report at the
+/// engine's own rate. The diagnostics stay on the scheduler's ~600 Hz; this runs at both that and the engine's.
+void USBAudioStream::service() {
 	if (!ringCleared) {
 		memset(ring, 0, sizeof(ring));
 		// DIAGNOSTIC. Channels 3 upwards get a distinct constant, written here and never touched by the
