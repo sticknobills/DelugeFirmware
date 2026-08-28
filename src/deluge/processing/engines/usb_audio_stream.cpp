@@ -272,12 +272,8 @@ uint32_t sweepOffsetTicks(uint32_t bin) {
 	return (kSweepFirstUs + bin * kSweepStepUs) * kTimerTicksPerMs / 1000u;
 }
 
-/// How long to keep waiting for the FIFO to report itself ready, in ticks of the 29.6 ns superfast timer.
-/// 128 ticks is ~3.8 us - well inside the frame, and bounded.
-constexpr uint16_t kFrdyWaitTicks = 128u;
 uint32_t statFrdyImmediate = 0;     ///< ready inside the vendored 100 ns
-uint32_t statFrdyLate = 0;          ///< ready only because we waited longer - what the old timeout was discarding
-uint32_t statFrdyNever = 0;         ///< genuinely not ready at all
+uint32_t statFrdyNever = 0;         ///< not ready
 uint32_t statCatchUp = 0;           ///< second writes in one fire, recovering a frame whose fire never happened
 constexpr int kAudioWriteTimer = 3; ///< Timer 3 is the only unused MTU2 channel.
 uint32_t statTimerFires = 0;
@@ -986,8 +982,6 @@ void reportStats() {
 	emitDec(statSofSeen);
 	emit(" fri");
 	emitDec(statFrdyImmediate);
-	emit(" frl");
-	emitDec(statFrdyLate);
 	emit(" frn");
 	emitDec(statFrdyNever);
 	emit(" cup");
@@ -1245,7 +1239,6 @@ void reportStats() {
 	statTimerShut = 0;
 	statSofSeen = 0;
 	statFrdyImmediate = 0;
-	statFrdyLate = 0;
 	statFrdyNever = 0;
 	statCatchUp = 0;
 	statTimerEmpty = 0;
@@ -1316,27 +1309,6 @@ void restoreFifoPort(uint16_t savedSel, uint16_t savedShadow) {
 	} while ((seen & (kFifoSelIsel | kFifoSelCurPipe)) != (savedSel & (kFifoSelIsel | kFifoSelCurPipe)));
 }
 
-/// Keeps waiting where the vendored call gives up.
-///
-/// usb_cstd_is_set_frdy_rohan re-points the shared FIFO port at our pipe and then allows FRDY just 5 ticks of
-/// the 29.6 ns timer - 100 ns - to assert. The port change is already done by the time it returns an error, so
-/// this carries on polling the same register. If a large share of writes are rescued here, the "plane shut"
-/// this build has been chasing was never the plane: it was a timeout too short for the port change to settle,
-/// and it read as a stable 16-19% loss on every version of this timer, free-running or SOF-clocked.
-uint16_t extendFifoWait() {
-	volatile uint16_t* const ctr = (volatile uint16_t*)&(USB201.CFIFOCTR);
-	const uint16_t start = *TCNT[TIMER_SYSTEM_SUPERFAST];
-	while ((uint16_t)(*TCNT[TIMER_SYSTEM_SUPERFAST] - start) < kFrdyWaitTicks) {
-		const uint16_t buffer = *ctr;
-		if ((buffer & kFifoCtrFrdy) != 0u) {
-			statFrdyLate++;
-			return buffer;
-		}
-	}
-	statFrdyNever++;
-	return kFifoError;
-}
-
 void audioWriteTimerInterrupt(uint32_t /*intSense*/) {
 	timerClearCompareMatchTGRA(kAudioWriteTimer);
 	statTimerFires++;
@@ -1375,9 +1347,12 @@ void audioWriteTimerInterrupt(uint32_t /*intSense*/) {
 		// Restoring unconditionally costs a pipe change on every write, and usb_cstd_is_set_frdy_rohan gives up if
 		// the port is not ready within 100 ns - measured as 753 refusals a second against 37 writes.
 		const bool borrowed = (savedSel & kFifoSelCurPipe) != USB_CFG_PAUDIO_ISO_IN;
-		uint16_t status = usb_cstd_is_set_frdy_rohan(USB_CFG_PAUDIO_ISO_IN);
+		// The vendored 100 ns timeout is taken as final. Polling past it for a further 3.8 us rescued zero
+		// writes in 120 s of streaming across two songs, and zero again on 2026-08-27 - and it spun with all
+		// interrupts masked ~1,950 times a second to do it.
+		const uint16_t status = usb_cstd_is_set_frdy_rohan(USB_CFG_PAUDIO_ISO_IN);
 		if (status == kFifoError) {
-			status = extendFifoWait();
+			statFrdyNever++;
 		}
 		else {
 			statFrdyImmediate++;
