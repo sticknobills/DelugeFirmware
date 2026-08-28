@@ -48,6 +48,7 @@
 #include "modulation/patch/patch_cable_set.h"
 #include "processing/audio_output.h"
 #include "processing/engines/cv_engine.h"
+#include "processing/engines/engine_load_report.h"
 #include "processing/engines/usb_audio_stream.h"
 #include "processing/live/live_input_buffer.h"
 #include "processing/metronome/metronome.h"
@@ -461,6 +462,9 @@ void cullVoices(size_t numSamples, int32_t numAudio, int32_t numVoice) {
 			}
 			// soft cull
 			forceReleaseOneVoice(numSamples);
+			// DIAGNOSTIC
+			deluge::processing::engines::EngineLoadReport::recordCull(1, (uint32_t)num_to_terminate,
+			                                                          (uint32_t)num_to_kill);
 
 #if ALPHA_OR_BETA_VERSION
 			logAction("hard cull");
@@ -474,6 +478,8 @@ void cullVoices(size_t numSamples, int32_t numAudio, int32_t numVoice) {
 		else if (num_samples_over_limit >= 0) {
 			if (last_num_samples_over > 0 && num_samples_over_limit >= last_num_samples_over) {
 				forceReleaseOneVoice(numSamples);
+				// DIAGNOSTIC
+				deluge::processing::engines::EngineLoadReport::recordCull(1, 0, 0);
 				if (numRoutines > 0) {
 					culled = true;
 					D_PRINTLN("culling in second routine");
@@ -486,6 +492,8 @@ void cullVoices(size_t numSamples, int32_t numAudio, int32_t numVoice) {
 		if (num_samples_over_limit >= 40) {
 			D_PRINTLN("under min voices but culling anyway");
 			terminateOneVoice(numSamples);
+			// DIAGNOSTIC
+			deluge::processing::engines::EngineLoadReport::recordCull(0, 1, 0);
 			culled = true;
 		}
 	}
@@ -502,6 +510,8 @@ void cullVoices(size_t numSamples, int32_t numAudio, int32_t numVoice) {
 // not in header (private to audio engine)
 /// set the direness level and cull any voices
 inline void setDireness(size_t numSamples) { // Consider direness and culling - before increasing the number of samples
+	// DIAGNOSTIC. numSamples is reassigned below, so the render's own window is taken while it still means that.
+	const size_t windowSamples = numSamples;
 	// number of samples it took to do the last render
 	auto dspTime = (int32_t)(getAverageRunTimeForTask(routine_task_id) * 44100.);
 	size_t nonDSP = numSamples - dspTime;
@@ -545,6 +555,9 @@ inline void setDireness(size_t numSamples) { // Consider direness and culling - 
 			}
 		}
 	}
+
+	// DIAGNOSTIC. Reported at the end so the direness recorded is this render's, not the previous one's.
+	deluge::processing::engines::EngineLoadReport::recordRender(dspTime, windowSamples, cpuDireness);
 }
 
 void scheduleMidiGateOutISR(uint32_t saddrPosAtStart, int32_t unadjustedNumSamplesBeforeLappingPlayHead,

@@ -62,6 +62,7 @@
 #include "playback/mode/session.h"
 #include "processing/engines/audio_engine.h"
 #include "processing/engines/cv_engine.h"
+#include "processing/engines/engine_load_report.h"
 #include "processing/engines/usb_audio_stream.h"
 #include "scheduler_api.h"
 #include "storage/audio/audio_file_manager.h"
@@ -603,6 +604,9 @@ void registerTasks() {
 	// handles animations and checks on the timers for any infrequent actions
 	// long term this should probably be made into an idle task
 	addRepeatingTask([]() { uiTimerManager.routine(); }, p++, 0.0001, 0.0007, 0.01, "ui routine", RESOURCE_NONE);
+	// DIAGNOSTIC. Last in the idle band deliberately: registering it anywhere else shifts the priority of every
+	// task below it, and what this measures is how the engine fares under the scheduler it is being compared in.
+	addRepeatingTask(engineLoadReportRoutine, p++, 0.05, 0.1, 0.5, "engine load report", RESOURCE_NONE);
 
 	// addRepeatingTask([]() { AudioEngine::routineWithClusterLoading(true); }, 0, 1 / 44100., 16 / 44100., 32 / 44100.,
 	// true); addRepeatingTask(&(AudioEngine::routine), 0, 16 / 44100., 64 / 44100., true);
