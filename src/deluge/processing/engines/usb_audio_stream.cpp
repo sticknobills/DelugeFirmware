@@ -285,6 +285,15 @@ uint32_t statTimerWrote = 0;
 uint32_t statTimerShut = 0;
 uint32_t statTimerEmpty = 0;
 uint32_t statQueueBuilt = 0;
+
+/// DIAGNOSTIC. How many frames each packet carried, in bins of eight, over the report interval.
+///
+/// The mean is already derivable from frm/pkt and it hides the thing in question: the builder sends
+/// `available - kLeadFrames`, and buildQueuedPackets() fills all four slots in one pass, so every build after
+/// the first in a burst finds the ring at exactly the cushion and takes an eighth of it. That produces one full
+/// packet followed by several short ones at the same mean as an even flow.
+constexpr uint32_t kSizeBins = 8u;
+uint32_t statSizeHist[kSizeBins] = {};
 bool audioTimerRunning = false;
 /// The driver's submit path writes the same shared FIFO port as the timer interrupt, and usb_pstd_write_fifo
 /// writes what it is handed with no space check while also changing the port's access width partway through.
@@ -773,6 +782,8 @@ uint32_t buildNextPacket(uint8_t* buffer) {
 
 	statPacketsSent++;
 	statFramesSent += send;
+	// DIAGNOSTIC. Bins of eight, so bin 7 is 56-63 frames - a packet at the endpoint's ceiling.
+	statSizeHist[(send >> 3u) < kSizeBins ? (send >> 3u) : (kSizeBins - 1u)]++;
 
 	stampPacketNumber(buffer, send);
 
@@ -1004,6 +1015,19 @@ void reportStats() {
 	*p = '\0';
 	Debug::sysexDebugPrint(*Debug::midiDebugCable, line, true);
 
+	// DIAGNOSTIC. Its own line: the counters line above already runs near its buffer at full counter width.
+	char histLine[128];
+	p = histLine;
+	emit("AUS");
+	for (uint32_t bin = 0; bin < kSizeBins; bin++) {
+		emit(" h");
+		emitDec(bin);
+		emit(":");
+		emitDec(statSizeHist[bin]);
+	}
+	*p = '\0';
+	Debug::sysexDebugPrint(*Debug::midiDebugCable, histLine, true);
+
 	// Second line rather than more fields on the first: at full counter width that one already runs near its
 	// buffer, and growing a fixed-size debug line past it is the likeliest cause of the freeze on 2026-08-22.
 	// Live values first, then the same registers as they stood at the last completion.
@@ -1227,6 +1251,9 @@ void reportStats() {
 	statTimerEmpty = 0;
 	statQueueBuilt = 0;
 	statBuilds = 0;
+	for (uint32_t i = 0; i < kSizeBins; i++) {
+		statSizeHist[i] = 0;
+	}
 	statResyncGenuine = 0;
 	statResyncOvertaken = 0;
 	// statWorstOvertake is deliberately not cleared: the furthest the reader has ever got past the writer is
