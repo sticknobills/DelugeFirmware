@@ -229,13 +229,7 @@ constexpr uint32_t kTimerTicksPerMs = DELUGE_CLOCKS_PER / 1000u;
 constexpr uint16_t kIntEnbSofe = 0x2000u;
 bool sofEnabled = false;
 
-/// 800 us, one retry per host frame plus a margin, raised from 400 on 2026-08-28.
-///
-/// 400 fired 1,975 times a second to land 990 writes: half the interrupts found the plane occupied and
-/// returned. Attempts were worth buying when the write rate was the constraint, and it no longer is - 990/s
-/// against a 700/s break-even, delivery 0.999. The 2026-08-27 sweep puts 800 us at 926 writes/s, still clear
-/// of break-even, for half the interrupt load.
-uint32_t sofToWriteTicks = (kTimerTicksPerMs * 4u) / 5u;
+uint32_t sofToWriteTicks = (kTimerTicksPerMs * 2u) / 5u; ///< 400 us
 uint32_t statSofSeen = 0;
 
 /// The adaptive walk is gone, and it was working against the stream the whole time.
