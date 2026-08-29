@@ -148,6 +148,15 @@ constexpr uint32_t kLeadFrames = 256u;
 /// - simulated at 184-328 frames around the 256 set-point.
 constexpr uint32_t kLeadBandFrames = 64u;
 
+/// Past this the lead is not drifting, it is recovering, and the packet size steps four blocks instead of one.
+///
+/// This was kMaxFramesPerPacket - 62 frames, which is *below* the band above, so the recovery branch shadowed
+/// the gentle one entirely and the one-block trim was dead code. Measured on hardware 2026-08-29 (evening):
+/// 8.8% of packets left at 52 frames, an 18% rate excursion arriving whenever the lead crossed 62, and three of
+/// them landed in the first second where the host's own margin is thinnest. Rahul heard exactly that second and
+/// nothing else in the recording. A whole set-point's worth of error is what "recovering" should mean.
+constexpr uint32_t kLeadCatchUpFrames = kLeadFrames;
+
 /// Past this the writer is about to lap the reader, which silently reorders a second of audio. Everything short
 /// of it is caught up rather than discarded: the builder's catch-up branch sends four blocks above nominal,
 /// draining ~52,000 frames a second against the 44,100 the engine produces, so a ring filled by a 100 ms stall
@@ -805,6 +814,14 @@ uint32_t buildNextPacket(uint8_t* buffer) {
 			return frames;
 		}
 		primed = true;
+		// Start centred. Priming waits for a whole packet *above* the cushion, so without this the first real
+		// packet begins its life one packet clear of the set-point and the trim spends the opening second
+		// working it back down - which is when the host has least margin to spare. Nothing is discarded: the
+		// frames between here and the write pointer have not been sent, and the lead is what the stream carries
+		// rather than what it owes.
+		readFrame = writeFrame - kLeadFrames;
+		statReadAdvResync++;
+		available = kLeadFrames;
 	}
 
 	// The host is not draining us fast enough to keep up. A rate trim cannot recover this in useful time, so
@@ -864,7 +881,7 @@ uint32_t buildNextPacket(uint8_t* buffer) {
 	// silently.
 	const int32_t leadError = (int32_t)available - (int32_t)kLeadFrames;
 	uint32_t send = frames;
-	if (leadError > (int32_t)kMaxFramesPerPacket) {
+	if (leadError > (int32_t)kLeadCatchUpFrames) {
 		// Far above the set-point - a stalled task, or the recovery after one. Four blocks, not the whole
 		// backlog: 52 frames a packet drains ~7,800 frames a second faster than the engine produces, so the
 		// ring returns to the set-point without ever putting a step on the wire. Simulated against a 100 ms
