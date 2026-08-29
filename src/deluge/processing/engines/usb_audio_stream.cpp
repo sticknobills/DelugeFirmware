@@ -26,14 +26,19 @@
 extern "C" {
 #include "OSLikeStuff/timers_interrupts/clock_type.h"
 #include "OSLikeStuff/timers_interrupts/timers_interrupts.h"
+#include "RZA1/cpu_specific.h"
+#include "RZA1/intc/devdrv_intc.h"
 #include "RZA1/mtu/mtu.h"
 #include "RZA1/ostm/ostm.h"
 #include "RZA1/system/iodefine.h"
+#include "RZA1/system/iodefines/dmac_iodefine.h"
 #include "RZA1/system/iodefines/usb20_iodefine.h"
 #include "RZA1/usb/r_usb_basic/r_usb_basic_if.h"
+#include "RZA1/usb/r_usb_basic/src/hw/inc/r_usb_bitdefine.h"
 #include "definitions.h"
 #include "deluge/drivers/usb/usb_setup_trace.h"
 #include "deluge/drivers/usb/userdef/r_usb_paudio_config.h"
+#include "drivers/dmac/dmac.h"
 
 // Declared here rather than by including r_usb_extern.h, which carries an inline function that only compiles as C.
 // midi_engine.cpp reaches into the same driver the same way.
@@ -198,11 +203,23 @@ uint32_t statFramesDiscarded = 0;
 /// 1 kHz interrupt. So the task builds - it already has the headroom - and the interrupt does nothing but the
 /// FIFO write. Single producer (task), single consumer (timer interrupt), free-running indices.
 constexpr uint32_t kQueueSlots = 4u;
+/// The payload is written through the uncached mirror and read by the DMA controller, so nothing else may share
+/// a cache line with it: a cached write to a neighbouring field would write the whole line back and undo the
+/// uncached bytes sitting in it. The length therefore lives in its own array rather than beside the payload, and
+/// each slot is padded to a whole number of cache lines.
 struct QueuedPacket {
-	alignas(4) uint8_t data[kMaxPacketBytes];
-	uint16_t bytes;
+	alignas(CACHE_LINE_SIZE) uint8_t data[(kMaxPacketBytes + CACHE_LINE_SIZE - 1) / CACHE_LINE_SIZE * CACHE_LINE_SIZE];
 };
 QueuedPacket packetQueue[kQueueSlots];
+uint16_t packetQueueBytes[kQueueSlots];
+
+/// The same slot seen by the CPU with the cache bypassed. The builder writes here and the DMA controller reads
+/// the ordinary address, so neither has to flush anything - the pattern the PIC and SSI transmit buffers already
+/// use. A whole-cache flush per packet, which is what the vendor driver does, would cost far more than the copy
+/// this change exists to remove.
+uint8_t* uncachedSlot(uint32_t slot) {
+	return (uint8_t*)((uint32_t)packetQueue[slot].data + UNCACHED_MIRROR_OFFSET);
+}
 volatile uint32_t queueWrite = 0;
 volatile uint32_t queueRead = 0;
 
@@ -300,6 +317,8 @@ bool audioTimerRunning = false;
 /// timer's. Writes were landing at 950/s against 2.6 submits/s already, so the driver's path was contributing
 /// nothing but the race.
 bool firstPacketSubmitted = false;
+/// Driver re-arms abandoned because a DMA transfer would not retire in time to hand the FIFO port over.
+/// Declared and reported since the timer work but never incremented until the DMA path gave it a meaning.
 uint32_t statSubmitSkipped = 0;
 /// readFrame has exactly three writers. The counters say nothing is built and the timer never writes, and the
 /// lead still reads 1 - so something advances it that is not accounted for, or one of these readings is false.
@@ -327,12 +346,24 @@ struct PathCost {
 	uint32_t cycles;
 	uint32_t calls;
 };
-PathCost costTimer = {};     ///< the whole write-timer interrupt, every branch including the ones that do nothing
-PathCost costFifoWrite = {}; ///< the FIFO copy alone, nested inside costTimer
-PathCost costService = {};   ///< all of service(), which the audio task is billed for and direness is read from
-PathCost costBuild = {};     ///< buildQueuedPackets, ring memcpy included, nested inside costService
-PathCost costSubmit = {};    ///< the driver's own submit path, nested inside costService
-PathCost costFeedMix = {};   ///< the producer writing the SDRAM ring, inside the audio routine
+PathCost costTimer = {};       ///< the whole write-timer interrupt, every branch including the ones that do nothing
+PathCost costFifoWrite = {};   ///< the FIFO copy alone, nested inside costTimer
+PathCost costService = {};     ///< all of service(), which the audio task is billed for and direness is read from
+PathCost costBuild = {};       ///< buildQueuedPackets, ring memcpy included, nested inside costService
+PathCost costSubmit = {};      ///< the driver's own submit path, nested inside costService
+PathCost costFeedMix = {};     ///< the producer writing the SDRAM ring, inside the audio routine
+PathCost costDmaStart = {};    ///< arming the DMA controller, which is what replaces the copy
+PathCost costDmaComplete = {}; ///< committing the packet once the controller has moved it
+
+/// DMA transmit state. audioDmaBusy is set by the timer that arms a transfer and cleared by the interrupt that
+/// retires it, so it is the only thing standing between the builder and a slot still being read.
+bool audioDmaConfigured = false;
+bool audioDmaInterruptArmed = false;
+volatile bool audioDmaBusy = false;
+uint32_t statDmaStarted = 0;
+uint32_t statDmaCompleted = 0;
+uint32_t statDmaBusySkips = 0;
+uint32_t statDmaLateRetires = 0;
 
 /// Cycle count at the last report, so every figure above is divided by a clock rather than by an assumed second.
 /// The report fires every 1000 task passes and the task rate breathes, which has manufactured a phantom result
@@ -1170,6 +1201,16 @@ void reportStats() {
 	emitDec(statFrdyAfterSubmit[0]);
 	emit(" bad:");
 	emitDec(statProbeNotOurs);
+	// Started against completed says whether every transfer the timer armed actually retired; skips say how often
+	// a fire found the controller still working. Per interval, unlike the cumulative fields beside them.
+	emit(" dma:");
+	emitDec(statDmaStarted);
+	emit("/");
+	emitDec(statDmaCompleted);
+	emit(" dsk:");
+	emitDec(statDmaBusySkips);
+	emit(" dlr:");
+	emitDec(statDmaLateRetires);
 	*p = '\0';
 	Debug::sysexDebugPrint(*Debug::midiDebugCable, planeLine, true);
 
@@ -1308,6 +1349,8 @@ void reportStats() {
 			emitCost(" bld:", costBuild);
 			emitCost(" sub:", costSubmit);
 			emitCost(" mix:", costFeedMix);
+			emitCost(" dst:", costDmaStart);
+			emitCost(" dcp:", costDmaComplete);
 		}
 		*p = '\0';
 		Debug::sysexDebugPrint(*Debug::midiDebugCable, costLine, true);
@@ -1318,6 +1361,8 @@ void reportStats() {
 		costBuild = PathCost{};
 		costSubmit = PathCost{};
 		costFeedMix = PathCost{};
+		costDmaStart = PathCost{};
+		costDmaComplete = PathCost{};
 	}
 
 	statPacketsSent = 0;
@@ -1379,31 +1424,146 @@ void reportStats() {
 	statFrdyAfterSubmit[0] = 0;
 	statFrdyAfterSubmit[1] = 0;
 	statProbeNotOurs = 0;
+	statDmaStarted = 0;
+	statDmaCompleted = 0;
+	statDmaBusySkips = 0;
+	statDmaLateRetires = 0;
 	// usbBempBitsSeen is deliberately not cleared: which pipes are live at all is the question, not how often.
+}
+
+/// Channel 0, the first of the two the vendor's USB configuration already names and one of the five the CPU's own
+/// channel map (RZA1/cpu_specific.h) lists as unallocated.
+constexpr uint32_t kAudioDmaChannel = 0;
+
+/// The request line the USB peripheral raises for D0FIFO on USB0, taken from the vendor driver's own table
+/// (r_usb_dma.c:1370). It means "the transmit FIFO will accept data", so the controller moves a packet only at a
+/// moment the CPU could have written one - the same window, without the CPU in it.
+constexpr uint32_t kAudioDmaRequest = 0x00000083u;
+
+/// Values rather than an include: the vendor's r_usb_dmac.h declares a whole driver's worth of types alongside
+/// these and has never been compiled in this fork. Each is named here as it is named there, r_usb_dmac.h:68-131.
+constexpr uint32_t kDmaChcfgAmBusCycle = 0x00000200u;   ///< AM = bus cycle mode
+constexpr uint32_t kDmaChcfgLevel = 0x00000040u;        ///< LVL: the request is a level, not an edge
+constexpr uint32_t kDmaChcfgHighEnable = 0x00000020u;   ///< HIEN: active high
+constexpr uint32_t kDmaChcfgSelCh0 = 0x00000000u;       ///< SEL = channel 0
+constexpr uint32_t kDmaChcfgDest32 = 0x00020000u;       ///< DDS: 32-bit writes to the FIFO
+constexpr uint32_t kDmaChcfgDestFixed = 0x00200000u;    ///< DAD: the FIFO register does not advance
+constexpr uint32_t kDmaChcfgSrc32 = 0x00002000u;        ///< SDS: 32-bit reads from the packet
+constexpr uint32_t kDmaChcfgReqDest = 0x00000008u;      ///< REQD: the requesting module is the destination
+constexpr uint32_t kDmaChctrlClearEnd = 0x00000020u;    ///< CLREND
+constexpr uint32_t kDmaChctrlClearTc = 0x00000040u;     ///< CLRTC
+constexpr uint32_t kDmaChctrlSwReset = 0x00000008u;     ///< SWRST
+constexpr uint32_t kDmaChctrlSetEnable = 0x00000001u;   ///< SETEN
+constexpr uint32_t kDmaChctrlClearEnable = 0x00000002u; ///< CLREN
+
+/// 32-bit either side, destination address fixed on the FIFO register, source incrementing through the packet.
+/// Every packet is a whole number of audio frames and a frame is kFrameBytes, so the byte count is always a
+/// multiple of four and there is never a remainder to write by hand.
+constexpr uint32_t kAudioDmaConfig = kDmaChcfgAmBusCycle | kDmaChcfgLevel | kDmaChcfgHighEnable | kDmaChcfgSelCh0
+                                     | kDmaChcfgDest32 | kDmaChcfgDestFixed | kDmaChcfgSrc32 | kDmaChcfgReqDest;
+
+/// Points the D0FIFO port at the audio pipe and leaves it there for the life of the stream.
+///
+/// This is the half of the change that matters beyond CPU cost: D0FIFO is a second, independent port, so the
+/// audio path stops sharing the CPU FIFO port with MIDI. The borrow-and-restore around every write, the interrupt
+/// masking that protected it, and the part-frame packet that rotates the host's channel mapping when two writers
+/// collide all cease to be possible rather than being guarded against.
+void configureAudioDmaFifo() {
+	usb_regadr_t reg = usb_hstd_get_usb_ip_adr(USB_CFG_USE_USBIP);
+	const uint16_t want = (uint16_t)(USB_CFG_PAUDIO_ISO_IN | USB_MBW_32);
+	uint16_t seen;
+	do {
+		reg->D0FIFOSEL = want;
+		seen = reg->D0FIFOSEL;
+	} while ((seen & USB_CURPIPE) != USB_CFG_PAUDIO_ISO_IN);
+	// Separately and after the pipe select has taken, matching the vendor driver: the request line must not be
+	// armed while the port still points somewhere else.
+	reg->D0FIFOSEL = (uint16_t)(want | USB_DREQE);
+	audioDmaConfigured = true;
+}
+
+/// Commits the packet the controller has just finished moving.
+///
+/// A transmit DMA leaves the buffer plane loaded but unsent - the hardware cannot know whether a short packet is
+/// finished or merely paused - so software sets the buffer-valid flag to release it. Two register writes, which is
+/// the whole CPU cost of a packet now.
+void retireAudioDma() {
+	if (!audioDmaBusy) {
+		return;
+	}
+	DMACn(kAudioDmaChannel).CHCTRL_n = kDmaChctrlClearEnd | kDmaChctrlClearTc;
+	usb_regadr_t reg = usb_hstd_get_usb_ip_adr(USB_CFG_USE_USBIP);
+	reg->D0FIFOCTR |= USB_BVAL;
+	queueRead++;
+	statTimerWrote++;
+	statDmaCompleted++;
+	audioDmaBusy = false;
+}
+
+extern "C" void audioDmaTransferComplete(uint32_t /*intSense*/) {
+	const uint32_t start = Debug::readCycleCounter();
+	retireAudioDma();
+	addCost(costDmaComplete, start);
+}
+
+/// Parks the D0FIFO port so the driver can write the same pipe through the CPU port.
+///
+/// One pipe must not be selected on two FIFO ports at once. The timer's writes and the driver's have always
+/// shared a pipe; until now they also shared a port, and interrupt masking was enough to keep them apart. They
+/// are on different ports now, so the port itself has to be handed over. This runs on the driver's re-arm, which
+/// is about once a second, not on the write path.
+///
+/// Returns false if a transfer would not retire in time, in which case the caller must not write: a bounded spin
+/// that gives up is the only safe answer, since this runs with interrupts masked and the completion interrupt
+/// that would normally retire the transfer cannot run.
+bool parkAudioDmaPort() {
+	const uint32_t deadline = Debug::readCycleCounter() + 4000u; ///< 10 us at 400 MHz
+	while ((DMACn(kAudioDmaChannel).CHSTAT_n & 0x05u) != 0u) {
+		if ((int32_t)(Debug::readCycleCounter() - deadline) > 0) {
+			return false;
+		}
+	}
+	// The controller has finished but its interrupt is masked by the caller, so the packet is sitting in the
+	// plane uncommitted. Retire it here rather than leaving it for an interrupt that will arrive after the
+	// driver has already written the pipe.
+	retireAudioDma();
+	usb_regadr_t reg = usb_hstd_get_usb_ip_adr(USB_CFG_USE_USBIP);
+	reg->D0FIFOSEL = USB_MBW_32;
+	audioDmaConfigured = false;
+	return true;
+}
+
+/// Hands one packet to the DMA controller. Returns without arming if the channel is still working on the last one.
+bool startAudioDma(uint32_t slot, uint16_t bytes) {
+	const uint32_t start = Debug::readCycleCounter();
+	// EN or TACT still set means the previous transfer has not retired. Skipped rather than waited on: the next
+	// timer fire is 400 us away and spinning here would hold the interrupt open for exactly the reason this
+	// change exists.
+	if ((DMACn(kAudioDmaChannel).CHSTAT_n & 0x05u) != 0u) {
+		statDmaBusySkips++;
+		return false;
+	}
+	// The ordinary, cached address of the slot: the builder wrote it through the uncached mirror, so what is in
+	// memory is already current and the controller reads the same bytes from the normal one.
+	DMACn(kAudioDmaChannel).N0SA_n = (uint32_t)packetQueue[slot].data;
+	DMACn(kAudioDmaChannel).N0DA_n = (uint32_t)&(usb_hstd_get_usb_ip_adr(USB_CFG_USE_USBIP)->D0FIFO);
+	DMACn(kAudioDmaChannel).N0TB_n = bytes;
+	DMACn(kAudioDmaChannel).CHCFG_n = kAudioDmaConfig;
+	DMACn(kAudioDmaChannel).CHITVL_n = 0u;
+	setDMARS(kAudioDmaChannel, kAudioDmaRequest);
+	DMACn(kAudioDmaChannel).CHCTRL_n = kDmaChctrlSwReset;
+	audioDmaBusy = true;
+	DMACn(kAudioDmaChannel).CHCTRL_n = kDmaChctrlSetEnable;
+	statDmaStarted++;
+	addCost(costDmaStart, start);
+	return true;
 }
 
 /// Pushes one pre-built packet into the pipe, from the timer interrupt.
 ///
 /// Does no building and touches neither the ring nor the sequence counter: those belong to the task, because a
-/// ~990-byte copy out of the ring inside a 1 kHz interrupt is what starved the audio engine on v0.14.0. All this
-/// does is steer the shared FIFO port and push bytes that are already sitting in memory.
-/// Puts the shared FIFO port back exactly as it was found.
-///
-/// usb_cstd_is_set_frdy_rohan re-points the port at our pipe and never restores it. That is harmless when only
-/// the driver's own single-threaded paths use it, and not harmless at all from a 1 kHz interrupt: landing inside
-/// a MIDI FIFO write leaves the rest of MIDI's bytes going into our pipe, which reaches the host as a part-frame
-/// packet and rotates its channel mapping. Measured as channel constants arriving on channel 1, ~40 samples a
-/// minute. The port's access width lives in the same register, so restoring it wholesale covers that too.
-void restoreFifoPort(uint16_t savedSel, uint16_t savedShadow) {
-	usb_regadr_t reg = usb_hstd_get_usb_ip_adr(USB_CFG_USE_USBIP);
-	fifoSels[kUseCpuFifo] = savedShadow;
-	uint16_t seen;
-	do {
-		reg->CFIFOSEL = savedSel;
-		seen = reg->CFIFOSEL;
-	} while ((seen & (kFifoSelIsel | kFifoSelCurPipe)) != (savedSel & (kFifoSelIsel | kFifoSelCurPipe)));
-}
-
+/// ~990-byte copy out of the ring inside a 1 kHz interrupt is what starved the audio engine on v0.14.0. Since the
+/// DMA controller took the copy over, all this does is check whether a buffer plane is free and arm a transfer.
 void audioWriteTimerBody() {
 	timerClearCompareMatchTGRA(kAudioWriteTimer);
 	statTimerFires++;
@@ -1421,67 +1581,44 @@ void audioWriteTimerBody() {
 		return;
 	}
 
-	// Up to one extra write per fire, to recover a frame whose fire never happened. 61 of the host's 1000
-	// frames a second produced no timer interrupt at all under load - the handler is delayed past its own next
-	// deadline and two compare matches collapse into one - and one write per fire can never make that up.
-	//
-	// It cannot overrun the host: a plane only becomes free when the host has taken a packet, so the free plane
-	// is the host's clock rather than ours. If nothing is free the second attempt costs one register read.
-	for (uint32_t writesThisFire = 0; writesThisFire < 2u; writesThisFire++) {
-		if (writesThisFire > 0u && queueWrite == queueRead) {
-			break;
-		}
-
-		// The FIFO port is shared with MIDI and the readiness check steers it to our pipe, so nothing may run in
-		// between. This interrupt can itself be preempted, so the guard is explicit rather than assumed.
-		DISABLE_ALL_INTERRUPTS();
-		usb_regadr_t reg = usb_hstd_get_usb_ip_adr(USB_CFG_USE_USBIP);
-		const uint16_t savedSel = reg->CFIFOSEL;
-		const uint16_t savedShadow = fifoSels[kUseCpuFifo];
-		// Restore only if the port was pointing somewhere else, which is the only case where anything was borrowed.
-		// Restoring unconditionally costs a pipe change on every write, and usb_cstd_is_set_frdy_rohan gives up if
-		// the port is not ready within 100 ns - measured as 753 refusals a second against 37 writes.
-		const bool borrowed = (savedSel & kFifoSelCurPipe) != USB_CFG_PAUDIO_ISO_IN;
-		// The vendored 100 ns timeout is taken as final. Polling past it for a further 3.8 us rescued zero
-		// writes in 120 s of streaming across two songs, and zero again on 2026-08-27 - and it spun with all
-		// interrupts masked ~1,950 times a second to do it.
-		const uint16_t status = usb_cstd_is_set_frdy_rohan(USB_CFG_PAUDIO_ISO_IN);
-		if (status == kFifoError) {
-			statFrdyNever++;
-		}
-		else {
-			statFrdyImmediate++;
-		}
-		if (status == kFifoError) {
-			if (borrowed) {
-				restoreFifoPort(savedSel, savedShadow);
-			}
-			ENABLE_ALL_INTERRUPTS();
-			statTimerShut++;
-			// Nothing writable now, so a second attempt this fire cannot succeed either. The next attempt is
-			// kTimerTicksPerMs/2.5 away rather than a whole frame, which is the entire fix.
+	// One packet per fire now, not up to two. The catch-up second write existed because a CPU write completes
+	// inside the interrupt and a second one could follow it; a DMA transfer is still in flight when this returns,
+	// so there is nothing to double up on. It was recovering 6-8 frames a second.
+	if (audioDmaBusy) {
+		// A transfer the controller has finished but whose interrupt has not run leaves the packet uncommitted
+		// and audioDmaBusy set, which would stall the stream permanently on a single missed interrupt. Retiring
+		// it here makes the interrupt an optimisation rather than the only path. The two are still told apart:
+		// costDmaComplete counts only the interrupt's retires, so dcp near zero against dma completes near a
+		// thousand says the interrupt never fires at all.
+		if ((DMACn(kAudioDmaChannel).CHSTAT_n & 0x05u) != 0u) {
+			statDmaBusySkips++;
 			return;
 		}
+		retireAudioDma();
+		statDmaLateRetires++;
+	}
 
-		QueuedPacket& q = packetQueue[queueRead % kQueueSlots];
-		// DIAGNOSTIC. The copy alone, which is the only part of this handler DMA could take over.
-		const uint32_t fifoStart = Debug::readCycleCounter();
-		usb_pstd_write_fifo(q.bytes, kUseCpuFifo, q.data);
-		if ((hw_usb_read_fifoctr(nullptr, kUseCpuFifo) & kFifoCtrBval) == 0u) {
-			hw_usb_set_bval(nullptr, kUseCpuFifo);
-		}
-		addCost(costFifoWrite, fifoStart);
-		if (borrowed) {
-			restoreFifoPort(savedSel, savedShadow);
-			statPortBorrowed++;
-		}
-		ENABLE_ALL_INTERRUPTS();
-		queueRead++;
-		statTimerWrote++;
-		if (kSweepOffsets && sweepBin < kSweepBins) {
-			sweepWrites[sweepBin]++;
-		}
-		statCatchUp += (writesThisFire > 0u) ? 1u : 0u;
+	// The audio pipe now has D0FIFO to itself - MIDI is on the CPU port - so this reads the plane's readiness
+	// without steering a shared selector, and neither the borrow-and-restore nor the interrupt masking that
+	// protected it is needed any more. That polling was measured at 14.2 us per fire on 2026-08-29, on top of the
+	// 60.7 us copy.
+	usb_regadr_t reg = usb_hstd_get_usb_ip_adr(USB_CFG_USE_USBIP);
+	if ((reg->D0FIFOCTR & USB_FRDY) == 0u) {
+		statFrdyNever++;
+		statTimerShut++;
+		return;
+	}
+	statFrdyImmediate++;
+
+	const uint32_t slot = queueRead % kQueueSlots;
+	if (!startAudioDma(slot, packetQueueBytes[slot])) {
+		statTimerShut++;
+		return;
+	}
+	// queueRead is advanced by the completion handler, not here: the controller is still reading this slot and
+	// releasing it now would let the builder overwrite a packet mid-flight.
+	if (kSweepOffsets && sweepBin < kSweepBins) {
+		sweepWrites[sweepBin]++;
 	}
 }
 
@@ -1498,9 +1635,12 @@ void audioWriteTimerInterrupt(uint32_t /*intSense*/) {
 void buildQueuedPackets() {
 	const uint32_t start = Debug::readCycleCounter();
 	while ((uint32_t)(queueWrite - queueRead) < kQueueSlots) {
-		QueuedPacket& q = packetQueue[queueWrite % kQueueSlots];
-		const uint32_t frames = buildNextPacket(q.data);
-		q.bytes = (uint16_t)(frames * kFrameBytes);
+		const uint32_t slot = queueWrite % kQueueSlots;
+		// Built straight into the uncached view of the slot, so the bytes are in memory the instant they are
+		// written and the DMA controller needs no cache maintenance to see them. A whole-cache flush per packet,
+		// which is what the vendor driver does, would cost more than the copy this change exists to remove.
+		const uint32_t frames = buildNextPacket(uncachedSlot(slot));
+		packetQueueBytes[slot] = (uint16_t)(frames * kFrameBytes);
 		// The slot's contents must be visible before the index that publishes it.
 		__asm volatile("DSB" ::: "memory");
 		queueWrite++;
@@ -1608,6 +1748,14 @@ static void serviceBody() {
 		statReadAdvPark++;
 		queueRead = queueWrite;
 		firstPacketSubmitted = false;
+		// Stop the channel and drop the request line with it: a stream that ends between arming and completion
+		// would otherwise leave a live request against a pipe nothing is servicing.
+		if (audioDmaConfigured) {
+			DMACn(kAudioDmaChannel).CHCTRL_n = kDmaChctrlClearEnable;
+			usb_hstd_get_usb_ip_adr(USB_CFG_USE_USBIP)->D0FIFOSEL = USB_MBW_32;
+			audioDmaConfigured = false;
+		}
+		audioDmaBusy = false;
 		stopAudioWriteTimer();
 		if (sofEnabled) {
 			usb_hstd_get_usb_ip_adr(USB_CFG_USE_USBIP)->INTENB0 &= (uint16_t)~kIntEnbSofe;
@@ -1665,12 +1813,30 @@ static void serviceBody() {
 	// channel mapping permanently.
 	const uint32_t submitStart = Debug::readCycleCounter();
 	DISABLE_ALL_INTERRUPTS();
+	// The port is handed over rather than shared, and the write is abandoned if a transfer will not retire.
+	// Skipping one re-arm costs a packet; writing a pipe selected on two ports is what rotates the host's
+	// channel mapping permanently.
+	if (audioDmaConfigured && !parkAudioDmaPort()) {
+		ENABLE_ALL_INTERRUPTS();
+		statSubmitSkipped++;
+		addCost(costSubmit, submitStart);
+		return;
+	}
 	sendNextPacket();
 	ENABLE_ALL_INTERRUPTS();
 	addCost(costSubmit, submitStart);
 	firstPacketSubmitted = transferInFlight;
 	// Started only once a host is actually streaming and the driver's own first transfer is set up, so an idle
 	// Deluge pays nothing and the timer never fires against an unconfigured pipe.
+	if (!audioDmaConfigured) {
+		configureAudioDmaFifo();
+		if (!audioDmaInterruptArmed) {
+			// Priority 5, matching the write timer that arms it: this hands one packet over and returns, and
+			// there is no reason for it to outrank the CV SPI transfers already at that level.
+			setupAndEnableInterrupt(audioDmaTransferComplete, INTC_ID_DMAINT0 + kAudioDmaChannel, 5);
+			audioDmaInterruptArmed = true;
+		}
+	}
 	startAudioWriteTimer();
 	if (!sofEnabled && transferInitialised) {
 		usb_hstd_get_usb_ip_adr(USB_CFG_USE_USBIP)->INTENB0 |= kIntEnbSofe;
