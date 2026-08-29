@@ -89,8 +89,23 @@ constexpr uint32_t kFrameRemainder = kSampleRate % 1000;
 /// carry what the engine renders - 980/s at 45 frames, 959/s at 46 - and it measures 900-904 under load. Derived
 /// from kFrameBytes rather than written down, so changing the channel count moves this with it.
 constexpr uint32_t kIsoLimitBytes = 1023;
-constexpr uint32_t kMaxFramesPerPacket = kIsoLimitBytes / kFrameBytes;
+
+/// Every packet is a whole number of 32-byte blocks, because that is the unit the DMA controller moves in.
+///
+/// Moving four bytes per bus cycle took 130 us mean and 675 us worst from arming a transfer to committing the
+/// packet, against 60.7 us for the CPU copy it replaced, and 27% of packets were committed a whole host frame
+/// after they were armed - measured 2026-08-29. A packet committed after the host has asked for it waits for the
+/// next token, which is what doubled the interruption rate. Thirty-two bytes a cycle is eight times fewer.
+///
+/// A frame is kFrameBytes, so a block is exactly two frames and every packet size here is even. The ceiling
+/// drops from 63 frames to 62, which raises break-even from 880 writes a second to about 890 against the 985
+/// measured.
+constexpr uint32_t kDmaBlockBytes = 32u;
+constexpr uint32_t kFramesPerBlock = kDmaBlockBytes / kFrameBytes;
+static_assert(kDmaBlockBytes % kFrameBytes == 0, "A DMA block must be a whole number of audio frames");
+constexpr uint32_t kMaxFramesPerPacket = (kIsoLimitBytes / kFrameBytes) / kFramesPerBlock * kFramesPerBlock;
 constexpr uint32_t kMaxPacketBytes = kMaxFramesPerPacket * kFrameBytes;
+static_assert(kMaxPacketBytes % kDmaBlockBytes == 0, "Packets must be whole DMA blocks");
 
 static_assert(kMaxFramesPerPacket > kFramesPerPacket,
               "A packet must hold more than the nominal frame count or the stream can never keep up");
@@ -749,11 +764,14 @@ uint32_t buildNextPacket(uint8_t* buffer) {
 	statBuilds++;
 	// Nominal packet size, used only while there is nothing real to send. 44.1 kHz does not divide into 1 ms
 	// frames, so 44 frames with a 45th every tenth packet averages exactly 44100 rather than drifting.
-	uint32_t frames = kFramesPerPacket;
+	// Even sizes only, so the long-run average is held by adding a whole block every twentieth packet rather than
+	// a single frame every tenth: 100 per packet against a 2000 threshold is 44 + 2/20 = 44.1, the same average
+	// the odd-sized version produced.
+	uint32_t frames = kFramesPerPacket / kFramesPerBlock * kFramesPerBlock;
 	frameAccumulator += kFrameRemainder;
-	if (frameAccumulator >= 1000) {
-		frames++;
-		frameAccumulator -= 1000;
+	if (frameAccumulator >= 1000u * kFramesPerBlock) {
+		frames += kFramesPerBlock;
+		frameAccumulator -= 1000u * kFramesPerBlock;
 	}
 
 	// Signed, and the pointers are free-running rather than masked to the ring: a masked subtraction cannot
@@ -800,9 +818,10 @@ uint32_t buildNextPacket(uint8_t* buffer) {
 		statResyncs++;
 	}
 
-	if (available == 0u) {
-		// The engine has not produced anything since the last poll. Send correctly sized silence rather than
-		// nothing, so the endpoint keeps answering, and do not advance the read pointer.
+	if (available < kFramesPerBlock) {
+		// Less than one whole block since the last poll, which cannot fill a packet the controller can move.
+		// Send correctly sized silence rather than nothing, so the endpoint keeps answering, and do not advance
+		// the read pointer.
 		statUnderruns++;
 		memset(buffer, 0, frames * kFrameBytes);
 		markDeviceSilence(buffer, frames);
@@ -843,6 +862,13 @@ uint32_t buildNextPacket(uint8_t* buffer) {
 	}
 	if (send > kMaxFramesPerPacket) {
 		send = kMaxFramesPerPacket;
+	}
+	// Down to a whole block, never up: rounding up would read frames the engine has not written yet. The frame
+	// left behind is sent by the next packet, so nothing is lost - the builder is self-regulating and takes
+	// whatever the ring holds above the cushion.
+	send = send / kFramesPerBlock * kFramesPerBlock;
+	if (send == 0u) {
+		send = kFramesPerBlock;
 	}
 
 	const uint32_t start = readFrame & kRingMask;
@@ -1477,9 +1503,9 @@ constexpr uint32_t kDmaChcfgAmBusCycle = 0x00000200u;   ///< AM = bus cycle mode
 constexpr uint32_t kDmaChcfgLevel = 0x00000040u;        ///< LVL: the request is a level, not an edge
 constexpr uint32_t kDmaChcfgHighEnable = 0x00000020u;   ///< HIEN: active high
 constexpr uint32_t kDmaChcfgSelCh0 = 0x00000000u;       ///< SEL = channel 0
-constexpr uint32_t kDmaChcfgDest32 = 0x00020000u;       ///< DDS: 32-bit writes to the FIFO
+constexpr uint32_t kDmaChcfgDest256 = 0x00050000u;      ///< DDS: 256-bit, a 32-byte block per bus cycle
 constexpr uint32_t kDmaChcfgDestFixed = 0x00200000u;    ///< DAD: the FIFO register does not advance
-constexpr uint32_t kDmaChcfgSrc32 = 0x00002000u;        ///< SDS: 32-bit reads from the packet
+constexpr uint32_t kDmaChcfgSrc256 = 0x00005000u;       ///< SDS: 256-bit reads from the packet
 constexpr uint32_t kDmaChcfgReqDest = 0x00000008u;      ///< REQD: the requesting module is the destination
 constexpr uint32_t kDmaChctrlClearEnd = 0x00000020u;    ///< CLREND
 constexpr uint32_t kDmaChctrlClearTc = 0x00000040u;     ///< CLRTC
@@ -1487,11 +1513,16 @@ constexpr uint32_t kDmaChctrlSwReset = 0x00000008u;     ///< SWRST
 constexpr uint32_t kDmaChctrlSetEnable = 0x00000001u;   ///< SETEN
 constexpr uint32_t kDmaChctrlClearEnable = 0x00000002u; ///< CLREN
 
-/// 32-bit either side, destination address fixed on the FIFO register, source incrementing through the packet.
-/// Every packet is a whole number of audio frames and a frame is kFrameBytes, so the byte count is always a
-/// multiple of four and there is never a remainder to write by hand.
+/// D0FBCFG's 32-byte continuous access mode, USB_DFACC_32 in the vendor's bit definitions.
+constexpr uint16_t kFifoAccess32Byte = 0x2000u;
+
+/// 32-byte blocks either side, destination fixed on the FIFO's block registers, source incrementing through the
+/// packet. kMaxFramesPerPacket keeps every packet a whole number of blocks, so there is never a remainder.
+///
+/// The FIFO port's own access mode must agree with this or the two disagree about what a request is worth; that
+/// is kFifoAccess32Byte, written to D0FBCFG in configureAudioDmaFifo.
 constexpr uint32_t kAudioDmaConfig = kDmaChcfgAmBusCycle | kDmaChcfgLevel | kDmaChcfgHighEnable | kDmaChcfgSelCh0
-                                     | kDmaChcfgDest32 | kDmaChcfgDestFixed | kDmaChcfgSrc32 | kDmaChcfgReqDest;
+                                     | kDmaChcfgDest256 | kDmaChcfgDestFixed | kDmaChcfgSrc256 | kDmaChcfgReqDest;
 
 /// Points the D0FIFO port at the audio pipe and leaves it there for the life of the stream.
 ///
@@ -1509,6 +1540,8 @@ void configureAudioDmaFifo() {
 	} while ((seen & USB_CURPIPE) != USB_CFG_PAUDIO_ISO_IN);
 	// Separately and after the pipe select has taken, matching the vendor driver: the request line must not be
 	// armed while the port still points somewhere else.
+	// The port's access mode is set while the request line is still down and before any transfer is armed.
+	reg->D0FBCFG = kFifoAccess32Byte;
 	reg->D0FIFOSEL = (uint16_t)(want | USB_DREQE);
 	audioDmaConfigured = true;
 }
@@ -1586,7 +1619,9 @@ bool startAudioDma(uint32_t slot, uint16_t bytes) {
 	// The ordinary, cached address of the slot: the builder wrote it through the uncached mirror, so what is in
 	// memory is already current and the controller reads the same bytes from the normal one.
 	DMACn(kAudioDmaChannel).N0SA_n = (uint32_t)packetQueue[slot].data;
-	DMACn(kAudioDmaChannel).N0DA_n = (uint32_t)&(usb_hstd_get_usb_ip_adr(USB_CFG_USE_USBIP)->D0FIFO);
+	// The block registers rather than the single-word port: a 32-byte transfer lands across D0FIFOB0-B7 in one
+	// bus cycle, which is the whole point of the change.
+	DMACn(kAudioDmaChannel).N0DA_n = (uint32_t)&(usb_hstd_get_usb_ip_adr(USB_CFG_USE_USBIP)->D0FIFOB0);
 	DMACn(kAudioDmaChannel).N0TB_n = bytes;
 	DMACn(kAudioDmaChannel).CHCFG_n = kAudioDmaConfig;
 	DMACn(kAudioDmaChannel).CHITVL_n = 0u;
