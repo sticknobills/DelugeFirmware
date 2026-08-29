@@ -36,7 +36,11 @@ public:
 	///
 	/// `dspTimeSamples` is the scheduler's running average for the audio task expressed in samples, which is
 	/// the figure culling is decided against; `windowSamples` is how many samples that render was asked for.
-	static void recordRender(int32_t dspTimeSamples, size_t windowSamples, int32_t direness);
+	/// `dspTimeSamples` is the corrected figure direness is actually decided from; `dspTimeRaw` is the scheduler's
+	/// own per-call average before that correction, and `rendersPerCallX100` is what separates them. All three are
+	/// reported so the correction can be checked rather than trusted.
+	static void recordRender(int32_t dspTimeSamples, int32_t dspTimeRaw, size_t windowSamples, int32_t direness,
+	                         uint32_t rendersPerCallX100);
 
 	/// Takes voices the engine gave up on because it ran out of time, by the route it used.
 	static void recordCull(uint32_t forceReleased, uint32_t terminated, uint32_t killed);

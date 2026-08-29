@@ -35,6 +35,8 @@ bool intervalStarted = false;
 
 uint32_t statRenders = 0;
 uint64_t statDspSum = 0;
+uint64_t statDspRawSum = 0;
+uint64_t statRpcSum = 0;
 int32_t statDspMax = 0;
 uint64_t statWindowSum = 0;
 uint32_t statWindowMax = 0;
@@ -46,6 +48,8 @@ uint32_t statKilled = 0;
 void clearInterval() {
 	statRenders = 0;
 	statDspSum = 0;
+	statDspRawSum = 0;
+	statRpcSum = 0;
 	statDspMax = 0;
 	statWindowSum = 0;
 	statWindowMax = 0;
@@ -57,8 +61,11 @@ void clearInterval() {
 
 } // namespace
 
-void EngineLoadReport::recordRender(int32_t dspTimeSamples, size_t windowSamples, int32_t direness) {
+void EngineLoadReport::recordRender(int32_t dspTimeSamples, int32_t dspTimeRaw, size_t windowSamples, int32_t direness,
+                                    uint32_t rendersPerCallX100) {
 	statRenders++;
+	statDspRawSum += (uint32_t)(dspTimeRaw < 0 ? 0 : dspTimeRaw);
+	statRpcSum += rendersPerCallX100;
 	if (dspTimeSamples < 0) {
 		dspTimeSamples = 0;
 	}
@@ -136,6 +143,10 @@ void EngineLoadReport::routine() {
 	// the scheduler's running average rather than this render's own cost, so a single late render is smoothed.
 	emit(" dsp");
 	emitDec(dspMean);
+	emit(" dspr");
+	emitDec((renders != 0u) ? (uint32_t)(statDspRawSum / renders) : 0u);
+	emit(" rpc");
+	emitDec((renders != 0u) ? (uint32_t)(statRpcSum / renders) : 0u);
 	emit(" dmx");
 	emitDec((uint32_t)statDspMax);
 	emit(" win");

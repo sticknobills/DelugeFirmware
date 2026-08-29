@@ -2286,29 +2286,40 @@ void USBAudioStream::snapshotBeforeTrack(const int32_t* mixNow, uint32_t numSamp
 	addCost(costStemSnapshot, start);
 }
 
-void USBAudioStream::captureStem(uint32_t channel, const int32_t* mixNow, uint32_t numSamples) {
+/// Built at -O3 for the vector unit alone. At the project's -O2 the compiler half-vectorises this and then hands
+/// each result back to the main processor one sample at a time to store it, which stalls this core's pipeline; at
+/// -O3 it deinterleaves and stores in vector registers throughout. Confirmed in the generated code, not assumed.
+[[gnu::optimize("O3")]] void USBAudioStream::captureStem(uint32_t channel, const int32_t* mixNow, uint32_t numSamples) {
 	if (channel >= kStemChannels || numSamples > stemWindowSamples) {
 		return;
 	}
 	const uint32_t costCaptureStart = costStart();
 	const int32_t* const snapshot = stemSnapshot;
 	int32_t* const out = stemAccumulator[channel];
-	int32_t peak = stemPeak[channel];
 	for (uint32_t i = 0; i < numSamples; i++) {
 		// The track's own contribution, left and right, taken as what it added to the mix rather than by rendering
 		// it a second time. Halved on the way to mono so a centred track keeps its level rather than doubling it.
+		//
+		// Assigned, not accumulated: a channel carries exactly one track, so there is nothing to add to. The
+		// accumulate was what forced every sample out of the vector unit and back into the main processor, and
+		// that transfer stalls this core - it was most of what made this walk 6.3x a plain copy of the same span.
 		const int32_t l = mixNow[i * 2] - snapshot[i * 2];
 		const int32_t r = mixNow[i * 2 + 1] - snapshot[i * 2 + 1];
-		const int32_t mono = (l >> 1) + (r >> 1);
-		out[i] += mono;
-		// Taken here rather than off the accumulator, so a channel nothing ever wrote to and a channel written
-		// with silence are told apart by the name beside it rather than by the number alone.
-		const int32_t magnitude = (mono < 0) ? -mono : mono;
-		if (magnitude > peak) {
-			peak = magnitude;
-		}
+		out[i] = (l >> 1) + (r >> 1);
 	}
-	stemPeak[channel] = peak;
+	if constexpr (kReportStemMap) {
+		// Its own walk, and only while the map report exists. Folded into the loop above it reintroduces exactly
+		// the transfer that loop was rewritten to avoid - measured in the generated code, not assumed.
+		int32_t peak = stemPeak[channel];
+		for (uint32_t i = 0; i < numSamples; i++) {
+			const int32_t m = out[i];
+			const int32_t magnitude = (m < 0) ? -m : m;
+			if (magnitude > peak) {
+				peak = magnitude;
+			}
+		}
+		stemPeak[channel] = peak;
+	}
 	addCost(costStemCapture, costCaptureStart);
 }
 

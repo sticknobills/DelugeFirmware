@@ -422,6 +422,17 @@ extern uint16_t g_usb_usbmode;
 
 uint8_t numRoutines = 0;
 
+/// How many renders the audio task has been doing per call, as a running average in hundredths.
+///
+/// The scheduler reports this task's average *call* duration, and one call can contain more than one render. The
+/// direness test below compares that duration against a single render's window, so anything that changes how many
+/// renders land in a call moves direness without moving the load. Measured 2026-08-30: opening the USB stream
+/// takes this from 1.21 to 1.59 renders a call, and the direness input rises 37% while the processor share rises
+/// 7%. Voices are culled off the inflated figure.
+///
+/// Hundredths of a render rather than a float, so the correction is integer arithmetic on the audio path.
+uint32_t rendersPerCallX100 = 100;
+
 // not in header (private to audio engine)
 /// determines how many voices to cull based on num audio samples, current voices and numSamplesLimit
 void cullVoices(size_t numSamples, int32_t numAudio, int32_t numVoice) {
@@ -511,7 +522,11 @@ inline void setDireness(size_t numSamples) { // Consider direness and culling - 
 	// DIAGNOSTIC. numSamples is reassigned below, so the render's own window is taken while it still means that.
 	const size_t windowSamples = numSamples;
 	// number of samples it took to do the last render
-	auto dspTime = (int32_t)(getAverageRunTimeForTask(routine_task_id) * 44100.);
+	const int32_t dspTimeRaw = (int32_t)(getAverageRunTimeForTask(routine_task_id) * 44100.);
+	// Shared across the renders in one call, so one render's share is the call's time divided by how many it makes.
+	// Without this the first render of every call is charged for the whole call, which is what let the USB stream
+	// inflate direness by a third while costing five points of processor.
+	auto dspTime = (int32_t)(((int64_t)dspTimeRaw * 100) / (int32_t)rendersPerCallX100);
 	size_t nonDSP = numSamples - dspTime;
 	// we don't care about the number that were rendered in the last go, only the ones taken by the first routine call
 	numSamples = std::max<int32_t>(dspTime - (int32_t)(numRoutines * numSamples), 0);
@@ -555,7 +570,8 @@ inline void setDireness(size_t numSamples) { // Consider direness and culling - 
 	}
 
 	// DIAGNOSTIC. Reported at the end so the direness recorded is this render's, not the previous one's.
-	deluge::processing::engines::EngineLoadReport::recordRender(dspTime, windowSamples, cpuDireness);
+	deluge::processing::engines::EngineLoadReport::recordRender(dspTime, dspTimeRaw, windowSamples, cpuDireness,
+	                                                            rendersPerCallX100);
 }
 
 void scheduleMidiGateOutISR(uint32_t saddrPosAtStart, int32_t unadjustedNumSamplesBeforeLappingPlayHead,
@@ -1090,6 +1106,15 @@ void routine() {
 #endif
 			routine_();
 			numRoutines += 1;
+		}
+		// Updated after the call rather than during it, because the first render cannot know how many will follow.
+		// A running average, same shape as the scheduler's own, so a single unusual call cannot swing the
+		// correction. Calls that rendered nothing are skipped - they would drag it below one render a call.
+		if (numRoutines > 0) {
+			rendersPerCallX100 = (rendersPerCallX100 + (uint32_t)numRoutines * 100u) / 2u;
+			if (rendersPerCallX100 < 100u) {
+				rendersPerCallX100 = 100u;
+			}
 		}
 	}
 	else {
