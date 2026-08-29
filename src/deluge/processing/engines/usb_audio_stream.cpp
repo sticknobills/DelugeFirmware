@@ -68,6 +68,17 @@ void __enable_irq(void);
 
 namespace {
 
+/// Whether this build carries its instruments.
+///
+/// Off is the shipping stream: no counters, no SysEx report, no cycle timing, and - the part that matters to a
+/// listener - channels 3 upwards carry audio rather than the producer stamp, the mark and the packet number.
+/// On restores every instrument the transport was built with, which is what the bench tools read: delivery.py
+/// and seams.py both decode the producer stamp, so a build with this off can only be judged by ear.
+///
+/// A constant rather than a preprocessor flag so both halves stay compiled and cannot rot apart. Everything it
+/// guards is discarded by the optimiser, so an off build pays nothing for carrying it.
+constexpr bool kDiagnostics = false;
+
 /// Must match the AudioStreaming interface's number in r_usb_pmidi_descriptor.c.
 constexpr uint16_t kAudioInterfaceNumber = 2;
 constexpr uint16_t kStreamingAltSetting = 1;
@@ -112,7 +123,8 @@ static_assert(kMaxFramesPerPacket > kFramesPerPacket,
 
 /// The diagnostics write channels 3-6 by fixed offset into the audio frame, so a smaller frame would put the
 /// producer stamp and the packet number outside it. Fails the build rather than corrupting the frame quietly.
-static_assert(kChannels >= 6, "Channels 3-6 carry the producer stamp, the mark and the packet number");
+/// Only binding while they are compiled in - a shipping build is free to be narrower than six channels.
+static_assert(!kDiagnostics || kChannels >= 6, "Channels 3-6 carry the producer stamp, the mark and the packet number");
 
 static_assert(kMaxPacketBytes <= USB_CFG_PAUDIO_BUF_BYTES,
               "Audio packet does not fit the pipe buffer declared in r_usb_paudio_config.h");
@@ -441,8 +453,36 @@ bool costCounterEnabled = false;
 /// Unsigned throughout, so the counter's 10.7 s wrap needs no detecting: the difference is right across it as
 /// long as the span itself is shorter than that, which every span here is by four orders of magnitude.
 [[gnu::always_inline]] inline void addCost(PathCost& c, uint32_t start) {
-	c.cycles += Debug::readCycleCounter() - start;
-	c.calls++;
+	if constexpr (kDiagnostics) {
+		c.cycles += Debug::readCycleCounter() - start;
+		c.calls++;
+	}
+}
+
+/// The cycle counter read that opens a timed span. Reads nothing when the instruments are compiled out, so a
+/// shipping build makes no PMU access on the write timer's path at all.
+///
+/// Not to be used for anything but timing: parkAudioDmaPort's deadline is a real one and reads the counter
+/// directly, which is also why Debug::init() below stays unconditional.
+[[gnu::always_inline]] inline uint32_t costStart() {
+	if constexpr (kDiagnostics) {
+		return Debug::readCycleCounter();
+	}
+	return 0u;
+}
+
+/// Counters, compiled out with everything else they feed. Declared as ordinary values above rather than wrapped
+/// in a type, so the shipping build differs from the measured one by these calls and nothing else.
+[[gnu::always_inline]] inline void bump(uint32_t& c) {
+	if constexpr (kDiagnostics) {
+		c++;
+	}
+}
+
+[[gnu::always_inline]] inline void bump(uint32_t& c, uint32_t n) {
+	if constexpr (kDiagnostics) {
+		c += n;
+	}
 }
 
 /// Branch counters. "Nothing was sent" cannot distinguish the task never running, the task
@@ -675,20 +715,23 @@ uint16_t readFrameNumber() {
 void sendNextPacket();
 
 void transferComplete(usb_utr_t* /*ptr*/, uint16_t /*data1*/, uint16_t /*data2*/) {
-	statCompletes++;
+	bump(statCompletes);
 	transferInFlight = false;
-	regsAtLastCompletion = readPipeRegisters();
-	regsSnapshotTaken = true;
 
-	const uint16_t frameAtCompletion = readFrameNumber();
-	if (lastCompletionFrameValid) {
-		const uint32_t gap = (uint32_t)((frameAtCompletion - lastCompletionFrame) & kFrameNumberMask);
-		// Bucketed rather than averaged: a steady two and an alternating one-and-three give the same mean and
-		// mean opposite things about where the packet is being lost.
-		statCompletionGap[gap > 4u ? 4u : gap]++;
+	if constexpr (kDiagnostics) {
+		regsAtLastCompletion = readPipeRegisters();
+		regsSnapshotTaken = true;
+
+		const uint16_t frameAtCompletion = readFrameNumber();
+		if (lastCompletionFrameValid) {
+			const uint32_t gap = (uint32_t)((frameAtCompletion - lastCompletionFrame) & kFrameNumberMask);
+			// Bucketed rather than averaged: a steady two and an alternating one-and-three give the same mean and
+			// mean opposite things about where the packet is being lost.
+			statCompletionGap[gap > 4u ? 4u : gap]++;
+		}
+		lastCompletionFrame = frameAtCompletion;
+		lastCompletionFrameValid = true;
 	}
-	lastCompletionFrame = frameAtCompletion;
-	lastCompletionFrameValid = true;
 
 	// Deliberately does NOT build or submit a packet. It used to, and that made the ring's read pointer shared
 	// between this interrupt and the task: both do readFrame = readFrame + send, and a completion landing inside
@@ -704,10 +747,10 @@ void transferComplete(usb_utr_t* /*ptr*/, uint16_t /*data1*/, uint16_t /*data2*/
 	// The task is now the only builder. The timer still writes bytes already in memory, which is what an
 	// interrupt can afford; the ~990-byte copy this used to do at 1 kHz is the same cost that starved the audio
 	// engine on v0.14.0.
-	if (streamActive && transferInitialised) {
+	if (kDiagnostics && streamActive && transferInitialised) {
 		// Measured across the write rather than timed, because what the chip cares about is which frame the write
 		// finished in, not how long it took - a fast write that lands after the SOF is as late as a slow one.
-		const uint32_t delta = (uint32_t)((readFrameNumber() - frameAtCompletion) & kFrameNumberMask);
+		const uint32_t delta = (uint32_t)((readFrameNumber() - lastCompletionFrame) & kFrameNumberMask);
 		statWriteFrameDelta[delta > 2u ? 2u : delta]++;
 
 		// Bounded rather than open: this runs inside the interrupt, and a loop whose length comes from the
@@ -742,17 +785,19 @@ void submit(const uint8_t* data, uint32_t bytes) {
 	transfer.keyword = USB_CFG_PAUDIO_ISO_IN;
 	transfer.tranlen = bytes;
 	transfer.p_tranadr = (void*)data;
-	statSubmits++;
+	bump(statSubmits);
 	const usb_er_t err = usb_pstd_transfer_start(&transfer);
-	statLastErr = (uint32_t)err;
-	// submit() returns with the packet already in a plane and BVAL set, so this reads whether a plane is left
-	// free rather than whether the write happened at all.
-	const FifoProbe probe = readFifoProbe();
-	if (fifoProbeIsOurs(probe)) {
-		statFrdyAfterSubmit[(probe.fifoctr & kFifoCtrFrdy) != 0u ? 1u : 0u]++;
-	}
-	else {
-		statProbeNotOurs++;
+	if constexpr (kDiagnostics) {
+		statLastErr = (uint32_t)err;
+		// submit() returns with the packet already in a plane and BVAL set, so this reads whether a plane is left
+		// free rather than whether the write happened at all.
+		const FifoProbe probe = readFifoProbe();
+		if (fifoProbeIsOurs(probe)) {
+			statFrdyAfterSubmit[(probe.fifoctr & kFifoCtrFrdy) != 0u ? 1u : 0u]++;
+		}
+		else {
+			statProbeNotOurs++;
+		}
 	}
 	// Always USB_OK in practice - every guard in that function is compiled out - so this records the
 	// code rather than relying on it. Kept as one call site so the flag cannot be set in two places.
@@ -768,6 +813,9 @@ void submit(const uint8_t* data, uint32_t bytes) {
 /// Channels 3 upwards carry diagnostics and nothing real, so this costs no audio. Channels 1 and 2 are
 /// untouched: the mix has to stay listenable for the recording to be worth anything else.
 void markDeviceSilence(uint8_t* buffer, uint32_t frames) {
+	if constexpr (!kDiagnostics) {
+		return;
+	}
 	int16_t* samples = (int16_t*)buffer;
 	for (uint32_t f = 0; f < frames; f++) {
 		samples[f * kChannels + 2] = 0;
@@ -779,6 +827,9 @@ void markDeviceSilence(uint8_t* buffer, uint32_t frames) {
 /// DIAGNOSTIC. Numbers the packet itself, at the moment it is built - not when it is written, so that a plane
 /// the hardware sends twice carries one number and appears twice.
 void stampPacketNumber(uint8_t* buffer, uint32_t frames) {
+	if constexpr (!kDiagnostics) {
+		return;
+	}
 	int16_t* samples = (int16_t*)buffer;
 	const int16_t number = encodeStamp(packetCounter++);
 	for (uint32_t f = 0; f < frames; f++) {
@@ -802,6 +853,9 @@ void prepareStandbyPacket() {
 /// the queue is empty, which by construction means the task is not running and the interrupt has nothing to
 /// compete with.
 void stampStandbyPacket() {
+	if constexpr (!kDiagnostics) {
+		return;
+	}
 	int16_t* samples = (int16_t*)((uint32_t)standbyPacket.data + UNCACHED_MIRROR_OFFSET);
 	const int16_t number = encodeStamp(packetCounter++);
 	const uint32_t frames = standbyBytes / kFrameBytes;
@@ -823,7 +877,7 @@ void stampStandbyPacket() {
 /// write - and the sizing, priming, resync and underrun rules must be identical for both. Duplicating them is
 /// how a rule enforced at two sites ends up enforced at one.
 uint32_t buildNextPacket(uint8_t* buffer) {
-	statBuilds++;
+	bump(statBuilds);
 	// Nominal packet size, used only while there is nothing real to send. 44.1 kHz does not divide into 1 ms
 	// frames, so 44 frames with a 45th every tenth packet averages exactly 44100 rather than drifting.
 	// Even sizes only, so the long-run average is held by adding a whole block every twentieth packet rather than
@@ -850,7 +904,7 @@ uint32_t buildNextPacket(uint8_t* buffer) {
 		// send; the trimmed builder would simply send its nominal size. Kept because the headroom costs
 		// nothing and the stream still wants a full window in hand before the first packet leaves.
 		if (available < kLeadFrames + kMaxFramesPerPacket) {
-			statPrimeSilence++;
+			bump(statPrimeSilence);
 			memset(buffer, 0, frames * kFrameBytes);
 			markDeviceSilence(buffer, frames);
 			stampPacketNumber(buffer, frames);
@@ -863,7 +917,7 @@ uint32_t buildNextPacket(uint8_t* buffer) {
 		// frames between here and the write pointer have not been sent, and the lead is what the stream carries
 		// rather than what it owes.
 		readFrame = writeFrame - kLeadFrames;
-		statReadAdvResync++;
+		bump(statReadAdvResync);
 		available = kLeadFrames;
 	}
 
@@ -872,21 +926,23 @@ uint32_t buildNextPacket(uint8_t* buffer) {
 	if (available >= kResyncFrames) {
 		// Signed, deliberately: the masked `available` above cannot tell "the ring holds 8191 frames" from "the
 		// reader is one frame past the writer". This can, and the two want opposite responses.
-		const int32_t signedLead = available32;
-		if (signedLead < 0) {
-			statResyncOvertaken++;
-			if (signedLead < statWorstOvertake) {
-				statWorstOvertake = signedLead;
+		if constexpr (kDiagnostics) {
+			const int32_t signedLead = available32;
+			if (signedLead < 0) {
+				statResyncOvertaken++;
+				if (signedLead < statWorstOvertake) {
+					statWorstOvertake = signedLead;
+				}
+			}
+			else {
+				statResyncGenuine++;
 			}
 		}
-		else {
-			statResyncGenuine++;
-		}
-		statFramesDiscarded += available - kLeadFrames;
+		bump(statFramesDiscarded, available - kLeadFrames);
 		readFrame = writeFrame - kLeadFrames;
-		statReadAdvResync++;
+		bump(statReadAdvResync);
 		available = kLeadFrames;
-		statResyncs++;
+		bump(statResyncs);
 	}
 
 	if (available < frames) {
@@ -903,7 +959,7 @@ uint32_t buildNextPacket(uint8_t* buffer) {
 		// once there are enough of them to fill one. A silent packet costs the ring nothing, and the engine
 		// refills it at 44.1 frames a millisecond, so this clears itself within a packet or two of the stall
 		// ending.
-		statUnderruns++;
+		bump(statUnderruns);
 		memset(buffer, 0, frames * kFrameBytes);
 		markDeviceSilence(buffer, frames);
 		stampPacketNumber(buffer, frames);
@@ -950,7 +1006,7 @@ uint32_t buildNextPacket(uint8_t* buffer) {
 		// fraction of what is left: the previous rule took an eighth here, which is a 4-frame packet, and a
 		// run of those is precisely what makes the host's reader overtake.
 		send = (frames > kFramesPerBlock) ? frames - kFramesPerBlock : kFramesPerBlock;
-		statLeadShort++;
+		bump(statLeadShort);
 	}
 	if (send > available) {
 		send = available;
@@ -973,12 +1029,14 @@ uint32_t buildNextPacket(uint8_t* buffer) {
 		memcpy(&buffer[firstRun * kFrameBytes], &ring[0], (send - firstRun) * kFrameBytes);
 	}
 	readFrame = readFrame + send;
-	statReadAdvBuild++;
+	bump(statReadAdvBuild);
 
-	statPacketsSent++;
-	statFramesSent += send;
-	// DIAGNOSTIC. Bins of eight, so bin 7 is 56-63 frames - a packet at the endpoint's ceiling.
-	statSizeHist[(send >> 3u) < kSizeBins ? (send >> 3u) : (kSizeBins - 1u)]++;
+	bump(statPacketsSent);
+	bump(statFramesSent, send);
+	if constexpr (kDiagnostics) {
+		// Bins of eight, so bin 7 is 56-63 frames - a packet at the endpoint's ceiling.
+		statSizeHist[(send >> 3u) < kSizeBins ? (send >> 3u) : (kSizeBins - 1u)]++;
+	}
 
 	stampPacketNumber(buffer, send);
 
@@ -1012,14 +1070,14 @@ void endAbandonedTransfer() {
 		stuckPasses = 0;
 		return;
 	}
-	statAbandonedSeen++;
+	bump(statAbandonedSeen);
 
 	if (++stuckPasses < 2) {
 		return;
 	}
 	stuckPasses = 0;
 
-	statAbandonedEnded++;
+	bump(statAbandonedEnded);
 	// Through the driver's own path rather than by clearing our flag: that releases g_p_usb_pipe too, and
 	// submitting over a pipe the driver still believes is busy is what froze the machine on 2026-08-22.
 	usb_pstd_forced_termination(USB_CFG_PAUDIO_ISO_IN, kUsbDataStop);
@@ -1658,28 +1716,31 @@ void retireAudioDma() {
 	DMACn(kAudioDmaChannel).CHCTRL_n = kDmaChctrlClearEnd | kDmaChctrlClearTc;
 	usb_regadr_t reg = usb_hstd_get_usb_ip_adr(USB_CFG_USE_USBIP);
 	reg->D0FIFOCTR |= USB_BVAL;
-	// DIAGNOSTIC. Read after the commit, so the span covers everything that stands between the plane being free
-	// and the packet being released - the transfer and the interrupt that retires it.
-	const uint32_t span = Debug::readCycleCounter() - statDmaArmCycles;
-	statDmaSpanSum += span;
-	if (span > statDmaSpanMax) {
-		statDmaSpanMax = span;
+	if constexpr (kDiagnostics) {
+		// Read after the commit, so the span covers everything that stands between the plane being free and the
+		// packet being released - the transfer and the interrupt that retires it.
+		const uint32_t span = Debug::readCycleCounter() - statDmaArmCycles;
+		statDmaSpanSum += span;
+		if (span > statDmaSpanMax) {
+			statDmaSpanMax = span;
+		}
+		const uint32_t frames =
+		    (uint32_t)((uint16_t)(reg->FRMNUM & kFrameNumberMask) - statDmaArmFrame) & kFrameNumberMask;
+		statDmaFrameSpan[frames > 2u ? 2u : frames]++;
 	}
-	const uint32_t frames = (uint32_t)((uint16_t)(reg->FRMNUM & kFrameNumberMask) - statDmaArmFrame) & kFrameNumberMask;
-	statDmaFrameSpan[frames > 2u ? 2u : frames]++;
 	if (audioDmaStandby) {
 		audioDmaStandby = false;
 	}
 	else {
 		queueRead++;
 	}
-	statTimerWrote++;
-	statDmaCompleted++;
+	bump(statTimerWrote);
+	bump(statDmaCompleted);
 	audioDmaBusy = false;
 }
 
 extern "C" void audioDmaTransferComplete(uint32_t /*intSense*/) {
-	const uint32_t start = Debug::readCycleCounter();
+	const uint32_t start = costStart();
 	retireAudioDma();
 	addCost(costDmaComplete, start);
 }
@@ -1713,12 +1774,12 @@ bool parkAudioDmaPort() {
 
 /// Hands one packet to the DMA controller. Returns without arming if the channel is still working on the last one.
 bool startAudioDma(const uint8_t* source, uint16_t bytes) {
-	const uint32_t start = Debug::readCycleCounter();
+	const uint32_t start = costStart();
 	// EN or TACT still set means the previous transfer has not retired. Skipped rather than waited on: the next
 	// timer fire is 400 us away and spinning here would hold the interrupt open for exactly the reason this
 	// change exists.
 	if ((DMACn(kAudioDmaChannel).CHSTAT_n & 0x05u) != 0u) {
-		statDmaBusySkips++;
+		bump(statDmaBusySkips);
 		return false;
 	}
 	// The ordinary, cached address of the packet: whoever filled it wrote through the uncached mirror, so what
@@ -1732,11 +1793,13 @@ bool startAudioDma(const uint8_t* source, uint16_t bytes) {
 	DMACn(kAudioDmaChannel).CHITVL_n = 0u;
 	setDMARS(kAudioDmaChannel, kAudioDmaRequest);
 	DMACn(kAudioDmaChannel).CHCTRL_n = kDmaChctrlSwReset;
-	statDmaArmFrame = (uint16_t)(usb_hstd_get_usb_ip_adr(USB_CFG_USE_USBIP)->FRMNUM & kFrameNumberMask);
-	statDmaArmCycles = Debug::readCycleCounter();
+	if constexpr (kDiagnostics) {
+		statDmaArmFrame = (uint16_t)(usb_hstd_get_usb_ip_adr(USB_CFG_USE_USBIP)->FRMNUM & kFrameNumberMask);
+		statDmaArmCycles = Debug::readCycleCounter();
+	}
 	audioDmaBusy = true;
 	DMACn(kAudioDmaChannel).CHCTRL_n = kDmaChctrlSetEnable;
-	statDmaStarted++;
+	bump(statDmaStarted);
 	addCost(costDmaStart, start);
 	return true;
 }
@@ -1748,7 +1811,7 @@ bool startAudioDma(const uint8_t* source, uint16_t bytes) {
 /// DMA controller took the copy over, all this does is check whether a buffer plane is free and arm a transfer.
 void audioWriteTimerBody() {
 	timerClearCompareMatchTGRA(kAudioWriteTimer);
-	statTimerFires++;
+	bump(statTimerFires);
 
 	if (!streamActive || !transferInitialised) {
 		return;
@@ -1760,7 +1823,7 @@ void audioWriteTimerBody() {
 	}
 	const bool queueEmpty = (queueWrite == queueRead);
 	if (queueEmpty) {
-		statTimerEmpty++;
+		bump(statTimerEmpty);
 		if (!standbyReady) {
 			return;
 		}
@@ -1776,11 +1839,11 @@ void audioWriteTimerBody() {
 		// costDmaComplete counts only the interrupt's retires, so dcp near zero against dma completes near a
 		// thousand says the interrupt never fires at all.
 		if ((DMACn(kAudioDmaChannel).CHSTAT_n & 0x05u) != 0u) {
-			statDmaBusySkips++;
+			bump(statDmaBusySkips);
 			return;
 		}
 		retireAudioDma();
-		statDmaLateRetires++;
+		bump(statDmaLateRetires);
 	}
 
 	// The audio pipe now has D0FIFO to itself - MIDI is on the CPU port - so this reads the plane's readiness
@@ -1789,11 +1852,11 @@ void audioWriteTimerBody() {
 	// 60.7 us copy.
 	usb_regadr_t reg = usb_hstd_get_usb_ip_adr(USB_CFG_USE_USBIP);
 	if ((reg->D0FIFOCTR & USB_FRDY) == 0u) {
-		statFrdyNever++;
-		statTimerShut++;
+		bump(statFrdyNever);
+		bump(statTimerShut);
 		return;
 	}
-	statFrdyImmediate++;
+	bump(statFrdyImmediate);
 
 	if (queueEmpty) {
 		// The builder is frozen - a card load, or the audio task starved. Keep the endpoint answering with
@@ -1802,16 +1865,16 @@ void audioWriteTimerBody() {
 		audioDmaStandby = true;
 		if (!startAudioDma(standbyPacket.data, standbyBytes)) {
 			audioDmaStandby = false;
-			statTimerShut++;
+			bump(statTimerShut);
 			return;
 		}
-		statStandbySent++;
+		bump(statStandbySent);
 		return;
 	}
 
 	const uint32_t slot = queueRead % kQueueSlots;
 	if (!startAudioDma(packetQueue[slot].data, packetQueueBytes[slot])) {
-		statTimerShut++;
+		bump(statTimerShut);
 		return;
 	}
 	// queueRead is advanced by the completion handler, not here: the controller is still reading this slot and
@@ -1825,14 +1888,14 @@ void audioWriteTimerBody() {
 /// branches that do work being the only ones counted. A fire that finds nothing to do still costs an interrupt
 /// entry and exit, and whether that is the expense is the question this build exists to answer.
 void audioWriteTimerInterrupt(uint32_t /*intSense*/) {
-	const uint32_t start = Debug::readCycleCounter();
+	const uint32_t start = costStart();
 	audioWriteTimerBody();
 	addCost(costTimer, start);
 }
 
 /// Fills the queue from the task, where the copy is affordable.
 void buildQueuedPackets() {
-	const uint32_t start = Debug::readCycleCounter();
+	const uint32_t start = costStart();
 	while ((uint32_t)(queueWrite - queueRead) < kQueueSlots) {
 		const uint32_t slot = queueWrite % kQueueSlots;
 		// Built straight into the uncached view of the slot, so the bytes are in memory the instant they are
@@ -1843,7 +1906,7 @@ void buildQueuedPackets() {
 		// The slot's contents must be visible before the index that publishes it.
 		__asm volatile("DSB" ::: "memory");
 		queueWrite++;
-		statQueueBuilt++;
+		bump(statQueueBuilt);
 	}
 	// Counted once per call rather than once per packet built, so the mean below is the cost of a whole refill -
 	// which is what the audio task actually waits for.
@@ -1857,7 +1920,7 @@ void buildQueuedPackets() {
 /// packets now and the timer only pushes bytes already in memory, so the expensive half of that is gone and the
 /// cheap half happens 750 us from here rather than at the boundary, where the plane is reliably shut.
 extern "C" void usbAudioStreamStartOfFrame(void) {
-	statSofSeen++;
+	bump(statSofSeen);
 	if (!audioTimerRunning) {
 		return;
 	}
@@ -1906,8 +1969,10 @@ void stopAudioWriteTimer() {
 namespace deluge::processing::engines {
 
 void USBAudioStream::routine() {
-	drainSetupTrace();
-	reportStats();
+	if constexpr (kDiagnostics) {
+		drainSetupTrace();
+		reportStats();
+	}
 	service();
 }
 
@@ -1920,14 +1985,16 @@ void USBAudioStream::routine() {
 static void serviceBody() {
 	if (!ringCleared) {
 		memset(ring, 0, sizeof(ring));
-		// DIAGNOSTIC. Channels 3 upwards get a distinct constant, written here and never touched by the
-		// render path, so one recording separates three cases that silence cannot: transport dead
-		// (everything zero), transport alive but capture broken (these present, mix channels zero), and
-		// working (both). The differing value per channel proves the channel mapping at the same time.
-		// Remove once real audio is confirmed - it permanently occupies those channels.
-		for (uint32_t f = 0; f < kRingFrames; f++) {
-			for (uint32_t c = 2; c < kChannels; c++) {
-				ring[f * kChannels + c] = (int16_t)((c + 1u) * 2000u);
+		if constexpr (kDiagnostics) {
+			// Channels 3 upwards get a distinct constant, written here and never touched by the render path, so
+			// one recording separates three cases that silence cannot: transport dead (everything zero),
+			// transport alive but capture broken (these present, mix channels zero), and working (both). The
+			// differing value per channel proves the channel mapping at the same time. It permanently occupies
+			// those channels, which is why per-track routing needs the instruments off.
+			for (uint32_t f = 0; f < kRingFrames; f++) {
+				for (uint32_t c = 2; c < kChannels; c++) {
+					ring[f * kChannels + c] = (int16_t)((c + 1u) * 2000u);
+				}
 			}
 		}
 		ringCleared = true;
@@ -1944,7 +2011,7 @@ static void serviceBody() {
 		pipeConfigRead = false;
 		lastCompletionFrameValid = false;
 		readFrame = writeFrame;
-		statReadAdvPark++;
+		bump(statReadAdvPark);
 		queueRead = queueWrite;
 		firstPacketSubmitted = false;
 		// Stop the channel and drop the request line with it: a stream that ends between arming and completion
@@ -1963,7 +2030,7 @@ static void serviceBody() {
 		return;
 	}
 	streamActive = true;
-	statAlt1++;
+	bump(statAlt1);
 
 	// Unconditionally, before any branch. This used to live inside the in-flight branch alone, which gave the
 	// task a state it could never leave: once a transfer ended without a new one starting, every pass took the
@@ -1974,15 +2041,17 @@ static void serviceBody() {
 	buildQueuedPackets();
 
 	if (transferInFlight) {
-		statInFlight++;
-		// Sampled here rather than at the top of the routine: a transfer is outstanding, which is the only
-		// condition under which "is a plane writable" is the question being asked.
-		const uint16_t ctr = readPipeCtr();
-		statReadyState[(((ctr & kPipeCtrBsts) != 0u) ? 2u : 0u) | (((ctr & kPipeCtrInBufM) != 0u) ? 1u : 0u)]++;
-		// Data pending and a plane writable: the second plane can be loaded now, and this is the only moment it
-		// can be. Anything else is either nothing to double up on or a port that would refuse the write.
-		if ((ctr & (kPipeCtrBsts | kPipeCtrInBufM)) != (kPipeCtrBsts | kPipeCtrInBufM)) {
-			statExtraNoWindow++;
+		bump(statInFlight);
+		if constexpr (kDiagnostics) {
+			// Sampled here rather than at the top of the routine: a transfer is outstanding, which is the only
+			// condition under which "is a plane writable" is the question being asked.
+			const uint16_t ctr = readPipeCtr();
+			statReadyState[(((ctr & kPipeCtrBsts) != 0u) ? 2u : 0u) | (((ctr & kPipeCtrInBufM) != 0u) ? 1u : 0u)]++;
+			// Data pending and a plane writable: the second plane can be loaded now, and this is the only moment
+			// it can be. Anything else is either nothing to double up on or a port that would refuse the write.
+			if ((ctr & (kPipeCtrBsts | kPipeCtrInBufM)) != (kPipeCtrBsts | kPipeCtrInBufM)) {
+				statExtraNoWindow++;
+			}
 		}
 		endAbandonedTransfer();
 		return;
@@ -2010,14 +2079,14 @@ static void serviceBody() {
 	// Interrupts off across the driver's own FIFO write, which is also what keeps the timer out of it: the two
 	// share a FIFO port, and two writers there truncate a packet into a part-frame that rotates the host's
 	// channel mapping permanently.
-	const uint32_t submitStart = Debug::readCycleCounter();
+	const uint32_t submitStart = costStart();
 	DISABLE_ALL_INTERRUPTS();
 	// The port is handed over rather than shared, and the write is abandoned if a transfer will not retire.
 	// Skipping one re-arm costs a packet; writing a pipe selected on two ports is what rotates the host's
 	// channel mapping permanently.
 	if (audioDmaConfigured && !parkAudioDmaPort()) {
 		ENABLE_ALL_INTERRUPTS();
-		statSubmitSkipped++;
+		bump(statSubmitSkipped);
 		addCost(costSubmit, submitStart);
 		return;
 	}
@@ -2048,26 +2117,27 @@ static void serviceBody() {
 
 void USBAudioStream::service() {
 	// The cycle counter is off in a release build - Debug::init() is only reached under a trace flag - so an
-	// uninitialised counter reads a constant and every figure here would be a silent zero. Enabled once, here,
-	// before anything is timed.
+	// uninitialised counter reads a constant. Enabled once, here, and unconditionally: parkAudioDmaPort spins on
+	// a real 10 us deadline read from this counter with interrupts masked, so a stopped counter would hang the
+	// machine there rather than merely zeroing a figure. It costs one register write per boot.
 	if (!costCounterEnabled) {
 		Debug::init();
 		costCounterEnabled = true;
 		costIntervalStart = Debug::readCycleCounter();
 	}
-	const uint32_t start = Debug::readCycleCounter();
+	const uint32_t start = costStart();
 	serviceBody();
 	addCost(costService, start);
 }
 
 void USBAudioStream::feedMix(const StereoSample* mix, uint32_t numSamples) {
-	// DIAGNOSTIC. Taken before the early return, not after: what an installed-but-idle build costs is one of the
-	// things being separated, and a timer that starts after the guard can never see it.
-	const uint32_t costStart = Debug::readCycleCounter();
+	// Taken before the early return, not after: what an installed-but-idle build costs is one of the things being
+	// separated, and a timer that starts after the guard can never see it.
+	const uint32_t feedStart = costStart();
 	// Nothing is listening, so do not pay for the conversion. While stopped the consumer parks the read pointer
 	// on the write pointer every pass, so the ring cannot look full to the first host that arrives.
 	if (!streamActive || numSamples == 0 || mix == nullptr) {
-		addCost(costFeedMix, costStart);
+		addCost(costFeedMix, feedStart);
 		return;
 	}
 
@@ -2076,7 +2146,7 @@ void USBAudioStream::feedMix(const StereoSample* mix, uint32_t numSamples) {
 	// advanced only after its own data is in place, which is the ordinary single-producer/single-consumer ring.
 	// Both sides run on the same core, so there is no cache to reconcile - only the compiler, which volatile holds.
 
-	statFramesIn += numSamples;
+	bump(statFramesIn, numSamples);
 
 	uint32_t w = writeFrame;
 	for (uint32_t i = 0; i < numSamples; i++) {
@@ -2084,22 +2154,24 @@ void USBAudioStream::feedMix(const StereoSample* mix, uint32_t numSamples) {
 		// The samples handed here are already at output scale, so this is only a width reduction.
 		frame[0] = (int16_t)(mix[i].l >> 16);
 		frame[1] = (int16_t)(mix[i].r >> 16);
-		// DIAGNOSTIC. The producer's own frame count, travelling with the audio it belongs to. Whatever reaches
-		// the host carries the number of the frame the engine rendered, so the recording alone says which frames
-		// were delivered and which were dropped on the way. Remove with the rest of the diagnostics.
-		const uint32_t block = w >> kStampBlockShift;
-		if (block != stampBlock) {
-			stampBlock = block;
-			stampLow = encodeStamp(block);
-			stampHigh = encodeStamp(block >> kStampBits);
+		if constexpr (kDiagnostics) {
+			// The producer's own frame count, travelling with the audio it belongs to. Whatever reaches the host
+			// carries the number of the frame the engine rendered, so the recording alone says which frames were
+			// delivered and which were dropped on the way. It is what delivery.py and seams.py decode.
+			const uint32_t block = w >> kStampBlockShift;
+			if (block != stampBlock) {
+				stampBlock = block;
+				stampLow = encodeStamp(block);
+				stampHigh = encodeStamp(block >> kStampBits);
+			}
+			frame[2] = stampLow;
+			frame[3] = stampHigh;
+			frame[4] = kMarkRendered;
 		}
-		frame[2] = stampLow;
-		frame[3] = stampHigh;
-		frame[4] = kMarkRendered;
 		w++;
 	}
 	writeFrame = w;
-	addCost(costFeedMix, costStart);
+	addCost(costFeedMix, feedStart);
 }
 
 } // namespace deluge::processing::engines
