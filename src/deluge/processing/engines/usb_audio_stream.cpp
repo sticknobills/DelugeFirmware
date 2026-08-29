@@ -365,6 +365,20 @@ uint32_t statDmaCompleted = 0;
 uint32_t statDmaBusySkips = 0;
 uint32_t statDmaLateRetires = 0;
 
+/// DIAGNOSTIC. How long a packet spends between being handed to the controller and being committed, and - the
+/// question that matters - whether it is still committed inside the host frame it was armed in.
+///
+/// The CPU copy set the buffer-valid flag the instant it finished, inside one interrupt. The controller's
+/// transfer and its completion interrupt are two separate delays after the arm, and a packet committed after the
+/// host has already asked for it waits a whole frame. Interruptions doubled on the change, 2.1/s to 4.3-5.2/s,
+/// with the device failing to deliver 201 blocks against 11 - so the delay is the first suspect and this is the
+/// measurement that convicts or clears it.
+uint32_t statDmaArmCycles = 0;     ///< cycle counter at the arm, for the span below
+uint16_t statDmaArmFrame = 0;      ///< host frame number at the arm
+uint32_t statDmaSpanSum = 0;       ///< summed arm-to-commit cycles
+uint32_t statDmaSpanMax = 0;       ///< worst arm-to-commit, cycles
+uint32_t statDmaFrameSpan[3] = {}; ///< committed in the same host frame, one later, two or more later
+
 /// Cycle count at the last report, so every figure above is divided by a clock rather than by an assumed second.
 /// The report fires every 1000 task passes and the task rate breathes, which has manufactured a phantom result
 /// here before.
@@ -1211,6 +1225,18 @@ void reportStats() {
 	emitDec(statDmaBusySkips);
 	emit(" dlr:");
 	emitDec(statDmaLateRetires);
+	// Mean and worst arm-to-commit in microseconds, then how many of those commits landed in the host frame they
+	// were armed in, one frame later, and two or more later. A packet committed late waits for the next token.
+	emit(" dus:");
+	emitDec(statDmaCompleted ? (statDmaSpanSum / statDmaCompleted / 400u) : 0u);
+	emit("/");
+	emitDec(statDmaSpanMax / 400u);
+	emit(" dfs:");
+	emitDec(statDmaFrameSpan[0]);
+	emit(",");
+	emitDec(statDmaFrameSpan[1]);
+	emit(",");
+	emitDec(statDmaFrameSpan[2]);
 	*p = '\0';
 	Debug::sysexDebugPrint(*Debug::midiDebugCable, planeLine, true);
 
@@ -1428,6 +1454,11 @@ void reportStats() {
 	statDmaCompleted = 0;
 	statDmaBusySkips = 0;
 	statDmaLateRetires = 0;
+	statDmaSpanSum = 0;
+	statDmaSpanMax = 0;
+	for (uint32_t i = 0; i < 3; i++) {
+		statDmaFrameSpan[i] = 0;
+	}
 	// usbBempBitsSeen is deliberately not cleared: which pipes are live at all is the question, not how often.
 }
 
@@ -1494,6 +1525,15 @@ void retireAudioDma() {
 	DMACn(kAudioDmaChannel).CHCTRL_n = kDmaChctrlClearEnd | kDmaChctrlClearTc;
 	usb_regadr_t reg = usb_hstd_get_usb_ip_adr(USB_CFG_USE_USBIP);
 	reg->D0FIFOCTR |= USB_BVAL;
+	// DIAGNOSTIC. Read after the commit, so the span covers everything that stands between the plane being free
+	// and the packet being released - the transfer and the interrupt that retires it.
+	const uint32_t span = Debug::readCycleCounter() - statDmaArmCycles;
+	statDmaSpanSum += span;
+	if (span > statDmaSpanMax) {
+		statDmaSpanMax = span;
+	}
+	const uint32_t frames = (uint32_t)((uint16_t)(reg->FRMNUM & kFrameNumberMask) - statDmaArmFrame) & kFrameNumberMask;
+	statDmaFrameSpan[frames > 2u ? 2u : frames]++;
 	queueRead++;
 	statTimerWrote++;
 	statDmaCompleted++;
@@ -1552,6 +1592,8 @@ bool startAudioDma(uint32_t slot, uint16_t bytes) {
 	DMACn(kAudioDmaChannel).CHITVL_n = 0u;
 	setDMARS(kAudioDmaChannel, kAudioDmaRequest);
 	DMACn(kAudioDmaChannel).CHCTRL_n = kDmaChctrlSwReset;
+	statDmaArmFrame = (uint16_t)(usb_hstd_get_usb_ip_adr(USB_CFG_USE_USBIP)->FRMNUM & kFrameNumberMask);
+	statDmaArmCycles = Debug::readCycleCounter();
 	audioDmaBusy = true;
 	DMACn(kAudioDmaChannel).CHCTRL_n = kDmaChctrlSetEnable;
 	statDmaStarted++;
