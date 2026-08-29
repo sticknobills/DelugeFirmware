@@ -78,7 +78,16 @@ namespace {
 ///
 /// A constant rather than a preprocessor flag so both halves stay compiled and cannot rot apart. Everything it
 /// guards is discarded by the optimiser, so an off build pays nothing for carrying it.
-constexpr bool kDiagnostics = false;
+constexpr bool kDiagnostics = true;
+
+/// Whether the stamps ride in the audio channels.
+///
+/// Separate from kDiagnostics because the two make different claims on the machine. The instruments cost CPU and
+/// nothing else; these cost *channels* - 3 upwards cannot carry a stamp and a track at once. A build measuring
+/// what routing costs needs the instruments on and the stamps off, which one flag could not express. Implies
+/// kDiagnostics: the encoder and the marks are compiled with the rest of the instruments.
+constexpr bool kAudioStamps = false;
+static_assert(!kAudioStamps || kDiagnostics, "The stamps are part of the instruments and need them compiled in");
 
 /// Must match the AudioStreaming interface's number in r_usb_pmidi_descriptor.c.
 constexpr uint16_t kAudioInterfaceNumber = 2;
@@ -125,11 +134,11 @@ static_assert(kMaxFramesPerPacket > kFramesPerPacket,
 /// The diagnostics write channels 3-6 by fixed offset into the audio frame, so a smaller frame would put the
 /// producer stamp and the packet number outside it. Fails the build rather than corrupting the frame quietly.
 /// Only binding while they are compiled in - a shipping build is free to be narrower than six channels.
-static_assert(!kDiagnostics || kChannels >= 6, "Channels 3-6 carry the producer stamp, the mark and the packet number");
+static_assert(!kAudioStamps || kChannels >= 6, "Channels 3-6 carry the producer stamp, the mark and the packet number");
 
 /// The stems fill the frame. With the instruments on they are not written at all - channels 3-6 carry stamps
 /// instead, and 1-2 carry the main mix, which is the pair every measurement to date was taken on.
-static_assert(kDiagnostics || kChannels >= deluge::processing::engines::USBAudioStream::kStemChannels,
+static_assert(kAudioStamps || kChannels >= deluge::processing::engines::USBAudioStream::kStemChannels,
               "Every channel carries one mono track");
 
 static_assert(kMaxPacketBytes <= USB_CFG_PAUDIO_BUF_BYTES,
@@ -449,6 +458,17 @@ PathCost costSubmit = {};      ///< the driver's own submit path, nested inside 
 PathCost costFeedMix = {};     ///< the producer writing the SDRAM ring, inside the audio routine
 PathCost costDmaStart = {};    ///< arming the DMA controller, which is what replaces the copy
 PathCost costDmaComplete = {}; ///< committing the packet once the controller has moved it
+
+/// The per-track routing path, which is the reason this instrument was extended.
+///
+/// These three are top-level: they run inside the audio engine's render, not inside service() or feedMix(), so
+/// they are added to the wall-time total rather than nested in one of the others. The two are split because a
+/// path that is expensive per call and a path that is merely called often want opposite fixes - the snapshot is
+/// one copy per routed track per window, the capture is a walk of the same length, and if they do not come back
+/// roughly equal then one of them is not doing what its shape says.
+PathCost costStemSnapshot = {}; ///< copying the mix aside before a routed track renders
+PathCost costStemCapture = {};  ///< walking the window again to recover that track alone
+PathCost costStemClear = {};    ///< zeroing the accumulators once per render window
 
 /// DMA transmit state. audioDmaBusy is set by the timer that arms a transfer and cleared by the interrupt that
 /// retires it, so it is the only thing standing between the builder and a slot still being read.
@@ -843,7 +863,7 @@ void submit(const uint8_t* data, uint32_t bytes) {
 /// Channels 3 upwards carry diagnostics and nothing real, so this costs no audio. Channels 1 and 2 are
 /// untouched: the mix has to stay listenable for the recording to be worth anything else.
 void markDeviceSilence(uint8_t* buffer, uint32_t frames) {
-	if constexpr (!kDiagnostics) {
+	if constexpr (!kAudioStamps) {
 		return;
 	}
 	int16_t* samples = (int16_t*)buffer;
@@ -857,7 +877,7 @@ void markDeviceSilence(uint8_t* buffer, uint32_t frames) {
 /// DIAGNOSTIC. Numbers the packet itself, at the moment it is built - not when it is written, so that a plane
 /// the hardware sends twice carries one number and appears twice.
 void stampPacketNumber(uint8_t* buffer, uint32_t frames) {
-	if constexpr (!kDiagnostics) {
+	if constexpr (!kAudioStamps) {
 		return;
 	}
 	int16_t* samples = (int16_t*)buffer;
@@ -883,7 +903,7 @@ void prepareStandbyPacket() {
 /// the queue is empty, which by construction means the task is not running and the interrupt has nothing to
 /// compete with.
 void stampStandbyPacket() {
-	if constexpr (!kDiagnostics) {
+	if constexpr (!kAudioStamps) {
 		return;
 	}
 	int16_t* samples = (int16_t*)((uint32_t)standbyPacket.data + UNCACHED_MIRROR_OFFSET);
@@ -1545,7 +1565,11 @@ void reportStats() {
 	// numbers separated by commas is 6 x 38 = 228. 244 worst case, and the two refusal lines are shorter than
 	// either.
 	{
-		char costLine[256];
+		// Eleven fields of <tag>:<permille>,<calls>,<mean>. Worst case a tag is 7 characters, permille 4 digits,
+		// calls and mean 10 each, plus two commas: 33. Eleven of those is 363, and the header "AUX el" with a
+		// ten-digit interval is 16 more. 448 leaves room for two further fields. Nothing below bounds-checks, and
+		// a debug line that outgrew its buffer froze this machine once already - so this is counted, not claimed.
+		char costLine[448];
 		p = costLine;
 		// A counter that was never enabled reads a constant, and a constant produces a confident zero on every
 		// field below rather than an error. Two reads that come back equal mean the instrument is dead, and it
@@ -1554,8 +1578,9 @@ void reportStats() {
 		const uint32_t live1 = Debug::readCycleCounter();
 		const uint32_t elapsed = live1 - costIntervalStart;
 		// Nested paths deliberately excluded: fifoWrite is inside timer, build and submit are inside service.
-		const uint64_t topLevel =
-		    (uint64_t)costTimer.cycles + (uint64_t)costService.cycles + (uint64_t)costFeedMix.cycles;
+		const uint64_t topLevel = (uint64_t)costTimer.cycles + (uint64_t)costService.cycles
+		                          + (uint64_t)costFeedMix.cycles + (uint64_t)costStemSnapshot.cycles
+		                          + (uint64_t)costStemCapture.cycles + (uint64_t)costStemClear.cycles;
 		if (live1 == live0) {
 			emit("AUX dead");
 		}
@@ -1590,6 +1615,9 @@ void reportStats() {
 			emitCost(" mix:", costFeedMix);
 			emitCost(" dst:", costDmaStart);
 			emitCost(" dcp:", costDmaComplete);
+			emitCost(" snap:", costStemSnapshot);
+			emitCost(" cap:", costStemCapture);
+			emitCost(" clr:", costStemClear);
 		}
 		*p = '\0';
 		Debug::sysexDebugPrint(*Debug::midiDebugCable, costLine, true);
@@ -1602,6 +1630,9 @@ void reportStats() {
 		costFeedMix = PathCost{};
 		costDmaStart = PathCost{};
 		costDmaComplete = PathCost{};
+		costStemSnapshot = PathCost{};
+		costStemCapture = PathCost{};
+		costStemClear = PathCost{};
 	}
 
 	statPacketsSent = 0;
@@ -2070,7 +2101,7 @@ void USBAudioStream::routine() {
 static void serviceBody() {
 	if (!ringCleared) {
 		memset(ring, 0, sizeof(ring));
-		if constexpr (kDiagnostics) {
+		if constexpr (kAudioStamps) {
 			// Channels 3 upwards get a distinct constant, written here and never touched by the render path, so
 			// one recording separates three cases that silence cannot: transport dead (everything zero),
 			// transport alive but capture broken (these present, mix channels zero), and working (both). The
@@ -2226,23 +2257,28 @@ void USBAudioStream::beginRender(uint32_t numSamples) {
 		stemWindowSamples = 0;
 		return;
 	}
+	const uint32_t start = costStart();
 	stemWindowSamples = (numSamples > kStemWindowSamples) ? kStemWindowSamples : numSamples;
 	for (uint32_t c = 0; c < kStemChannels; c++) {
 		memset(stemAccumulator[c], 0, stemWindowSamples * sizeof(int32_t));
 	}
+	addCost(costStemClear, start);
 }
 
 void USBAudioStream::snapshotBeforeTrack(const int32_t* mixNow, uint32_t numSamples) {
 	if (numSamples > stemWindowSamples) {
 		return;
 	}
+	const uint32_t start = costStart();
 	memcpy(stemSnapshot, mixNow, numSamples * 2 * sizeof(int32_t));
+	addCost(costStemSnapshot, start);
 }
 
 void USBAudioStream::captureStem(uint32_t channel, const int32_t* mixNow, uint32_t numSamples) {
 	if (channel >= kStemChannels || numSamples > stemWindowSamples) {
 		return;
 	}
+	const uint32_t costCaptureStart = costStart();
 	const int32_t* const snapshot = stemSnapshot;
 	int32_t* const out = stemAccumulator[channel];
 	int32_t peak = stemPeak[channel];
@@ -2261,6 +2297,7 @@ void USBAudioStream::captureStem(uint32_t channel, const int32_t* mixNow, uint32
 		}
 	}
 	stemPeak[channel] = peak;
+	addCost(costStemCapture, costCaptureStart);
 }
 
 void USBAudioStream::noteStemTrack(uint32_t channel, const char* name) {
@@ -2302,7 +2339,7 @@ void USBAudioStream::feedMix(const StereoSample* mix, uint32_t numSamples, uint3
 		// The samples handed here are already at output scale, so this is only a width reduction.
 		frame[0] = (int16_t)(mix[i].l >> 16);
 		frame[1] = (int16_t)(mix[i].r >> 16);
-		if constexpr (!kDiagnostics) {
+		if constexpr (!kAudioStamps) {
 			// One mono track a channel, across the whole frame, at the scale the mix would have reached the host
 			// on. The mix written just above is overwritten by channels 1 and 2 of this - it stays in the code
 			// because the instruments below need it and because a mix source is what an assignment interface will
@@ -2325,7 +2362,7 @@ void USBAudioStream::feedMix(const StereoSample* mix, uint32_t numSamples, uint3
 				}
 			}
 		}
-		if constexpr (kDiagnostics) {
+		if constexpr (kAudioStamps) {
 			// The producer's own frame count, travelling with the audio it belongs to. Whatever reaches the host
 			// carries the number of the frame the engine rendered, so the recording alone says which frames were
 			// delivered and which were dropped on the way. It is what delivery.py and seams.py decode.
