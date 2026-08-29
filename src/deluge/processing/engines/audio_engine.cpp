@@ -523,10 +523,12 @@ inline void setDireness(size_t numSamples) { // Consider direness and culling - 
 	const size_t windowSamples = numSamples;
 	// number of samples it took to do the last render
 	const int32_t dspTimeRaw = (int32_t)(getAverageRunTimeForTask(routine_task_id) * 44100.);
-	// Shared across the renders in one call, so one render's share is the call's time divided by how many it makes.
-	// Without this the first render of every call is charged for the whole call, which is what let the USB stream
-	// inflate direness by a third while costing five points of processor.
-	auto dspTime = (int32_t)(((int64_t)dspTimeRaw * 100) / (int32_t)rendersPerCallX100);
+	// REVERTED 2026-08-30, on hardware, within the session that tried it. Dividing by renders-per-call is
+	// arithmetically right and behaviourally wrong: the culling threshold below was tuned against the inflated
+	// figure, so correcting the input without re-tuning the threshold removes the protection. The dense reference
+	// song held 17-19 voices instead of culling to ~13, ran the engine to 94% of the processor, and crackled
+	// audibly. The inflation is real - see dspr and rpc on the report line - but it cannot be fixed here alone.
+	auto dspTime = dspTimeRaw;
 	size_t nonDSP = numSamples - dspTime;
 	// we don't care about the number that were rendered in the last go, only the ones taken by the first routine call
 	numSamples = std::max<int32_t>(dspTime - (int32_t)(numRoutines * numSamples), 0);
