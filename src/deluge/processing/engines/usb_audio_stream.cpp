@@ -470,6 +470,14 @@ PathCost costStemSnapshot = {}; ///< copying the mix aside before a routed track
 PathCost costStemCapture = {};  ///< walking the window again to recover that track alone
 PathCost costStemClear = {};    ///< zeroing the accumulators once per render window
 
+/// The audio task as a whole, and the per-output render loop inside it, in processor cycles.
+///
+/// The scheduler's own figure for this same task is a wall-clock duration, so it counts every interrupt that
+/// lands mid-task as if the task had spent the time. These do not. If the two agree the routing cost is real and
+/// hiding somewhere the per-path timers do not cover; if they diverge, the task is being interrupted, not slowed.
+PathCost costEngine = {};
+PathCost costOutputs = {};
+
 /// DMA transmit state. audioDmaBusy is set by the timer that arms a transfer and cleared by the interrupt that
 /// retires it, so it is the only thing standing between the builder and a slot still being read.
 bool audioDmaConfigured = false;
@@ -1618,6 +1626,8 @@ void reportStats() {
 			emitCost(" snap:", costStemSnapshot);
 			emitCost(" cap:", costStemCapture);
 			emitCost(" clr:", costStemClear);
+			emitCost(" eng:", costEngine);
+			emitCost(" outs:", costOutputs);
 		}
 		*p = '\0';
 		Debug::sysexDebugPrint(*Debug::midiDebugCable, costLine, true);
@@ -1633,6 +1643,8 @@ void reportStats() {
 		costStemSnapshot = PathCost{};
 		costStemCapture = PathCost{};
 		costStemClear = PathCost{};
+		costEngine = PathCost{};
+		costOutputs = PathCost{};
 	}
 
 	statPacketsSent = 0;
@@ -2309,6 +2321,18 @@ void USBAudioStream::noteStemTrack(uint32_t channel, const char* name) {
 		stemName[channel][i] = name[i];
 	}
 	stemName[channel][i] = 0;
+}
+
+uint32_t USBAudioStream::costMark() {
+	return costStart();
+}
+
+void USBAudioStream::costEngineRoutine(uint32_t start) {
+	addCost(costEngine, start);
+}
+
+void USBAudioStream::costOutputLoop(uint32_t start) {
+	addCost(costOutputs, start);
 }
 
 uint32_t USBAudioStream::stemChannelForOutput(uint32_t outputIndex) {

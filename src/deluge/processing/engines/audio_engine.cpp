@@ -1060,7 +1060,10 @@ void routine_task() {
 		        // called from within this!
 	}
 	calledFromScheduler = true;
+	// Times exactly the code the scheduler is timing, in processor cycles rather than wall clock.
+	const uint32_t engineStart = deluge::processing::engines::USBAudioStream::costMark();
 	routine();
+	deluge::processing::engines::USBAudioStream::costEngineRoutine(engineStart);
 	calledFromScheduler = false;
 }
 void routine() {

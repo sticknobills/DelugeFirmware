@@ -81,6 +81,13 @@ public:
 	/// output's own display name.
 	static void noteStemTrack(uint32_t channel, const char* name);
 
+	/// Reconciliation instruments. The scheduler reports the audio task's wall-clock duration, which absorbs every
+	/// interrupt that fires inside it; these time the same code in processor cycles, which does not. Two readings
+	/// of one thing, and the gap between them is the answer.
+	static uint32_t costMark();
+	static void costEngineRoutine(uint32_t start);
+	static void costOutputLoop(uint32_t start);
+
 	/// Which stem channel a track occupies, from its position in the song's output list.
 	///
 	/// Provisional: the first six tracks in song order, so the path can be proven on hardware before an assignment

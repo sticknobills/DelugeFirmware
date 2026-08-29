@@ -2493,6 +2493,7 @@ void Song::renderAudio(std::span<StereoSample> outputBuffer, int32_t* reverbBuff
 	// falls out of a valid state mid-song. Provisional assignment - see USBAudioStream::stemChannelForOutput.
 	uint32_t outputIndex = 0;
 	const bool captureStems = deluge::processing::engines::USBAudioStream::stemsWanted();
+	const uint32_t outputLoopStart = deluge::processing::engines::USBAudioStream::costMark();
 	for (Output* output = firstOutput; output; output = output->next) {
 		const uint32_t thisOutputIndex = outputIndex++;
 		if (!output->inValidState) {
@@ -2532,6 +2533,7 @@ void Song::renderAudio(std::span<StereoSample> outputBuffer, int32_t* reverbBuff
 		AudioEngine::logAction(buf);
 #endif
 	}
+	deluge::processing::engines::USBAudioStream::costOutputLoop(outputLoopStart);
 	AudioEngine::logAction("done rendering outputs");
 	// If recording the "MIX", this is the place where we want to grab it - before any master FX or volume applied
 	// Go through each SampleRecorder, feeding them audio
