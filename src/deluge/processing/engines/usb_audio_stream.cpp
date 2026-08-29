@@ -889,10 +889,20 @@ uint32_t buildNextPacket(uint8_t* buffer) {
 		statResyncs++;
 	}
 
-	if (available < kFramesPerBlock) {
-		// Less than one whole block since the last poll, which cannot fill a packet the controller can move.
-		// Send correctly sized silence rather than nothing, so the endpoint keeps answering, and do not advance
-		// the read pointer.
+	if (available < frames) {
+		// Not enough for a full-sized packet. Send silence rather than a runt.
+		//
+		// This threshold was one block - two frames - so a ring holding four frames produced a four-frame
+		// packet. Measured on the load stress of 2026-08-29 (evening): in the half-second windows that still
+		// carried a break, the smallest packet had a median of 4 frames against 44 everywhere else, and 98% of
+		// the remaining breaks sat within a second of a stall. It is the same fault the even-packet rule was
+		// written to remove, surviving in the one branch that rounding down to whole blocks could still reach:
+		// a run of runts starves the host exactly as a run of short packets did.
+		//
+		// The audio is not lost and the read pointer does not move - those frames go out in the next packet,
+		// once there are enough of them to fill one. A silent packet costs the ring nothing, and the engine
+		// refills it at 44.1 frames a millisecond, so this clears itself within a packet or two of the stall
+		// ending.
 		statUnderruns++;
 		memset(buffer, 0, frames * kFrameBytes);
 		markDeviceSilence(buffer, frames);
