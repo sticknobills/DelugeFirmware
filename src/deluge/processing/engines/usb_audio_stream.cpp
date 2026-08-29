@@ -140,10 +140,19 @@ constexpr uint32_t kRingMask = kRingFrames - 1u;
 /// between the engine's 128-frame bursts, and one window is emptied by exactly that.
 constexpr uint32_t kLeadFrames = 256u;
 
+/// How far the lead may stray before the packet size is trimmed a block to bring it back.
+///
+/// The band is what keeps the correction off the wire: inside it every packet is the nominal 44.1 frames, so
+/// the host sees a rate that does not move. Wide enough to swallow the engine's 128-frame burst and the four
+/// packets the builder fills in one pass, narrow enough that the lead never approaches either end of its range
+/// - simulated at 184-328 frames around the 256 set-point.
+constexpr uint32_t kLeadBandFrames = 64u;
+
 /// Past this the writer is about to lap the reader, which silently reorders a second of audio. Everything short
-/// of it is caught up rather than discarded: the builder sends `available - kLeadFrames` capped at
-/// kMaxFramesPerPacket, draining 63,000 frames a second against the 44,100 the engine produces, so even a full
-/// ring returns to the set-point in about 0.4 s with no audio thrown away.
+/// of it is caught up rather than discarded: the builder's catch-up branch sends four blocks above nominal,
+/// draining ~52,000 frames a second against the 44,100 the engine produces, so a ring filled by a 100 ms stall
+/// returns to the set-point in about 0.6 s with no audio thrown away. That is slower than the old rule's 0.4 s
+/// and it is the price of keeping the correction off the wire.
 ///
 /// At three quarters of the ring this fired first and binned the backlog instead. A kit load starves the task
 /// for longer than the ring's 186 ms, and the recovery discarded up to 113,639 frames in a 1.7 s interval while
@@ -316,10 +325,11 @@ uint32_t statQueueBuilt = 0;
 
 /// DIAGNOSTIC. How many frames each packet carried, in bins of eight, over the report interval.
 ///
-/// The mean is already derivable from frm/pkt and it hides the thing in question: the builder sends
-/// `available - kLeadFrames`, and buildQueuedPackets() fills all four slots in one pass, so every build after
-/// the first in a burst finds the ring at exactly the cushion and takes an eighth of it. That produces one full
-/// packet followed by several short ones at the same mean as an even flow.
+/// The mean is already derivable from frm/pkt and it hides the thing in question. Under the old rule the
+/// builder sent `available - kLeadFrames` and buildQueuedPackets() filled all four slots in one pass, so every
+/// build after the first in a burst found the ring at the cushion and took an eighth of it: one full packet
+/// followed by several short ones, at the same mean as an even flow. This is the histogram that shows whether
+/// the trimmed builder actually flattened that - every bin should now sit on 44-52 frames.
 constexpr uint32_t kSizeBins = 8u;
 uint32_t statSizeHist[kSizeBins] = {};
 bool audioTimerRunning = false;
@@ -783,9 +793,10 @@ uint32_t buildNextPacket(uint8_t* buffer) {
 	// Hold the first packets back until there is a window's worth of slack, so the very first late render does
 	// not produce a gap the host has to hear.
 	if (!primed) {
-		// One packet above the cushion, not level with it: the builder below sends `available - kLeadFrames`,
-		// so starting exactly at the cushion means the first packet has nothing to send and falls into the
-		// recovery branch. Simulated 2026-08-27 - the set-point is only reachable from above.
+		// One packet above the cushion, not level with it. This mattered when the builder sent
+		// `available - kLeadFrames` and starting level with the cushion left the first packet nothing to
+		// send; the trimmed builder would simply send its nominal size. Kept because the headroom costs
+		// nothing and the stream still wants a full window in hand before the first packet leaves.
 		if (available < kLeadFrames + kMaxFramesPerPacket) {
 			statPrimeSilence++;
 			memset(buffer, 0, frames * kFrameBytes);
@@ -829,36 +840,50 @@ uint32_t buildNextPacket(uint8_t* buffer) {
 		return frames;
 	}
 
-	// Leave kLeadFrames in the ring rather than draining it. This is the whole difference between a lead that
-	// is a starting value and a lead that is a set-point: sending `available` empties the ring by construction
-	// on every single packet, so the next build before the engine's next burst finds nothing and substitutes
-	// silence. Measured at 26.8 inserted silences a second on v0.29.0 at the best host buffer - 81% of every
-	// interruption in the stream, and more than the host drops by a factor of eight.
+	// A near-constant packet size, trimmed a block at a time towards the lead set-point.
 	//
-	// Sending `available - kLeadFrames` is self-regulating and needs no controller: the lead settles at
-	// kLeadFrames and each packet then carries exactly what the engine produced since the last one. The long
-	// run rate is production, so this cannot drift into a resync the way a fixed packet size would.
+	// This used to send `available - kLeadFrames`, which regulated the lead perfectly and put the whole of the
+	// engine's burstiness onto the wire. Read back off the 2026-08-29 capture: packets ranged from 2 frames to
+	// 62 with a median of 60, so the instantaneous rate the host saw swung between roughly 2,000 and 62,000
+	// frames a second while averaging exactly 44,100. That average is what every device-side counter reports,
+	// and it is why all of them read clean.
+	//
+	// A host input ring cannot absorb that. Its client reads at a fixed rate behind the device's writes, and
+	// when a run of short packets exhausts the margin the reader overtakes the writer and serves audio one ring
+	// lap - ~250 ms - old until the device catches up. That is exactly the shape measured in the recording: 18
+	// stale runs of 2-108 frames at a median depth of 11,008 frames, each with a step across the join 33x the
+	// music's own. Confirmed by ear on 2026-08-29 (evening), blind, against a repaired copy.
+	//
+	// So the ring absorbs the burstiness instead, which is what it is for. The nominal size above already holds
+	// 44.1 frames a packet; the lead is corrected a block at a time when it strays outside a band, which tracks
+	// the engine's real long-run rate without ever putting a step onto the wire. Simulated against the engine's
+	// 128-frame bursts before flashing: packet sizes 44-48 against 2-62, delivered rate 44,099 frames/s against
+	// 44,091, and the lead holding 184-328 around its 256 set-point with no underrun and no resync.
 	//
 	// Never a partial audio frame: a host that appends one rotates the channel mapping permanently and
 	// silently.
-	uint32_t send;
-	if (available > kLeadFrames) {
-		send = available - kLeadFrames;
+	const int32_t leadError = (int32_t)available - (int32_t)kLeadFrames;
+	uint32_t send = frames;
+	if (leadError > (int32_t)kMaxFramesPerPacket) {
+		// Far above the set-point - a stalled task, or the recovery after one. Four blocks, not the whole
+		// backlog: 52 frames a packet drains ~7,800 frames a second faster than the engine produces, so the
+		// ring returns to the set-point without ever putting a step on the wire. Simulated against a 100 ms
+		// task starve: 0.57 s to recover at four blocks against 1.26 s at two, for a rate excursion of 18%
+		// against the 40% the old rule took on every ordinary packet.
+		send = frames + 4u * kFramesPerBlock;
 	}
-	else {
-		// Below the cushion, which after priming means the engine genuinely stalled. Take an eighth, so the
-		// ring refills over the next few milliseconds instead of being held flat - and send real audio either
-		// way. A short packet is worth having; a silent one is the defect this whole change exists to remove.
-		//
-		// An eighth rather than a half: simulated at both, and a half drains faster than the engine produces
-		// at any lead above ~98 frames, so it settles at its own equilibrium and fights the set-point instead
-		// of restoring it. That is the same mistake as kLeadFrames not being read in the steady-state path,
-		// one layer in.
-		send = available >> 3u;
-		if (send == 0u) {
-			send = 1u;
-		}
+	else if (leadError > (int32_t)kLeadBandFrames) {
+		send = frames + kFramesPerBlock;
+	}
+	else if (leadError < -(int32_t)kLeadBandFrames) {
+		// Below the cushion, which after priming means the engine ran late. One block short rather than a
+		// fraction of what is left: the previous rule took an eighth here, which is a 4-frame packet, and a
+		// run of those is precisely what makes the host's reader overtake.
+		send = (frames > kFramesPerBlock) ? frames - kFramesPerBlock : kFramesPerBlock;
 		statLeadShort++;
+	}
+	if (send > available) {
+		send = available;
 	}
 	if (send > kMaxFramesPerPacket) {
 		send = kMaxFramesPerPacket;
