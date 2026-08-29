@@ -246,6 +246,25 @@ struct QueuedPacket {
 QueuedPacket packetQueue[kQueueSlots];
 uint16_t packetQueueBytes[kQueueSlots];
 
+/// One packet of silence, kept ready so the wire never goes quiet while the builder cannot run.
+///
+/// A card load freezes the audio task, so no packet is built and the timer finds an empty queue - and an
+/// endpoint that answers nothing is what makes the host's reader overtake and splice in a quarter-second-old
+/// fragment. Measured 2026-08-29 (evening) under a load stress: 103 dry-ring events on the device turned into
+/// 91 audible splices at the host, all of them inside the 90 seconds of loading.
+///
+/// Silence here is honest rather than a patch: the engine genuinely produced nothing, so a brief mute is what
+/// happened. It is marked as the device's own silence, so the recording still tells it apart from a packet
+/// that never arrived. The ring is not drained by it, so no audio is lost - it goes out in the next real
+/// packet.
+QueuedPacket standbyPacket;
+uint16_t standbyBytes = 0;
+bool standbyReady = false;
+/// Set while the controller is moving the standby packet, so its completion does not release a queue slot that
+/// was never consumed.
+bool audioDmaStandby = false;
+uint32_t statStandbySent = 0;
+
 /// The same slot seen by the CPU with the cache bypassed. The builder writes here and the DMA controller reads
 /// the ordinary address, so neither has to flush anything - the pattern the PIC and SSI transmit buffers already
 /// use. A whole-cache flush per packet, which is what the vendor driver does, would cost far more than the copy
@@ -767,6 +786,30 @@ void stampPacketNumber(uint8_t* buffer, uint32_t frames) {
 	}
 }
 
+/// Fills the standby packet once, at stream start. Everything in it is constant except the packet number,
+/// which the timer stamps as it goes out so the host-side tools still see a sequence rather than one long
+/// repeated value.
+void prepareStandbyPacket() {
+	const uint32_t frames = kFramesPerPacket / kFramesPerBlock * kFramesPerBlock;
+	uint8_t* buffer = (uint8_t*)((uint32_t)standbyPacket.data + UNCACHED_MIRROR_OFFSET);
+	memset(buffer, 0, frames * kFrameBytes);
+	markDeviceSilence(buffer, frames);
+	standbyBytes = (uint16_t)(frames * kFrameBytes);
+	standbyReady = true;
+}
+
+/// Numbers the standby packet on its way out. Forty-odd 16-bit stores through the uncached view, and only when
+/// the queue is empty, which by construction means the task is not running and the interrupt has nothing to
+/// compete with.
+void stampStandbyPacket() {
+	int16_t* samples = (int16_t*)((uint32_t)standbyPacket.data + UNCACHED_MIRROR_OFFSET);
+	const int16_t number = encodeStamp(packetCounter++);
+	const uint32_t frames = standbyBytes / kFrameBytes;
+	for (uint32_t f = 0; f < frames; f++) {
+		samples[f * kChannels + 5] = number;
+	}
+}
+
 /// Builds one packet from the ring and hands it to the endpoint.
 ///
 /// Called from the task for the first packet of a stream and after a recovery, and from the completion for every
@@ -1136,6 +1179,10 @@ void reportStats() {
 	emitDec(sofToWriteTicks * 1000u / kTimerTicksPerMs); ///< the settled offset, in us
 	emit(" tem");
 	emitDec(statTimerEmpty);
+	// Packets of marked silence sent because the builder was frozen. Read against ur: an under-run is the ring
+	// dry with the task still running, this is the task not running at all.
+	emit(" sby");
+	emitDec(statStandbySent);
 	emit(" qb");
 	emitDec(statQueueBuilt);
 	emit(" bld");
@@ -1476,6 +1523,7 @@ void reportStats() {
 	statFrdyNever = 0;
 	statCatchUp = 0;
 	statTimerEmpty = 0;
+	statStandbySent = 0;
 	statQueueBuilt = 0;
 	statBuilds = 0;
 	for (uint32_t i = 0; i < kSizeBins; i++) {
@@ -1609,7 +1657,12 @@ void retireAudioDma() {
 	}
 	const uint32_t frames = (uint32_t)((uint16_t)(reg->FRMNUM & kFrameNumberMask) - statDmaArmFrame) & kFrameNumberMask;
 	statDmaFrameSpan[frames > 2u ? 2u : frames]++;
-	queueRead++;
+	if (audioDmaStandby) {
+		audioDmaStandby = false;
+	}
+	else {
+		queueRead++;
+	}
 	statTimerWrote++;
 	statDmaCompleted++;
 	audioDmaBusy = false;
@@ -1649,7 +1702,7 @@ bool parkAudioDmaPort() {
 }
 
 /// Hands one packet to the DMA controller. Returns without arming if the channel is still working on the last one.
-bool startAudioDma(uint32_t slot, uint16_t bytes) {
+bool startAudioDma(const uint8_t* source, uint16_t bytes) {
 	const uint32_t start = Debug::readCycleCounter();
 	// EN or TACT still set means the previous transfer has not retired. Skipped rather than waited on: the next
 	// timer fire is 400 us away and spinning here would hold the interrupt open for exactly the reason this
@@ -1658,9 +1711,9 @@ bool startAudioDma(uint32_t slot, uint16_t bytes) {
 		statDmaBusySkips++;
 		return false;
 	}
-	// The ordinary, cached address of the slot: the builder wrote it through the uncached mirror, so what is in
-	// memory is already current and the controller reads the same bytes from the normal one.
-	DMACn(kAudioDmaChannel).N0SA_n = (uint32_t)packetQueue[slot].data;
+	// The ordinary, cached address of the packet: whoever filled it wrote through the uncached mirror, so what
+	// is in memory is already current and the controller reads the same bytes from the normal one.
+	DMACn(kAudioDmaChannel).N0SA_n = (uint32_t)source;
 	// The block registers rather than the single-word port: a 32-byte transfer lands across D0FIFOB0-B7 in one
 	// bus cycle, which is the whole point of the change.
 	DMACn(kAudioDmaChannel).N0DA_n = (uint32_t)&(usb_hstd_get_usb_ip_adr(USB_CFG_USE_USBIP)->D0FIFOB0);
@@ -1695,9 +1748,12 @@ void audioWriteTimerBody() {
 	if (kSweepOffsets && sweepBin < kSweepBins) {
 		sweepFires[sweepBin]++;
 	}
-	if (queueWrite == queueRead) {
+	const bool queueEmpty = (queueWrite == queueRead);
+	if (queueEmpty) {
 		statTimerEmpty++;
-		return;
+		if (!standbyReady) {
+			return;
+		}
 	}
 
 	// One packet per fire now, not up to two. The catch-up second write existed because a CPU write completes
@@ -1729,8 +1785,22 @@ void audioWriteTimerBody() {
 	}
 	statFrdyImmediate++;
 
+	if (queueEmpty) {
+		// The builder is frozen - a card load, or the audio task starved. Keep the endpoint answering with
+		// marked silence rather than letting the wire go quiet, which is the thing the host cannot absorb.
+		stampStandbyPacket();
+		audioDmaStandby = true;
+		if (!startAudioDma(standbyPacket.data, standbyBytes)) {
+			audioDmaStandby = false;
+			statTimerShut++;
+			return;
+		}
+		statStandbySent++;
+		return;
+	}
+
 	const uint32_t slot = queueRead % kQueueSlots;
-	if (!startAudioDma(slot, packetQueueBytes[slot])) {
+	if (!startAudioDma(packetQueue[slot].data, packetQueueBytes[slot])) {
 		statTimerShut++;
 		return;
 	}
@@ -1948,6 +2018,9 @@ static void serviceBody() {
 	// Started only once a host is actually streaming and the driver's own first transfer is set up, so an idle
 	// Deluge pays nothing and the timer never fires against an unconfigured pipe.
 	if (!audioDmaConfigured) {
+		if (!standbyReady) {
+			prepareStandbyPacket();
+		}
 		configureAudioDmaFifo();
 		if (!audioDmaInterruptArmed) {
 			// Priority 5, matching the write timer that arms it: this hands one packet over and returns, and
