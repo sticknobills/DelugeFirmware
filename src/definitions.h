@@ -49,6 +49,10 @@ extern void freezeWithError(char const* errmsg);
 #define TIMER_SYSTEM_SUPERFAST 1
 
 #define SSI_TX_BUFFER_NUM_SAMPLES 128
+
+// How far the output stage shifts the mix up on its way to the codec. Moved here from audio_engine.cpp so the USB
+// stream can put its per-track channels on the same scale as the mix from one definition rather than two.
+#define AUDIO_OUTPUT_GAIN_DOUBLINGS 8
 #define SSI_RX_BUFFER_NUM_SAMPLES 2048
 #define NUM_MONO_INPUT_CHANNELS (NUM_STEREO_INPUT_CHANNELS * 2)
 #define NUM_MONO_OUTPUT_CHANNELS (NUM_STEREO_OUTPUT_CHANNELS * 2)

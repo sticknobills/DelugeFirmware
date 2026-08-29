@@ -102,8 +102,6 @@ extern int32_t spareRenderingBuffer[][SSI_TX_BUFFER_NUM_SAMPLES];
 
 #define NUM_SAMPLES_FOR_CPU_USAGE_REPORT 32
 
-#define AUDIO_OUTPUT_GAIN_DOUBLINGS 8
-
 #ifdef REPORT_CPU_USAGE
 #define REPORT_AVERAGE_NUM 10
 int32_t usageTimes[REPORT_AVERAGE_NUM];
@@ -660,6 +658,10 @@ void renderAudio(size_t numSamples) {
 
 	numHopsEndedThisRoutineCall = 0;
 
+	// Before any output renders, because the capture below reads each track out of the mix as the difference it
+	// makes to it. Costs nothing while no host is streaming.
+	deluge::processing::engines::USBAudioStream::beginRender(numSamples);
+
 	// Render audio for song
 	if (currentSong != nullptr) {
 		currentSong->renderAudio(renderingBuffer, reverbBuffer.data(), sideChainHitPending);
@@ -694,6 +696,10 @@ void renderAudioForStemExport(size_t numSamples) {
 	}
 
 	numHopsEndedThisRoutineCall = 0;
+
+	// Cleared here too, so an offline export cannot leave the previous live window's stems standing in the
+	// accumulators for the output stage to read back as current audio.
+	deluge::processing::engines::USBAudioStream::beginRender(numSamples);
 
 	// Render audio for song
 	if (currentSong != nullptr) {
@@ -1149,6 +1155,9 @@ bool doSomeOutputting() {
 
 	std::span<StereoSample> outputBufferForResampling{reinterpret_cast<StereoSample*>(spareRenderingBuffer), 128 * 2};
 	StereoSample* __restrict__ renderingBufferOutputPosNow = renderingBufferOutputPos;
+	// Where in the render window this call starts. The window is drained across several calls, and a stem sample
+	// has to travel with the mix sample it was rendered beside or the channels slide against each other.
+	const uint32_t renderOffsetAtStart = (uint32_t)(renderingBufferOutputPosNow - renderingMemory.begin());
 	int32_t* __restrict__ i2sTXBufferPosNow = (int32_t*)i2sTXBufferPos;
 	int32_t* __restrict__ inputReadPos = (int32_t*)i2sRXBufferPos;
 
@@ -1233,7 +1242,8 @@ bool doSomeOutputting() {
 
 		// The same samples the OUTPUT recorder takes below, at the same point and the same scale -- this is the
 		// mix as the codec receives it, so a USB host and a resampled recording agree by construction.
-		deluge::processing::engines::USBAudioStream::feedMix(outputBufferForResampling.data(), numSamplesOutputted);
+		deluge::processing::engines::USBAudioStream::feedMix(outputBufferForResampling.data(), numSamplesOutputted,
+		                                                     renderOffsetAtStart);
 
 		i2sRXBufferPos += (numSamplesOutputted << (NUM_MONO_INPUT_CHANNELS_MAGNITUDE + 2));
 		if (i2sRXBufferPos >= (uint32_t)getRxBufferEnd()) {

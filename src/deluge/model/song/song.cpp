@@ -57,6 +57,7 @@
 #include "processing/audio_output.h"
 #include "processing/engines/audio_engine.h"
 #include "processing/engines/cv_engine.h"
+#include "processing/engines/usb_audio_stream.h"
 #include "processing/sound/sound_instrument.h"
 #include "processing/stem_export/stem_export.h"
 #include "storage/flash_storage.h"
@@ -2488,7 +2489,12 @@ void Song::renderAudio(std::span<StereoSample> outputBuffer, int32_t* reverbBuff
 	ModelStack* modelStack = setupModelStackWithSong(modelStackMemory, this);
 
 	AudioEngine::logAction("Start output render");
+	// Counts every output the loop considers, valid or not, so a track's channel does not move when another one
+	// falls out of a valid state mid-song. Provisional assignment - see USBAudioStream::stemChannelForOutput.
+	uint32_t outputIndex = 0;
+	const bool captureStems = deluge::processing::engines::USBAudioStream::stemsWanted();
 	for (Output* output = firstOutput; output; output = output->next) {
+		const uint32_t thisOutputIndex = outputIndex++;
 		if (!output->inValidState) {
 			continue;
 		}
@@ -2497,8 +2503,26 @@ void Song::renderAudio(std::span<StereoSample> outputBuffer, int32_t* reverbBuff
 		    (output->getActiveClip() && isClipActive(output->getActiveClip()->getClipBeingRecordedFrom()));
 		ENTER_CRITICAL_SECTION();
 		if (output->shouldRenderInSong()) {
+			// This track's own audio, taken as the difference it makes to the mix rather than by rendering it a
+			// second time. Nothing about how it renders changes, and the failure mode is a silent stem channel
+			// rather than a damaged mix.
+			const uint32_t stemChannel =
+			    captureStems ? deluge::processing::engines::USBAudioStream::stemChannelForOutput(thisOutputIndex)
+			                 : deluge::processing::engines::USBAudioStream::kNoStem;
+			const uint32_t numSamples = (uint32_t)outputBuffer.size();
+			int32_t* const mixRaw = (int32_t*)outputBuffer.data();
+			if (stemChannel != deluge::processing::engines::USBAudioStream::kNoStem) {
+				deluge::processing::engines::USBAudioStream::snapshotBeforeTrack(mixRaw, numSamples);
+			}
+
 			output->renderOutput(modelStack, outputBuffer, reverbBuffer, volumePostFX >> 1, sideChainHitPending,
 			                     !isClipActiveNow, isClipActiveNow);
+
+			if (stemChannel != deluge::processing::engines::USBAudioStream::kNoStem) {
+				// Its reverb send is not in here: that went into the shared reverb buffer during the render and is
+				// mixed in much later, so a stem carries the track dry.
+				deluge::processing::engines::USBAudioStream::captureStem(stemChannel, mixRaw, numSamples);
+			}
 		}
 		EXIT_CRITICAL_SECTION();
 #if DO_AUDIO_LOG

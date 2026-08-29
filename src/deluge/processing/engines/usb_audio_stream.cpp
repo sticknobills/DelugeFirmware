@@ -20,6 +20,7 @@
 #include "dsp/stereo_sample.h"
 #include "io/debug/print.h"
 #include "io/midi/sysex.h"
+#include "util/functions.h"
 #include <cstdint>
 #include <cstring>
 
@@ -126,6 +127,11 @@ static_assert(kMaxFramesPerPacket > kFramesPerPacket,
 /// Only binding while they are compiled in - a shipping build is free to be narrower than six channels.
 static_assert(!kDiagnostics || kChannels >= 6, "Channels 3-6 carry the producer stamp, the mark and the packet number");
 
+/// The stems sit above the main mix by fixed offset, the way the diagnostics did. The two never coexist: with the
+/// instruments on, channels 3-6 carry stamps and the stems are not written at all.
+static_assert(kDiagnostics || kChannels >= 2 + deluge::processing::engines::USBAudioStream::kStemChannels,
+              "Channels 3 upwards carry one mono track each");
+
 static_assert(kMaxPacketBytes <= USB_CFG_PAUDIO_BUF_BYTES,
               "Audio packet does not fit the pipe buffer declared in r_usb_paudio_config.h");
 
@@ -184,6 +190,18 @@ constexpr uint32_t kResyncFrames = kRingFrames - kLeadFrames - kMaxFramesPerPack
 /// Interleaved, one frame per host audio frame. Only channels 0 and 1 are ever written, so the rest are
 /// zeroed once at startup and left alone -- per-track routing fills them in a later cut.
 PLACE_SDRAM_BSS int16_t ring[kRingFrames * kChannels];
+
+/// One render window per stem channel, summed to mono, accumulated while the outputs render and read back by the
+/// output stage that also hands over the main mix.
+///
+/// Ordinary memory rather than SDRAM: 3 KB, written once per track per window and read once per output sample, so
+/// it is the wrong thing to put behind the slower bus. The ring is large and touched twice; this is small and
+/// touched constantly.
+constexpr uint32_t kStemWindowSamples = SSI_TX_BUFFER_NUM_SAMPLES;
+constexpr uint32_t kStemChannels = deluge::processing::engines::USBAudioStream::kStemChannels;
+int32_t stemAccumulator[kStemChannels][kStemWindowSamples];
+int32_t stemSnapshot[kStemWindowSamples * 2];
+uint32_t stemWindowSamples = 0;
 
 /// Free-running, not masked to the ring - they are masked only where they index it. Masked pointers make an
 /// overtaking reader indistinguishable from a full ring, which cost this build a whole session on 2026-08-26.
@@ -2130,7 +2148,50 @@ void USBAudioStream::service() {
 	addCost(costService, start);
 }
 
-void USBAudioStream::feedMix(const StereoSample* mix, uint32_t numSamples) {
+bool USBAudioStream::stemsWanted() {
+	// The host holding the interface is the whole test. A build nobody is streaming from does not capture, which is
+	// what keeps an unplugged Deluge at stock cost.
+	return streamActive;
+}
+
+void USBAudioStream::beginRender(uint32_t numSamples) {
+	if (!streamActive) {
+		stemWindowSamples = 0;
+		return;
+	}
+	stemWindowSamples = (numSamples > kStemWindowSamples) ? kStemWindowSamples : numSamples;
+	for (uint32_t c = 0; c < kStemChannels; c++) {
+		memset(stemAccumulator[c], 0, stemWindowSamples * sizeof(int32_t));
+	}
+}
+
+void USBAudioStream::snapshotBeforeTrack(const int32_t* mixNow, uint32_t numSamples) {
+	if (numSamples > stemWindowSamples) {
+		return;
+	}
+	memcpy(stemSnapshot, mixNow, numSamples * 2 * sizeof(int32_t));
+}
+
+void USBAudioStream::captureStem(uint32_t channel, const int32_t* mixNow, uint32_t numSamples) {
+	if (channel >= kStemChannels || numSamples > stemWindowSamples) {
+		return;
+	}
+	const int32_t* const snapshot = stemSnapshot;
+	int32_t* const out = stemAccumulator[channel];
+	for (uint32_t i = 0; i < numSamples; i++) {
+		// The track's own contribution, left and right, taken as what it added to the mix rather than by rendering
+		// it a second time. Halved on the way to mono so a centred track keeps its level rather than doubling it.
+		const int32_t l = mixNow[i * 2] - snapshot[i * 2];
+		const int32_t r = mixNow[i * 2 + 1] - snapshot[i * 2 + 1];
+		out[i] += (l >> 1) + (r >> 1);
+	}
+}
+
+uint32_t USBAudioStream::stemChannelForOutput(uint32_t outputIndex) {
+	return (outputIndex < kStemChannels) ? outputIndex : kNoStem;
+}
+
+void USBAudioStream::feedMix(const StereoSample* mix, uint32_t numSamples, uint32_t renderOffset) {
 	// Taken before the early return, not after: what an installed-but-idle build costs is one of the things being
 	// separated, and a timer that starts after the guard can never see it.
 	const uint32_t feedStart = costStart();
@@ -2154,6 +2215,26 @@ void USBAudioStream::feedMix(const StereoSample* mix, uint32_t numSamples) {
 		// The samples handed here are already at output scale, so this is only a width reduction.
 		frame[0] = (int16_t)(mix[i].l >> 16);
 		frame[1] = (int16_t)(mix[i].r >> 16);
+		if constexpr (!kDiagnostics) {
+			// One mono track a channel, at the same scale the mix above reaches the host on.
+			//
+			// The song's own volume, its master filters and its compressor are all applied after the point these
+			// were captured, so a stem is the track as the song mixes it and not as the master fader leaves it -
+			// which is what an individual track output is for. Turning the master down does not turn these down.
+			const uint32_t stemIndex = renderOffset + i;
+			if (stemIndex < stemWindowSamples) {
+				for (uint32_t c = 0; c < kStemChannels; c++) {
+					frame[2 + c] =
+					    (int16_t)(lshiftAndSaturate<AUDIO_OUTPUT_GAIN_DOUBLINGS>(stemAccumulator[c][stemIndex] >> 1)
+					              >> 16);
+				}
+			}
+			else {
+				for (uint32_t c = 0; c < kStemChannels; c++) {
+					frame[2 + c] = 0;
+				}
+			}
+		}
 		if constexpr (kDiagnostics) {
 			// The producer's own frame count, travelling with the audio it belongs to. Whatever reaches the host
 			// carries the number of the frame the engine rendered, so the recording alone says which frames were

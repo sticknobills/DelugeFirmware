@@ -47,7 +47,39 @@ public:
 	/// The Deluge is the clock master here: a device-to-host isochronous stream carries whatever the source
 	/// produced and the host adapts, so packets are sized from what this leaves in the ring rather than from a
 	/// nominal rate. Costs nothing when no host is streaming.
-	static void feedMix(const StereoSample* mix, uint32_t numSamples);
+	/// renderOffset is where these samples sit in the render window the stems were captured against, so the two
+	/// halves of a frame come from the same instant. The output stage drains a window across several calls.
+	static void feedMix(const StereoSample* mix, uint32_t numSamples, uint32_t renderOffset);
+
+	/// Channels beyond the main mix, one mono track each.
+	///
+	/// Mono rather than stereo pairs: it keeps every channel independently assignable and the far end recombines,
+	/// which is worth more than a track's own panning over a cable that carries eight of them at most.
+	static constexpr uint32_t kStemChannels = 6;
+	static constexpr uint32_t kNoStem = 0xFFFFFFFFu;
+
+	/// Whether any of the above is worth capturing. False unless a host holds the streaming interface, so a
+	/// machine with nothing plugged in pays for none of it.
+	static bool stemsWanted();
+
+	/// Clears the stem accumulators. Once per render window, before any output has rendered into the mix.
+	static void beginRender(uint32_t numSamples);
+
+	/// Remembers the mix as it stands before one track renders into it.
+	///
+	/// One buffer, taken and consumed inside a single output's render and never outliving it. The window bound is
+	/// enforced here rather than at the call site, so there is one place that can get it wrong.
+	static void snapshotBeforeTrack(const int32_t* mixNow, uint32_t numSamples);
+
+	/// Adds one track to a stem channel, as the difference between the mix now and the snapshot above. Summed to
+	/// mono, at the scale the main mix reaches the host on.
+	static void captureStem(uint32_t channel, const int32_t* mixNow, uint32_t numSamples);
+
+	/// Which stem channel a track occupies, from its position in the song's output list.
+	///
+	/// Provisional: the first six tracks in song order, so the path can be proven on hardware before an assignment
+	/// interface exists. What replaces it is stage D, and T8 is its constraint.
+	static uint32_t stemChannelForOutput(uint32_t outputIndex);
 };
 
 } // namespace deluge::processing::engines
