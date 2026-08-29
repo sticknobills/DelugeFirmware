@@ -51,11 +51,13 @@ public:
 	/// halves of a frame come from the same instant. The output stage drains a window across several calls.
 	static void feedMix(const StereoSample* mix, uint32_t numSamples, uint32_t renderOffset);
 
-	/// Channels beyond the main mix, one mono track each.
+	/// One mono track per channel, across the whole width of the stream.
 	///
 	/// Mono rather than stereo pairs: it keeps every channel independently assignable and the far end recombines,
-	/// which is worth more than a track's own panning over a cable that carries eight of them at most.
-	static constexpr uint32_t kStemChannels = 6;
+	/// which is worth more than a track's own panning over a cable that carries eight of them at most. No pair is
+	/// reserved for the main mix - that was decided 2026-08-22 and the mix is a source like any other once there
+	/// is an interface to assign one.
+	static constexpr uint32_t kStemChannels = 8;
 	static constexpr uint32_t kNoStem = 0xFFFFFFFFu;
 
 	/// Whether any of the above is worth capturing. False unless a host holds the streaming interface, so a
@@ -74,6 +76,10 @@ public:
 	/// Adds one track to a stem channel, as the difference between the mix now and the snapshot above. Summed to
 	/// mono, at the scale the main mix reaches the host on.
 	static void captureStem(uint32_t channel, const int32_t* mixNow, uint32_t numSamples);
+
+	/// Names the track a stem channel is carrying, for the map report. Called from the render loop with the
+	/// output's own display name.
+	static void noteStemTrack(uint32_t channel, const char* name);
 
 	/// Which stem channel a track occupies, from its position in the song's output list.
 	///

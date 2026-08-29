@@ -2513,6 +2513,7 @@ void Song::renderAudio(std::span<StereoSample> outputBuffer, int32_t* reverbBuff
 			int32_t* const mixRaw = (int32_t*)outputBuffer.data();
 			if (stemChannel != deluge::processing::engines::USBAudioStream::kNoStem) {
 				deluge::processing::engines::USBAudioStream::snapshotBeforeTrack(mixRaw, numSamples);
+				deluge::processing::engines::USBAudioStream::noteStemTrack(stemChannel, output->name.get());
 			}
 
 			output->renderOutput(modelStack, outputBuffer, reverbBuffer, volumePostFX >> 1, sideChainHitPending,

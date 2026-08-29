@@ -127,10 +127,10 @@ static_assert(kMaxFramesPerPacket > kFramesPerPacket,
 /// Only binding while they are compiled in - a shipping build is free to be narrower than six channels.
 static_assert(!kDiagnostics || kChannels >= 6, "Channels 3-6 carry the producer stamp, the mark and the packet number");
 
-/// The stems sit above the main mix by fixed offset, the way the diagnostics did. The two never coexist: with the
-/// instruments on, channels 3-6 carry stamps and the stems are not written at all.
-static_assert(kDiagnostics || kChannels >= 2 + deluge::processing::engines::USBAudioStream::kStemChannels,
-              "Channels 3 upwards carry one mono track each");
+/// The stems fill the frame. With the instruments on they are not written at all - channels 3-6 carry stamps
+/// instead, and 1-2 carry the main mix, which is the pair every measurement to date was taken on.
+static_assert(kDiagnostics || kChannels >= deluge::processing::engines::USBAudioStream::kStemChannels,
+              "Every channel carries one mono track");
 
 static_assert(kMaxPacketBytes <= USB_CFG_PAUDIO_BUF_BYTES,
               "Audio packet does not fit the pipe buffer declared in r_usb_paudio_config.h");
@@ -202,6 +202,18 @@ constexpr uint32_t kStemChannels = deluge::processing::engines::USBAudioStream::
 int32_t stemAccumulator[kStemChannels][kStemWindowSamples];
 int32_t stemSnapshot[kStemWindowSamples * 2];
 uint32_t stemWindowSamples = 0;
+
+/// DIAGNOSTIC, and it goes when the routing interface arrives. Which track each channel is carrying and how loud
+/// it has been, printed once a second.
+///
+/// The assignment is by position in the song's own output list, which is not the order the tracks appear on
+/// screen and is not something a user can see. Until it is a setting they choose, the machine has to say what it
+/// chose - reading it off the recording is guesswork, and guessing is what made this necessary.
+constexpr bool kReportStemMap = true;
+constexpr uint32_t kStemNameChars = 10;
+char stemName[deluge::processing::engines::USBAudioStream::kStemChannels][kStemNameChars + 1] = {};
+int32_t stemPeak[deluge::processing::engines::USBAudioStream::kStemChannels] = {};
+uint32_t stemMapCountdown = 0;
 
 /// Free-running, not masked to the ring - they are masked only where they index it. Masked pointers make an
 /// overtaking reader indistinguishable from a full ring, which cost this build a whole session on 2026-08-26.
@@ -1982,6 +1994,58 @@ void stopAudioWriteTimer() {
 	audioTimerRunning = false;
 }
 
+/// DIAGNOSTIC. One line naming every channel's track and the loudest thing it carried since the last line.
+void reportStemMap() {
+	if (!kReportStemMap || Debug::midiDebugCable == nullptr) {
+		return;
+	}
+	// The scheduler runs this at a few hundred hertz; the map changes only when the song does.
+	if (++stemMapCountdown < 600u) {
+		return;
+	}
+	stemMapCountdown = 0;
+
+	// Eight entries of "c8:nameXXXXXX=32767 " is 8 x 21, and the header is 8 more. Counted rather than asserted,
+	// because a debug line that outgrew its buffer froze this machine once already.
+	char line[8 + deluge::processing::engines::USBAudioStream::kStemChannels * (kStemNameChars + 12) + 1];
+	uint32_t at = 0;
+	const auto put = [&](const char* text) {
+		for (uint32_t i = 0; text[i] != 0 && at + 1 < sizeof(line); i++) {
+			line[at++] = text[i];
+		}
+	};
+	const auto putNumber = [&](int32_t value) {
+		char digits[12];
+		uint32_t n = 0;
+		if (value < 0) {
+			put("-");
+			value = -value;
+		}
+		do {
+			digits[n++] = (char)('0' + (value % 10));
+			value /= 10;
+		} while (value != 0 && n < sizeof(digits));
+		while (n > 0 && at + 1 < sizeof(line)) {
+			line[at++] = digits[--n];
+		}
+	};
+
+	put("SM");
+	for (uint32_t c = 0; c < kStemChannels; c++) {
+		put(" c");
+		putNumber((int32_t)(c + 1));
+		put(":");
+		put(stemName[c][0] != 0 ? stemName[c] : "-");
+		put("=");
+		// Reported at the scale the channel reaches the host on, so a figure here and a peak read off the
+		// recording are the same number rather than two that have to be reconciled.
+		putNumber(lshiftAndSaturate<AUDIO_OUTPUT_GAIN_DOUBLINGS>(stemPeak[c] >> 1) >> 16);
+		stemPeak[c] = 0;
+	}
+	line[at] = 0;
+	Debug::sysexDebugPrint(*Debug::midiDebugCable, line, true);
+}
+
 } // namespace
 
 namespace deluge::processing::engines {
@@ -1991,6 +2055,9 @@ void USBAudioStream::routine() {
 		drainSetupTrace();
 		reportStats();
 	}
+	// Outside the gate: this is the report that says which track each channel is carrying, and it is needed
+	// precisely when the instruments are off and real audio is on those channels.
+	reportStemMap();
 	service();
 }
 
@@ -2178,13 +2245,33 @@ void USBAudioStream::captureStem(uint32_t channel, const int32_t* mixNow, uint32
 	}
 	const int32_t* const snapshot = stemSnapshot;
 	int32_t* const out = stemAccumulator[channel];
+	int32_t peak = stemPeak[channel];
 	for (uint32_t i = 0; i < numSamples; i++) {
 		// The track's own contribution, left and right, taken as what it added to the mix rather than by rendering
 		// it a second time. Halved on the way to mono so a centred track keeps its level rather than doubling it.
 		const int32_t l = mixNow[i * 2] - snapshot[i * 2];
 		const int32_t r = mixNow[i * 2 + 1] - snapshot[i * 2 + 1];
-		out[i] += (l >> 1) + (r >> 1);
+		const int32_t mono = (l >> 1) + (r >> 1);
+		out[i] += mono;
+		// Taken here rather than off the accumulator, so a channel nothing ever wrote to and a channel written
+		// with silence are told apart by the name beside it rather than by the number alone.
+		const int32_t magnitude = (mono < 0) ? -mono : mono;
+		if (magnitude > peak) {
+			peak = magnitude;
+		}
 	}
+	stemPeak[channel] = peak;
+}
+
+void USBAudioStream::noteStemTrack(uint32_t channel, const char* name) {
+	if (!kReportStemMap || channel >= kStemChannels || name == nullptr) {
+		return;
+	}
+	uint32_t i = 0;
+	for (; i < kStemNameChars && name[i] != 0; i++) {
+		stemName[channel][i] = name[i];
+	}
+	stemName[channel][i] = 0;
 }
 
 uint32_t USBAudioStream::stemChannelForOutput(uint32_t outputIndex) {
@@ -2216,7 +2303,10 @@ void USBAudioStream::feedMix(const StereoSample* mix, uint32_t numSamples, uint3
 		frame[0] = (int16_t)(mix[i].l >> 16);
 		frame[1] = (int16_t)(mix[i].r >> 16);
 		if constexpr (!kDiagnostics) {
-			// One mono track a channel, at the same scale the mix above reaches the host on.
+			// One mono track a channel, across the whole frame, at the scale the mix would have reached the host
+			// on. The mix written just above is overwritten by channels 1 and 2 of this - it stays in the code
+			// because the instruments below need it and because a mix source is what an assignment interface will
+			// route here.
 			//
 			// The song's own volume, its master filters and its compressor are all applied after the point these
 			// were captured, so a stem is the track as the song mixes it and not as the master fader leaves it -
@@ -2224,14 +2314,14 @@ void USBAudioStream::feedMix(const StereoSample* mix, uint32_t numSamples, uint3
 			const uint32_t stemIndex = renderOffset + i;
 			if (stemIndex < stemWindowSamples) {
 				for (uint32_t c = 0; c < kStemChannels; c++) {
-					frame[2 + c] =
+					frame[c] =
 					    (int16_t)(lshiftAndSaturate<AUDIO_OUTPUT_GAIN_DOUBLINGS>(stemAccumulator[c][stemIndex] >> 1)
 					              >> 16);
 				}
 			}
 			else {
 				for (uint32_t c = 0; c < kStemChannels; c++) {
-					frame[2 + c] = 0;
+					frame[c] = 0;
 				}
 			}
 		}
