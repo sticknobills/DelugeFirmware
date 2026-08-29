@@ -314,6 +314,39 @@ uint32_t statResyncOvertaken = 0;
 int32_t statWorstOvertake = 0;
 uint32_t statReportCountdown = 0;
 
+/// DIAGNOSTIC. What each hot path actually costs, in CPU cycles, so the engine load this build carries can be
+/// attributed rather than inferred.
+///
+/// The 2026-08-29 reading that the cost is interrupt-bound came from one build that moved four things at once -
+/// timer fires, FIFO writes, packet builds and ring traffic - so it cannot say which of them the instrument pays
+/// for. These do, directly. Cortex-A9 PMU cycle counter, 400 MHz, 2.5 ns a tick.
+///
+/// Two of the six are nested inside others and must not be added to them: fifoWrite sits inside timer, and build
+/// and submit both sit inside service.
+struct PathCost {
+	uint32_t cycles;
+	uint32_t calls;
+};
+PathCost costTimer = {};     ///< the whole write-timer interrupt, every branch including the ones that do nothing
+PathCost costFifoWrite = {}; ///< the FIFO copy alone, nested inside costTimer
+PathCost costService = {};   ///< all of service(), which the audio task is billed for and direness is read from
+PathCost costBuild = {};     ///< buildQueuedPackets, ring memcpy included, nested inside costService
+PathCost costSubmit = {};    ///< the driver's own submit path, nested inside costService
+PathCost costFeedMix = {};   ///< the producer writing the SDRAM ring, inside the audio routine
+
+/// Cycle count at the last report, so every figure above is divided by a clock rather than by an assumed second.
+/// The report fires every 1000 task passes and the task rate breathes, which has manufactured a phantom result
+/// here before.
+uint32_t costIntervalStart = 0;
+bool costCounterEnabled = false;
+
+/// Unsigned throughout, so the counter's 10.7 s wrap needs no detecting: the difference is right across it as
+/// long as the span itself is shorter than that, which every span here is by four orders of magnitude.
+[[gnu::always_inline]] inline void addCost(PathCost& c, uint32_t start) {
+	c.cycles += Debug::readCycleCounter() - start;
+	c.calls++;
+}
+
 /// Branch counters. "Nothing was sent" cannot distinguish the task never running, the task
 /// returning because a transfer is still outstanding, and the task sending silence because the
 /// ring looked empty - and those want three different fixes. Counting the branch taken is what
@@ -1225,6 +1258,68 @@ void reportStats() {
 		Debug::sysexDebugPrint(*Debug::midiDebugCable, ptrLine, true);
 	}
 
+	// DIAGNOSTIC. Where the CPU this build costs the instrument actually goes, so the next change is aimed at a
+	// measured share rather than at the one candidate that got tested. Own buffer for the reason the others carry.
+	//
+	// 256: "AUX el" plus ten digits is 16, and six fields of a four-character tag, a colon and three ten-digit
+	// numbers separated by commas is 6 x 38 = 228. 244 worst case, and the two refusal lines are shorter than
+	// either.
+	{
+		char costLine[256];
+		p = costLine;
+		// A counter that was never enabled reads a constant, and a constant produces a confident zero on every
+		// field below rather than an error. Two reads that come back equal mean the instrument is dead, and it
+		// says so instead of answering.
+		const uint32_t live0 = Debug::readCycleCounter();
+		const uint32_t live1 = Debug::readCycleCounter();
+		const uint32_t elapsed = live1 - costIntervalStart;
+		// Nested paths deliberately excluded: fifoWrite is inside timer, build and submit are inside service.
+		const uint64_t topLevel =
+		    (uint64_t)costTimer.cycles + (uint64_t)costService.cycles + (uint64_t)costFeedMix.cycles;
+		if (live1 == live0) {
+			emit("AUX dead");
+		}
+		else if (elapsed == 0u || topLevel > (uint64_t)elapsed) {
+			// The interval outran the counter's 10.7 s wrap, or something is being double-counted. Either way the
+			// ratio would be arithmetic on a wrong denominator, so print the raw cycles and refuse the ratio.
+			emit("AUX bad el");
+			emitDec(elapsed);
+			emit(" top");
+			emitDec((uint32_t)topLevel);
+		}
+		else {
+			// Each field is <tag>:<parts per thousand of wall time>,<calls this interval>,<mean cycles per call>.
+			// Per mille rather than per cent because two of these are expected to land under 1%, and a mean per
+			// call because a path that is expensive per event and a path that is merely frequent want opposite
+			// fixes.
+			auto emitCost = [&emit, &emitDec, elapsed](const char* tag, const PathCost& c) {
+				emit(tag);
+				emitDec((uint32_t)(((uint64_t)c.cycles * 1000u) / elapsed));
+				emit(",");
+				emitDec(c.calls);
+				emit(",");
+				emitDec(c.calls ? (c.cycles / c.calls) : 0u);
+			};
+			emit("AUX el");
+			emitDec(elapsed / 400u); ///< the interval in us, at 400 MHz
+			emitCost(" tim:", costTimer);
+			emitCost(" fifo:", costFifoWrite);
+			emitCost(" svc:", costService);
+			emitCost(" bld:", costBuild);
+			emitCost(" sub:", costSubmit);
+			emitCost(" mix:", costFeedMix);
+		}
+		*p = '\0';
+		Debug::sysexDebugPrint(*Debug::midiDebugCable, costLine, true);
+		costIntervalStart = live1;
+		costTimer = PathCost{};
+		costFifoWrite = PathCost{};
+		costService = PathCost{};
+		costBuild = PathCost{};
+		costSubmit = PathCost{};
+		costFeedMix = PathCost{};
+	}
+
 	statPacketsSent = 0;
 	statFramesSent = 0;
 	statFramesIn = 0;
@@ -1309,7 +1404,7 @@ void restoreFifoPort(uint16_t savedSel, uint16_t savedShadow) {
 	} while ((seen & (kFifoSelIsel | kFifoSelCurPipe)) != (savedSel & (kFifoSelIsel | kFifoSelCurPipe)));
 }
 
-void audioWriteTimerInterrupt(uint32_t /*intSense*/) {
+void audioWriteTimerBody() {
 	timerClearCompareMatchTGRA(kAudioWriteTimer);
 	statTimerFires++;
 
@@ -1369,10 +1464,13 @@ void audioWriteTimerInterrupt(uint32_t /*intSense*/) {
 		}
 
 		QueuedPacket& q = packetQueue[queueRead % kQueueSlots];
+		// DIAGNOSTIC. The copy alone, which is the only part of this handler DMA could take over.
+		const uint32_t fifoStart = Debug::readCycleCounter();
 		usb_pstd_write_fifo(q.bytes, kUseCpuFifo, q.data);
 		if ((hw_usb_read_fifoctr(nullptr, kUseCpuFifo) & kFifoCtrBval) == 0u) {
 			hw_usb_set_bval(nullptr, kUseCpuFifo);
 		}
+		addCost(costFifoWrite, fifoStart);
 		if (borrowed) {
 			restoreFifoPort(savedSel, savedShadow);
 			statPortBorrowed++;
@@ -1387,8 +1485,18 @@ void audioWriteTimerInterrupt(uint32_t /*intSense*/) {
 	}
 }
 
+/// DIAGNOSTIC. Split from the body above only so that every one of its early returns is timed, rather than the
+/// branches that do work being the only ones counted. A fire that finds nothing to do still costs an interrupt
+/// entry and exit, and whether that is the expense is the question this build exists to answer.
+void audioWriteTimerInterrupt(uint32_t /*intSense*/) {
+	const uint32_t start = Debug::readCycleCounter();
+	audioWriteTimerBody();
+	addCost(costTimer, start);
+}
+
 /// Fills the queue from the task, where the copy is affordable.
 void buildQueuedPackets() {
+	const uint32_t start = Debug::readCycleCounter();
 	while ((uint32_t)(queueWrite - queueRead) < kQueueSlots) {
 		QueuedPacket& q = packetQueue[queueWrite % kQueueSlots];
 		const uint32_t frames = buildNextPacket(q.data);
@@ -1398,6 +1506,9 @@ void buildQueuedPackets() {
 		queueWrite++;
 		statQueueBuilt++;
 	}
+	// Counted once per call rather than once per packet built, so the mean below is the cost of a whole refill -
+	// which is what the audio task actually waits for.
+	addCost(costBuild, start);
 }
 
 /// Called from the peripheral interrupt handler's frame branch, on the host's own clock, 1000 times a second.
@@ -1463,7 +1574,11 @@ void USBAudioStream::routine() {
 
 /// Split from routine() so the audio engine can service the transport without also emitting a SysEx report at the
 /// engine's own rate. The diagnostics stay on the scheduler's ~600 Hz; this runs at both that and the engine's.
-void USBAudioStream::service() {
+///
+/// DIAGNOSTIC. The body is separated from USBAudioStream::service() below only so that its early returns are
+/// timed with the rest. This is the path the audio task is billed for, and direness is read straight off that
+/// bill, so it is the single most important of the six figures.
+static void serviceBody() {
 	if (!ringCleared) {
 		memset(ring, 0, sizeof(ring));
 		// DIAGNOSTIC. Channels 3 upwards get a distinct constant, written here and never touched by the
@@ -1548,9 +1663,11 @@ void USBAudioStream::service() {
 	// Interrupts off across the driver's own FIFO write, which is also what keeps the timer out of it: the two
 	// share a FIFO port, and two writers there truncate a packet into a part-frame that rotates the host's
 	// channel mapping permanently.
+	const uint32_t submitStart = Debug::readCycleCounter();
 	DISABLE_ALL_INTERRUPTS();
 	sendNextPacket();
 	ENABLE_ALL_INTERRUPTS();
+	addCost(costSubmit, submitStart);
 	firstPacketSubmitted = transferInFlight;
 	// Started only once a host is actually streaming and the driver's own first transfer is set up, so an idle
 	// Deluge pays nothing and the timer never fires against an unconfigured pipe.
@@ -1561,10 +1678,28 @@ void USBAudioStream::service() {
 	}
 }
 
+void USBAudioStream::service() {
+	// The cycle counter is off in a release build - Debug::init() is only reached under a trace flag - so an
+	// uninitialised counter reads a constant and every figure here would be a silent zero. Enabled once, here,
+	// before anything is timed.
+	if (!costCounterEnabled) {
+		Debug::init();
+		costCounterEnabled = true;
+		costIntervalStart = Debug::readCycleCounter();
+	}
+	const uint32_t start = Debug::readCycleCounter();
+	serviceBody();
+	addCost(costService, start);
+}
+
 void USBAudioStream::feedMix(const StereoSample* mix, uint32_t numSamples) {
+	// DIAGNOSTIC. Taken before the early return, not after: what an installed-but-idle build costs is one of the
+	// things being separated, and a timer that starts after the guard can never see it.
+	const uint32_t costStart = Debug::readCycleCounter();
 	// Nothing is listening, so do not pay for the conversion. While stopped the consumer parks the read pointer
 	// on the write pointer every pass, so the ring cannot look full to the first host that arrives.
 	if (!streamActive || numSamples == 0 || mix == nullptr) {
+		addCost(costFeedMix, costStart);
 		return;
 	}
 
@@ -1596,6 +1731,7 @@ void USBAudioStream::feedMix(const StereoSample* mix, uint32_t numSamples) {
 		w++;
 	}
 	writeFrame = w;
+	addCost(costFeedMix, costStart);
 }
 
 } // namespace deluge::processing::engines
