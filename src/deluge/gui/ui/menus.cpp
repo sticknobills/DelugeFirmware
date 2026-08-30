@@ -223,6 +223,7 @@
 #include "gui/menu_item/unison/stereoSpread.h"
 #include "gui/menu_item/unpatched_param.h"
 #include "gui/menu_item/unpatched_param/pan.h"
+#include "gui/menu_item/usb_audio/routing.h"
 #include "gui/menu_item/voice/polyphony.h"
 #include "gui/menu_item/voice/portamento.h"
 #include "gui/menu_item/voice/priority.h"
@@ -1518,6 +1519,57 @@ PLACE_SDRAM_BSS Submenu soundEditorRootDrumActionsMenu{
     {&drumNameEditMenu, &sample0RecorderMenu, &sample1RecorderMenu},
 };
 
+// USB audio routing - per clip. Thirteen destinations and the main-mix switch, all toggles, so the whole thing
+// renders as dots on 7SEG and ticks on OLED without any drawing code of its own.
+//
+// A single channel carries the clip summed to mono; a pair carries left on the lower channel and right on the
+// upper. Both may be on at once, and several clips may name one channel, in which case they add there.
+PLACE_SDRAM_BSS usb_audio::ChannelToggle usbChannel1Menu{STRING_FOR_USB_CHANNEL_1, STRING_FOR_USB_CHANNEL_1,
+                                                         UsbRoute::CH1};
+PLACE_SDRAM_BSS usb_audio::ChannelToggle usbChannel2Menu{STRING_FOR_USB_CHANNEL_2, STRING_FOR_USB_CHANNEL_2,
+                                                         UsbRoute::CH2};
+PLACE_SDRAM_BSS usb_audio::ChannelToggle usbChannel3Menu{STRING_FOR_USB_CHANNEL_3, STRING_FOR_USB_CHANNEL_3,
+                                                         UsbRoute::CH3};
+PLACE_SDRAM_BSS usb_audio::ChannelToggle usbChannel4Menu{STRING_FOR_USB_CHANNEL_4, STRING_FOR_USB_CHANNEL_4,
+                                                         UsbRoute::CH4};
+PLACE_SDRAM_BSS usb_audio::ChannelToggle usbChannel5Menu{STRING_FOR_USB_CHANNEL_5, STRING_FOR_USB_CHANNEL_5,
+                                                         UsbRoute::CH5};
+PLACE_SDRAM_BSS usb_audio::ChannelToggle usbChannel6Menu{STRING_FOR_USB_CHANNEL_6, STRING_FOR_USB_CHANNEL_6,
+                                                         UsbRoute::CH6};
+PLACE_SDRAM_BSS usb_audio::ChannelToggle usbChannel7Menu{STRING_FOR_USB_CHANNEL_7, STRING_FOR_USB_CHANNEL_7,
+                                                         UsbRoute::CH7};
+PLACE_SDRAM_BSS usb_audio::ChannelToggle usbChannel8Menu{STRING_FOR_USB_CHANNEL_8, STRING_FOR_USB_CHANNEL_8,
+                                                         UsbRoute::CH8};
+PLACE_SDRAM_BSS usb_audio::ChannelToggle usbPair12Menu{STRING_FOR_USB_PAIR_12, STRING_FOR_USB_PAIR_12,
+                                                       UsbRoute::PAIR12};
+PLACE_SDRAM_BSS usb_audio::ChannelToggle usbPair34Menu{STRING_FOR_USB_PAIR_34, STRING_FOR_USB_PAIR_34,
+                                                       UsbRoute::PAIR34};
+PLACE_SDRAM_BSS usb_audio::ChannelToggle usbPair56Menu{STRING_FOR_USB_PAIR_56, STRING_FOR_USB_PAIR_56,
+                                                       UsbRoute::PAIR56};
+PLACE_SDRAM_BSS usb_audio::ChannelToggle usbPair78Menu{STRING_FOR_USB_PAIR_78, STRING_FOR_USB_PAIR_78,
+                                                       UsbRoute::PAIR78};
+PLACE_SDRAM_BSS usb_audio::MainToggle usbMainMenu{STRING_FOR_USB_MAIN, STRING_FOR_USB_MAIN};
+
+PLACE_SDRAM_BSS usb_audio::RoutingSubmenu usbRoutingMenu{
+    STRING_FOR_USB_ROUTING,
+    STRING_FOR_USB_ROUTING,
+    {
+        &usbChannel1Menu,
+        &usbChannel2Menu,
+        &usbChannel3Menu,
+        &usbChannel4Menu,
+        &usbChannel5Menu,
+        &usbChannel6Menu,
+        &usbChannel7Menu,
+        &usbChannel8Menu,
+        &usbPair12Menu,
+        &usbPair34Menu,
+        &usbPair56Menu,
+        &usbPair78Menu,
+        &usbMainMenu,
+    },
+};
+
 PLACE_SDRAM_BSS Submenu soundEditorRootMenu{
     STRING_FOR_SOUND,
     {
@@ -1548,6 +1600,7 @@ PLACE_SDRAM_BSS Submenu soundEditorRootMenu{
         &patchCablesMenu,
         &sequenceDirectionMenu,
         &outputMidiSubmenu,
+        &usbRoutingMenu,
     },
 };
 
@@ -1745,6 +1798,7 @@ PLACE_SDRAM_BSS menu_item::Submenu soundEditorRootMenuAudioClip{
         &audioClipSampleMenu,
         &audioClipAttackMenu,
         &priorityMenu,
+        &usbRoutingMenu,
     },
 };
 
@@ -1892,6 +1946,19 @@ PLACE_SDRAM_BSS menu_item::Submenu soundEditorRootMenuKitGlobalFX{
         &globalFiltersMenu,
         &globalFXMenu,
         &globalSidechainMenu,
+        &usbRoutingMenu,
+    },
+};
+
+// USB audio, machine-wide. The trim is here rather than on a clip because it describes the gain staging of what
+// is on the other end of the cable, not anything about the song.
+PLACE_SDRAM_BSS usb_audio::Level usbAudioLevelMenu{STRING_FOR_USB_LEVEL, STRING_FOR_USB_LEVEL};
+
+PLACE_SDRAM_BSS Submenu usbAudioSettingsMenu{
+    STRING_FOR_USB_ROUTING,
+    STRING_FOR_USB_ROUTING,
+    {
+        &usbAudioLevelMenu,
     },
 };
 
@@ -1902,6 +1969,7 @@ PLACE_SDRAM_BSS Submenu settingsRootMenu{
         &settingsActionsSubmenu,
         &cvSelectionMenu,
         &gateSelectionMenu,
+        &usbAudioSettingsMenu,
         &triggerClockMenu,
         &midiMenu,
         &defaultsSubmenu,
