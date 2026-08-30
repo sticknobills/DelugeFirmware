@@ -49,6 +49,7 @@ Clip::Clip(ClipType newType) : type(newType) {
 	wasActiveBefore = false; // Want to set this default in case a Clip was created during playback
 
 	section = 0;
+	usbRouting = UsbRoute::DEFAULT;
 	output = nullptr;
 	beingRecordedFromClip = nullptr;
 	isPendingOverdub = false;
@@ -104,6 +105,7 @@ void Clip::copyBasicsFrom(Clip const* otherClip) {
 	section = otherClip->section;
 	launchStyle = otherClip->launchStyle;
 	onAutomationClipView = otherClip->onAutomationClipView;
+	usbRouting = otherClip->usbRouting;
 }
 
 void Clip::setupForRecordingAsAutoOverdub(Clip* existingClip, Song* song, OverDubType newOverdubNature) {
@@ -687,6 +689,11 @@ void Clip::writeDataToFile(Serializer& writer, Song* song) {
 	if (launchStyle != LaunchStyle::DEFAULT) {
 		writer.writeAttribute("launchStyle", launchStyleToString(launchStyle));
 	}
+	// Written only when it says something, so a song that never touches USB routing saves byte-identical to one
+	// saved by stock firmware.
+	if (usbRouting != UsbRoute::DEFAULT) {
+		writer.writeAttribute("usbRouting", usbRouting);
+	}
 }
 
 void Clip::writeMidiCommandsToFile(Serializer& writer, Song* song) {
@@ -727,6 +734,11 @@ void Clip::readTagFromFile(Deserializer& reader, char const* tagName, Song* song
 
 	else if (!strcmp(tagName, "colourOffset")) {
 		colourOffset = reader.readTagOrAttributeValueInt();
+	}
+
+	else if (!strcmp(tagName, "usbRouting")) {
+		// Masked: a later firmware may define bits this one does not, and an unknown bit must not route anywhere.
+		usbRouting = (uint16_t)(reader.readTagOrAttributeValueInt() & UsbRoute::ALL);
 	}
 
 	else if (!strcmp(tagName, "beingEdited")) {

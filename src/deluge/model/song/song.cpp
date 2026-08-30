@@ -2489,13 +2489,9 @@ void Song::renderAudio(std::span<StereoSample> outputBuffer, int32_t* reverbBuff
 	ModelStack* modelStack = setupModelStackWithSong(modelStackMemory, this);
 
 	AudioEngine::logAction("Start output render");
-	// Counts every output the loop considers, valid or not, so a track's channel does not move when another one
-	// falls out of a valid state mid-song. Provisional assignment - see USBAudioStream::stemChannelForOutput.
-	uint32_t outputIndex = 0;
 	const bool captureStems = deluge::processing::engines::USBAudioStream::stemsWanted();
 	const uint32_t outputLoopStart = deluge::processing::engines::USBAudioStream::costMark();
 	for (Output* output = firstOutput; output; output = output->next) {
-		const uint32_t thisOutputIndex = outputIndex++;
 		if (!output->inValidState) {
 			continue;
 		}
@@ -2505,25 +2501,32 @@ void Song::renderAudio(std::span<StereoSample> outputBuffer, int32_t* reverbBuff
 		ENTER_CRITICAL_SECTION();
 		if (output->shouldRenderInSong()) {
 			// This track's own audio, taken as the difference it makes to the mix rather than by rendering it a
-			// second time. Nothing about how it renders changes, and the failure mode is a silent stem channel
+			// second time. Nothing about how it renders changes, and the failure mode is a silent USB channel
 			// rather than a damaged mix.
-			const uint32_t stemChannel =
-			    captureStems ? deluge::processing::engines::USBAudioStream::stemChannelForOutput(thisOutputIndex)
-			                 : deluge::processing::engines::USBAudioStream::kNoStem;
+			//
+			// The routing is read off whichever clip is playing on this track, because the difference this
+			// bracket measures is the whole track's render and there is only one of those.
+			Clip* const routingClip = output->getActiveClip();
+			const uint16_t route = routingClip ? routingClip->usbRouting : (uint16_t)UsbRoute::DEFAULT;
+			const bool capture = captureStems && deluge::processing::engines::USBAudioStream::routeWantsCapture(route);
 			const uint32_t numSamples = (uint32_t)outputBuffer.size();
 			int32_t* const mixRaw = (int32_t*)outputBuffer.data();
-			if (stemChannel != deluge::processing::engines::USBAudioStream::kNoStem) {
+			if (capture) {
 				deluge::processing::engines::USBAudioStream::snapshotBeforeTrack(mixRaw, numSamples);
-				deluge::processing::engines::USBAudioStream::noteStemTrack(stemChannel, output->name.get());
 			}
 
 			output->renderOutput(modelStack, outputBuffer, reverbBuffer, volumePostFX >> 1, sideChainHitPending,
 			                     !isClipActiveNow, isClipActiveNow);
 
-			if (stemChannel != deluge::processing::engines::USBAudioStream::kNoStem) {
+			if (capture) {
 				// Its reverb send is not in here: that went into the shared reverb buffer during the render and is
 				// mixed in much later, so a stem carries the track dry.
-				deluge::processing::engines::USBAudioStream::captureStem(stemChannel, mixRaw, numSamples);
+				deluge::processing::engines::USBAudioStream::captureStem(route, mixRaw, numSamples);
+				if ((route & UsbRoute::MAIN) == 0) {
+					// Taken back out of the mix, after its copy has been made. Its reverb tail still reaches the
+					// main outputs - that went into a shared buffer and cannot be unpicked from here.
+					deluge::processing::engines::USBAudioStream::removeTrackFromMix(mixRaw, numSamples);
+				}
 			}
 		}
 		EXIT_CRITICAL_SECTION();

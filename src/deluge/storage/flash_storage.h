@@ -84,6 +84,10 @@ extern ScreensaverMode screensaverMode;
 /// kMaxScreensaverTimeoutMinutes.
 extern uint8_t screensaverTimeoutMinutes;
 
+/// Trim applied to every USB audio channel, 0-50. Per-machine, because it describes the gain staging of whatever
+/// is on the other end of the cable rather than anything about the song.
+extern uint8_t usbAudioTrim;
+
 extern ThresholdRecordingMode defaultThresholdRecordingMode;
 
 extern Polarity defaultPatchCablePolarity;

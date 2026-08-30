@@ -20,6 +20,7 @@
 #include "dsp/stereo_sample.h"
 #include "io/debug/print.h"
 #include "io/midi/sysex.h"
+#include "model/clip/clip.h"
 #include "util/functions.h"
 #include <cstdint>
 #include <cstring>
@@ -212,17 +213,23 @@ int32_t stemAccumulator[kStemChannels][kStemWindowSamples];
 int32_t stemSnapshot[kStemWindowSamples * 2];
 uint32_t stemWindowSamples = 0;
 
-/// DIAGNOSTIC, and it goes when the routing interface arrives. Which track each channel is carrying and how loud
-/// it has been, printed once a second.
+/// Which channels have been written this window, so the first clip to name a channel assigns and any after it add.
 ///
-/// The assignment is by position in the song's own output list, which is not the order the tracks appear on
-/// screen and is not something a user can see. Until it is a setting they choose, the machine has to say what it
-/// chose - reading it off the recording is guesswork, and guessing is what made this necessary.
-constexpr bool kReportStemMap = true;
-constexpr uint32_t kStemNameChars = 10;
-char stemName[deluge::processing::engines::USBAudioStream::kStemChannels][kStemNameChars + 1] = {};
-int32_t stemPeak[deluge::processing::engines::USBAudioStream::kStemChannels] = {};
-uint32_t stemMapCountdown = 0;
+/// The assigning walk is 3.8x the accumulating one, because assignment lets the compiler keep the whole loop in
+/// vector registers. Sharing a channel is legal and costs the difference, but only on channels actually shared.
+uint16_t channelsWritten = 0;
+
+/// Trim applied to every stem on the way to 16 bit. Held as a multiplier so the hot path is one multiply and a
+/// shift rather than a table lookup or a branch.
+uint32_t stemTrimSetting = deluge::processing::engines::USBAudioStream::kTrimDefault;
+int32_t stemTrimMultiplier = 1 << 24;
+
+/// The loudest thing any stem has carried since it was last read, at capture scale.
+///
+/// Taken before the width reduction, so it reads true on a stem the current trim would clip - which is the whole
+/// point of it. A peak read off a clipped recording only ever says "full scale".
+int32_t stemPeakAll = 0;
+uint32_t stemPeakCountdown = 0;
 
 /// Free-running, not masked to the ring - they are masked only where they index it. Masked pointers make an
 /// overtaking reader indistinguishable from a full ring, which cost this build a whole session on 2026-08-26.
@@ -1203,6 +1210,57 @@ void drainSetupTrace() {
 	Debug::sysexDebugPrint(*Debug::midiDebugCable, line, true);
 }
 
+/// DIAGNOSTIC. The loudest thing any channel has carried since the last line, at capture scale and therefore
+/// before the trim and the width reduction that would clip it.
+///
+/// Its own line rather than a field on the cost line, which already runs 243 of its 256 bytes with three of its
+/// counters still climbing - a debug line that outgrew its buffer froze this machine once already.
+///
+/// This is the instrument the trim is set from: 32767 here means the stem would have flat-topped at unity, and
+/// what the trim has to do is bring it under that with room to spare.
+void reportStemPeak() {
+	if (!kDiagnostics || Debug::midiDebugCable == nullptr) {
+		return;
+	}
+	// The scheduler runs this at a few hundred hertz; a peak-hold wants to be read at about the rate a person can
+	// read it.
+	if (++stemPeakCountdown < 600u) {
+		return;
+	}
+	stemPeakCountdown = 0;
+
+	// "SP pk4294967295 tr50" is 20 characters. Sized for both fields at their full width rather than for the line
+	// as it reads today.
+	char line[32];
+	uint32_t at = 0;
+	const auto put = [&](const char* text) {
+		for (uint32_t i = 0; text[i] != 0 && at + 1 < sizeof(line); i++) {
+			line[at++] = text[i];
+		}
+	};
+	const auto putNumber = [&](uint32_t value) {
+		char digits[12];
+		uint32_t n = 0;
+		do {
+			digits[n++] = (char)('0' + (value % 10));
+			value /= 10;
+		} while (value != 0 && n < sizeof(digits));
+		while (n > 0 && at + 1 < sizeof(line)) {
+			line[at++] = digits[--n];
+		}
+	};
+
+	const int32_t peak = deluge::processing::engines::USBAudioStream::readAndClearStemPeak();
+	put("SP pk");
+	// At the scale a channel would reach the host on with no trim, so this figure and a peak read off a recording
+	// are the same number rather than two that have to be reconciled.
+	putNumber((uint32_t)(lshiftAndSaturate<AUDIO_OUTPUT_GAIN_DOUBLINGS>(peak >> 1) >> 16));
+	put(" tr");
+	putNumber(deluge::processing::engines::USBAudioStream::getTrim());
+	line[at] = 0;
+	Debug::sysexDebugPrint(*Debug::midiDebugCable, line, true);
+}
+
 /// One line a second while the debug channel is on: how much audio actually left, and how often the ring was
 /// empty or had to be snapped back. A gap-free stream reports rising packets with underruns and resyncs at zero.
 void reportStats() {
@@ -2037,58 +2095,6 @@ void stopAudioWriteTimer() {
 	audioTimerRunning = false;
 }
 
-/// DIAGNOSTIC. One line naming every channel's track and the loudest thing it carried since the last line.
-void reportStemMap() {
-	if (!kReportStemMap || Debug::midiDebugCable == nullptr) {
-		return;
-	}
-	// The scheduler runs this at a few hundred hertz; the map changes only when the song does.
-	if (++stemMapCountdown < 600u) {
-		return;
-	}
-	stemMapCountdown = 0;
-
-	// Eight entries of "c8:nameXXXXXX=32767 " is 8 x 21, and the header is 8 more. Counted rather than asserted,
-	// because a debug line that outgrew its buffer froze this machine once already.
-	char line[8 + deluge::processing::engines::USBAudioStream::kStemChannels * (kStemNameChars + 12) + 1];
-	uint32_t at = 0;
-	const auto put = [&](const char* text) {
-		for (uint32_t i = 0; text[i] != 0 && at + 1 < sizeof(line); i++) {
-			line[at++] = text[i];
-		}
-	};
-	const auto putNumber = [&](int32_t value) {
-		char digits[12];
-		uint32_t n = 0;
-		if (value < 0) {
-			put("-");
-			value = -value;
-		}
-		do {
-			digits[n++] = (char)('0' + (value % 10));
-			value /= 10;
-		} while (value != 0 && n < sizeof(digits));
-		while (n > 0 && at + 1 < sizeof(line)) {
-			line[at++] = digits[--n];
-		}
-	};
-
-	put("SM");
-	for (uint32_t c = 0; c < kStemChannels; c++) {
-		put(" c");
-		putNumber((int32_t)(c + 1));
-		put(":");
-		put(stemName[c][0] != 0 ? stemName[c] : "-");
-		put("=");
-		// Reported at the scale the channel reaches the host on, so a figure here and a peak read off the
-		// recording are the same number rather than two that have to be reconciled.
-		putNumber(lshiftAndSaturate<AUDIO_OUTPUT_GAIN_DOUBLINGS>(stemPeak[c] >> 1) >> 16);
-		stemPeak[c] = 0;
-	}
-	line[at] = 0;
-	Debug::sysexDebugPrint(*Debug::midiDebugCable, line, true);
-}
-
 } // namespace
 
 namespace deluge::processing::engines {
@@ -2097,10 +2103,8 @@ void USBAudioStream::routine() {
 	if constexpr (kDiagnostics) {
 		drainSetupTrace();
 		reportStats();
+		reportStemPeak();
 	}
-	// Outside the gate: this is the report that says which track each channel is carrying, and it is needed
-	// precisely when the instruments are off and real audio is on those channels.
-	reportStemMap();
 	service();
 }
 
@@ -2267,10 +2271,12 @@ bool USBAudioStream::stemsWanted() {
 void USBAudioStream::beginRender(uint32_t numSamples) {
 	if (!streamActive) {
 		stemWindowSamples = 0;
+		channelsWritten = 0;
 		return;
 	}
 	const uint32_t start = costStart();
 	stemWindowSamples = (numSamples > kStemWindowSamples) ? kStemWindowSamples : numSamples;
+	channelsWritten = 0;
 	for (uint32_t c = 0; c < kStemChannels; c++) {
 		memset(stemAccumulator[c], 0, stemWindowSamples * sizeof(int32_t));
 	}
@@ -2286,52 +2292,158 @@ void USBAudioStream::snapshotBeforeTrack(const int32_t* mixNow, uint32_t numSamp
 	addCost(costStemSnapshot, start);
 }
 
-/// Built at -O3 for the vector unit alone. At the project's -O2 the compiler half-vectorises this and then hands
+/// Built at -O3 for the vector unit alone. At the project's -O2 the compiler half-vectorises these and then hands
 /// each result back to the main processor one sample at a time to store it, which stalls this core's pipeline; at
 /// -O3 it deinterleaves and stores in vector registers throughout. Confirmed in the generated code, not assumed.
-[[gnu::optimize("O3")]] void USBAudioStream::captureStem(uint32_t channel, const int32_t* mixNow, uint32_t numSamples) {
-	if (channel >= kStemChannels || numSamples > stemWindowSamples) {
-		return;
-	}
-	const uint32_t costCaptureStart = costStart();
-	const int32_t* const snapshot = stemSnapshot;
-	int32_t* const out = stemAccumulator[channel];
+///
+/// Four walks rather than one branchy one, for the same reason: a test inside the loop puts the whole thing back
+/// on the main processor. Mono sums the track's two sides; stereo takes one side. Assign is the first writer to a
+/// channel, add is every writer after it.
+namespace {
+
+[[gnu::optimize("O3")]] void walkMonoAssign(int32_t* __restrict out, const int32_t* __restrict mixNow,
+                                            const int32_t* __restrict snapshot, uint32_t numSamples) {
 	for (uint32_t i = 0; i < numSamples; i++) {
-		// The track's own contribution, left and right, taken as what it added to the mix rather than by rendering
-		// it a second time. Halved on the way to mono so a centred track keeps its level rather than doubling it.
-		//
-		// Assigned, not accumulated: a channel carries exactly one track, so there is nothing to add to. The
-		// accumulate was what forced every sample out of the vector unit and back into the main processor, and
-		// that transfer stalls this core - it was most of what made this walk 6.3x a plain copy of the same span.
+		// The track's own contribution, taken as what it added to the mix rather than by rendering it a second
+		// time. Halved on the way to mono so a centred track keeps its level rather than doubling it.
 		const int32_t l = mixNow[i * 2] - snapshot[i * 2];
 		const int32_t r = mixNow[i * 2 + 1] - snapshot[i * 2 + 1];
 		out[i] = (l >> 1) + (r >> 1);
 	}
-	if constexpr (kReportStemMap) {
-		// Its own walk, and only while the map report exists. Folded into the loop above it reintroduces exactly
-		// the transfer that loop was rewritten to avoid - measured in the generated code, not assumed.
-		int32_t peak = stemPeak[channel];
-		for (uint32_t i = 0; i < numSamples; i++) {
-			const int32_t m = out[i];
-			const int32_t magnitude = (m < 0) ? -m : m;
-			if (magnitude > peak) {
-				peak = magnitude;
+}
+
+[[gnu::optimize("O3")]] void walkMonoAdd(int32_t* __restrict out, const int32_t* __restrict mixNow,
+                                         const int32_t* __restrict snapshot, uint32_t numSamples) {
+	for (uint32_t i = 0; i < numSamples; i++) {
+		const int32_t l = mixNow[i * 2] - snapshot[i * 2];
+		const int32_t r = mixNow[i * 2 + 1] - snapshot[i * 2 + 1];
+		out[i] += (l >> 1) + (r >> 1);
+	}
+}
+
+/// side is 0 for left, 1 for right. Not halved: a stereo pair keeps each side whole, because nothing is being
+/// summed into it.
+[[gnu::optimize("O3")]] void walkSideAssign(int32_t* __restrict out, const int32_t* __restrict mixNow,
+                                            const int32_t* __restrict snapshot, uint32_t numSamples, uint32_t side) {
+	for (uint32_t i = 0; i < numSamples; i++) {
+		out[i] = mixNow[i * 2 + side] - snapshot[i * 2 + side];
+	}
+}
+
+[[gnu::optimize("O3")]] void walkSideAdd(int32_t* __restrict out, const int32_t* __restrict mixNow,
+                                         const int32_t* __restrict snapshot, uint32_t numSamples, uint32_t side) {
+	for (uint32_t i = 0; i < numSamples; i++) {
+		out[i] += mixNow[i * 2 + side] - snapshot[i * 2 + side];
+	}
+}
+
+/// Its own walk, and only while the peak instrument is compiled in. Folded into the walks above it reintroduces
+/// exactly the register transfer they were rewritten to avoid - measured in the generated code, not assumed.
+void trackPeak(const int32_t* out, uint32_t numSamples) {
+	int32_t peak = stemPeakAll;
+	for (uint32_t i = 0; i < numSamples; i++) {
+		const int32_t m = out[i];
+		const int32_t magnitude = (m < 0) ? -m : m;
+		if (magnitude > peak) {
+			peak = magnitude;
+		}
+	}
+	stemPeakAll = peak;
+}
+
+} // namespace
+
+bool USBAudioStream::routeWantsCapture(uint16_t route) {
+	return (route & UsbRoute::ANY_USB) != 0 || (route & UsbRoute::MAIN) == 0;
+}
+
+void USBAudioStream::captureStem(uint16_t route, const int32_t* mixNow, uint32_t numSamples) {
+	if (numSamples > stemWindowSamples || (route & UsbRoute::ANY_USB) == 0) {
+		return;
+	}
+	const uint32_t costCaptureStart = costStart();
+	const int32_t* const snapshot = stemSnapshot;
+
+	for (uint32_t c = 0; c < kStemChannels; c++) {
+		if ((route & (UsbRoute::FIRST_MONO << c)) == 0) {
+			continue;
+		}
+		int32_t* const out = stemAccumulator[c];
+		const uint16_t bit = (uint16_t)(1u << c);
+		if ((channelsWritten & bit) == 0) {
+			walkMonoAssign(out, mixNow, snapshot, numSamples);
+			channelsWritten |= bit;
+		}
+		else {
+			walkMonoAdd(out, mixNow, snapshot, numSamples);
+		}
+		if constexpr (kDiagnostics) {
+			trackPeak(out, numSamples);
+		}
+	}
+
+	for (uint32_t pair = 0; pair < kStemChannels / 2; pair++) {
+		if ((route & (UsbRoute::PAIR12 << pair)) == 0) {
+			continue;
+		}
+		for (uint32_t side = 0; side < 2; side++) {
+			const uint32_t c = pair * 2 + side;
+			int32_t* const out = stemAccumulator[c];
+			const uint16_t bit = (uint16_t)(1u << c);
+			if ((channelsWritten & bit) == 0) {
+				walkSideAssign(out, mixNow, snapshot, numSamples, side);
+				channelsWritten |= bit;
+			}
+			else {
+				walkSideAdd(out, mixNow, snapshot, numSamples, side);
+			}
+			if constexpr (kDiagnostics) {
+				trackPeak(out, numSamples);
 			}
 		}
-		stemPeak[channel] = peak;
 	}
+
 	addCost(costStemCapture, costCaptureStart);
 }
 
-void USBAudioStream::noteStemTrack(uint32_t channel, const char* name) {
-	if (!kReportStemMap || channel >= kStemChannels || name == nullptr) {
+void USBAudioStream::removeTrackFromMix(int32_t* mixNow, uint32_t numSamples) {
+	if (numSamples > stemWindowSamples) {
 		return;
 	}
-	uint32_t i = 0;
-	for (; i < kStemNameChars && name[i] != 0; i++) {
-		stemName[channel][i] = name[i];
+	// x - (x - y) = y in two's complement, including on overflow, so putting the snapshot back is exactly
+	// subtracting the track that rendered since it was taken - and it is a copy rather than a walk.
+	const uint32_t start = costStart();
+	memcpy(mixNow, stemSnapshot, numSamples * 2 * sizeof(int32_t));
+	addCost(costStemSnapshot, start);
+}
+
+void USBAudioStream::setTrim(uint32_t trim) {
+	if (trim > kTrimMax) {
+		trim = kTrimMax;
 	}
-	stemName[channel][i] = 0;
+	stemTrimSetting = trim;
+	// 1.2 dB a step, the same ladder the AUX send levels use, so the two features feel like one control when they
+	// merge. Full scale at the top, silence at the bottom.
+	if (trim == 0) {
+		stemTrimMultiplier = 0;
+		return;
+	}
+	int32_t multiplier = 1 << 24;
+	for (uint32_t step = trim; step < kTrimMax; step++) {
+		// 1.2 dB is a factor of 0.871. 57139/65536 to stay in integers.
+		multiplier = (int32_t)(((int64_t)multiplier * 57139) >> 16);
+	}
+	stemTrimMultiplier = multiplier;
+}
+
+uint32_t USBAudioStream::getTrim() {
+	return stemTrimSetting;
+}
+
+int32_t USBAudioStream::readAndClearStemPeak() {
+	const int32_t peak = stemPeakAll;
+	stemPeakAll = 0;
+	return peak;
 }
 
 uint32_t USBAudioStream::costMark() {
@@ -2344,10 +2456,6 @@ void USBAudioStream::costEngineRoutine(uint32_t start) {
 
 void USBAudioStream::costOutputLoop(uint32_t start) {
 	addCost(costOutputs, start);
-}
-
-uint32_t USBAudioStream::stemChannelForOutput(uint32_t outputIndex) {
-	return (outputIndex < kStemChannels) ? outputIndex : kNoStem;
 }
 
 void USBAudioStream::feedMix(const StereoSample* mix, uint32_t numSamples, uint32_t renderOffset) {
@@ -2386,9 +2494,13 @@ void USBAudioStream::feedMix(const StereoSample* mix, uint32_t numSamples, uint3
 			const uint32_t stemIndex = renderOffset + i;
 			if (stemIndex < stemWindowSamples) {
 				for (uint32_t c = 0; c < kStemChannels; c++) {
-					frame[c] =
-					    (int16_t)(lshiftAndSaturate<AUDIO_OUTPUT_GAIN_DOUBLINGS>(stemAccumulator[c][stemIndex] >> 1)
-					              >> 16);
+					// Trimmed before the saturation, not after: a stem is taken before the master compressor and
+					// runs about three times hotter than the mix, so at unity it flat-tops where the mix does not
+					// and the true peak becomes unreadable. Scaling first is what makes the saturation a guard
+					// rather than the normal case.
+					const int32_t trimmed =
+					    (int32_t)(((int64_t)stemAccumulator[c][stemIndex] * stemTrimMultiplier) >> 24);
+					frame[c] = (int16_t)(lshiftAndSaturate<AUDIO_OUTPUT_GAIN_DOUBLINGS>(trimmed >> 1) >> 16);
 				}
 			}
 			else {

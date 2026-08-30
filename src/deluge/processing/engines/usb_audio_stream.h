@@ -53,10 +53,10 @@ public:
 
 	/// One mono track per channel, across the whole width of the stream.
 	///
-	/// Mono rather than stereo pairs: it keeps every channel independently assignable and the far end recombines,
-	/// which is worth more than a track's own panning over a cable that carries eight of them at most. No pair is
-	/// reserved for the main mix - that was decided 2026-08-22 and the mix is a source like any other once there
-	/// is an interface to assign one.
+	/// Mono rather than stereo pairs by default: it keeps every channel independently assignable and the far end
+	/// recombines. A clip that wants true stereo selects a pair instead, which is a per-clip choice rather than a
+	/// global mode. No pair is reserved for the main mix - decided 2026-08-22, revisited 2026-08-30 and reserved
+	/// for stage D.
 	static constexpr uint32_t kStemChannels = 8;
 	static constexpr uint32_t kNoStem = 0xFFFFFFFFu;
 
@@ -73,13 +73,20 @@ public:
 	/// enforced here rather than at the call site, so there is one place that can get it wrong.
 	static void snapshotBeforeTrack(const int32_t* mixNow, uint32_t numSamples);
 
-	/// Adds one track to a stem channel, as the difference between the mix now and the snapshot above. Summed to
-	/// mono, at the scale the main mix reaches the host on.
-	static void captureStem(uint32_t channel, const int32_t* mixNow, uint32_t numSamples);
+	/// Copies one track out to every destination its clip asked for, as the difference between the mix now and the
+	/// snapshot above.
+	///
+	/// route is a UsbRoute mask. A mono channel gets the sum of the track's two sides; a pair gets left on the
+	/// lower channel and right on the upper. Several clips may name one channel, in which case they add.
+	static void captureStem(uint16_t route, const int32_t* mixNow, uint32_t numSamples);
 
-	/// Names the track a stem channel is carrying, for the map report. Called from the render loop with the
-	/// output's own display name.
-	static void noteStemTrack(uint32_t channel, const char* name);
+	/// Puts the mix back as the snapshot found it, undoing one track's render. For a clip that has left the main
+	/// mix: x - (x - y) = y holds in two's complement, so this is a copy rather than a subtraction.
+	static void removeTrackFromMix(int32_t* mixNow, uint32_t numSamples);
+
+	/// True if this route asks for anything at all - any USB channel, or leaving the main mix. Everything else on
+	/// this path is skipped when it is false, which is what keeps an unrouted song at stock cost.
+	static bool routeWantsCapture(uint16_t route);
 
 	/// Reconciliation instruments. The scheduler reports the audio task's wall-clock duration, which absorbs every
 	/// interrupt that fires inside it; these time the same code in processor cycles, which does not. Two readings
@@ -88,11 +95,19 @@ public:
 	static void costEngineRoutine(uint32_t start);
 	static void costOutputLoop(uint32_t start);
 
-	/// Which stem channel a track occupies, from its position in the song's output list.
+	/// Trim applied to every stem on the way to 16 bit, 0-50, 1.2 dB a step.
 	///
-	/// Provisional: the first six tracks in song order, so the path can be proven on hardware before an assignment
-	/// interface exists. What replaces it is stage D, and T8 is its constraint.
-	static uint32_t stemChannelForOutput(uint32_t outputIndex);
+	/// A stem is captured before the master compressor, so it runs about three times hotter than the mix and
+	/// clips where the mix does not. This is the one control that fixes that, and it is per-machine rather than
+	/// per-song because it describes the gain staging of whatever is on the other end of the cable.
+	static constexpr uint32_t kTrimMax = 50;
+	static constexpr uint32_t kTrimDefault = 36;
+	static void setTrim(uint32_t trim);
+	static uint32_t getTrim();
+
+	/// Largest magnitude any stem has reached since the last read, at capture scale and therefore before the
+	/// width reduction that would clip it. The instrument the trim is set from.
+	static int32_t readAndClearStemPeak();
 };
 
 } // namespace deluge::processing::engines
