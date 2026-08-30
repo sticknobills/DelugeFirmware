@@ -144,8 +144,12 @@ void inputRoutine() {
 	bool speakerOn = (!AudioEngine::headphonesPluggedIn && !outputPluggedInR && !outputPluggedInL);
 	setOutputState(SPEAKER_ENABLE.port, SPEAKER_ENABLE.pin, speakerOn);
 
+	// A host streaming USB audio is a listener like any other, and it is the only one of these that is not a
+	// physical socket. Without it the whole song renders mono whenever nothing is plugged into the Deluge's own
+	// outputs, so every USB channel carries a mono render and a stereo pair collapses to the same signal twice.
 	AudioEngine::renderInStereo =
-	    (AudioEngine::headphonesPluggedIn || outputPluggedInR || AudioEngine::isAnyInternalRecordingHappening());
+	    (AudioEngine::headphonesPluggedIn || outputPluggedInR || AudioEngine::isAnyInternalRecordingHappening()
+	     || deluge::processing::engines::USBAudioStream::stemsWanted());
 
 	bool lineInNow = readInput(LINE_IN_DETECT.port, LINE_IN_DETECT.pin) != 0u;
 	if (lineInNow != AudioEngine::lineInPluggedIn) {
