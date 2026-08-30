@@ -97,7 +97,10 @@ public:
 	/// clips where the mix does not. This is the one control that fixes that, and it is per-machine rather than
 	/// per-song because it describes the gain staging of whatever is on the other end of the cable.
 	static constexpr uint32_t kTrimMax = 50;
-	static constexpr uint32_t kTrimDefault = 36;
+	/// Set from measurement, 2026-08-30: at unity the reference song's stems peak 1.8x past full scale, and at 36
+	/// they peaked at 10,498 of 32,767 - a third of the range in use and about 10 dB thrown away. 40 lands them
+	/// near 18,000, which keeps roughly 5 dB for a song hotter than that one.
+	static constexpr uint32_t kTrimDefault = 40;
 	static void setTrim(uint32_t trim);
 	static uint32_t getTrim();
 
