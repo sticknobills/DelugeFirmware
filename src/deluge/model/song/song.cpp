@@ -2508,25 +2508,28 @@ void Song::renderAudio(std::span<StereoSample> outputBuffer, int32_t* reverbBuff
 			// bracket measures is the whole track's render and there is only one of those.
 			Clip* const routingClip = output->getActiveClip();
 			const uint16_t route = routingClip ? routingClip->usbRouting : (uint16_t)UsbRoute::DEFAULT;
-			const bool capture = captureStems && deluge::processing::engines::USBAudioStream::routeWantsCapture(route);
+			// Two independent questions. A copy on the cable is worth nothing with no host listening; leaving the
+			// main mix is what the user asked for either way, so it must not change when a cable is plugged in.
+			const bool wantsCopy = captureStems && (route & UsbRoute::ANY_USB) != 0;
+			const bool wantsOut = (route & UsbRoute::MAIN) == 0;
 			const uint32_t numSamples = (uint32_t)outputBuffer.size();
 			int32_t* const mixRaw = (int32_t*)outputBuffer.data();
-			if (capture) {
+			if (wantsCopy || wantsOut) {
 				deluge::processing::engines::USBAudioStream::snapshotBeforeTrack(mixRaw, numSamples);
 			}
 
 			output->renderOutput(modelStack, outputBuffer, reverbBuffer, volumePostFX >> 1, sideChainHitPending,
 			                     !isClipActiveNow, isClipActiveNow);
 
-			if (capture) {
+			if (wantsCopy) {
 				// Its reverb send is not in here: that went into the shared reverb buffer during the render and is
 				// mixed in much later, so a stem carries the track dry.
 				deluge::processing::engines::USBAudioStream::captureStem(route, mixRaw, numSamples);
-				if ((route & UsbRoute::MAIN) == 0) {
-					// Taken back out of the mix, after its copy has been made. Its reverb tail still reaches the
-					// main outputs - that went into a shared buffer and cannot be unpicked from here.
-					deluge::processing::engines::USBAudioStream::removeTrackFromMix(mixRaw, numSamples);
-				}
+			}
+			if (wantsOut) {
+				// Taken back out of the mix, after any copy has been made. Its reverb tail still reaches the main
+				// outputs - that went into a shared buffer and cannot be unpicked from here.
+				deluge::processing::engines::USBAudioStream::removeTrackFromMix(mixRaw, numSamples);
 			}
 		}
 		EXIT_CRITICAL_SECTION();

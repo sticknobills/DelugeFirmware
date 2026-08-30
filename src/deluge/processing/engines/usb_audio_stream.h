@@ -84,10 +84,6 @@ public:
 	/// mix: x - (x - y) = y holds in two's complement, so this is a copy rather than a subtraction.
 	static void removeTrackFromMix(int32_t* mixNow, uint32_t numSamples);
 
-	/// True if this route asks for anything at all - any USB channel, or leaving the main mix. Everything else on
-	/// this path is skipped when it is false, which is what keeps an unrouted song at stock cost.
-	static bool routeWantsCapture(uint16_t route);
-
 	/// Reconciliation instruments. The scheduler reports the audio task's wall-clock duration, which absorbs every
 	/// interrupt that fires inside it; these time the same code in processor cycles, which does not. Two readings
 	/// of one thing, and the gap between them is the answer.

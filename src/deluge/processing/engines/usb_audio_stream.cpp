@@ -1222,9 +1222,9 @@ void reportStemPeak() {
 	if (!kDiagnostics || Debug::midiDebugCable == nullptr) {
 		return;
 	}
-	// The scheduler runs this at a few hundred hertz; a peak-hold wants to be read at about the rate a person can
-	// read it.
-	if (++stemPeakCountdown < 600u) {
+	// Measured at roughly three lines a second at 600, so the scheduler runs this nearer 2 kHz than the few
+	// hundred hertz assumed. A peak-hold wants reading at about the rate a person can read it.
+	if (++stemPeakCountdown < 4000u) {
 		return;
 	}
 	stemPeakCountdown = 0;
@@ -1252,9 +1252,10 @@ void reportStemPeak() {
 
 	const int32_t peak = deluge::processing::engines::USBAudioStream::readAndClearStemPeak();
 	put("SP pk");
-	// At the scale a channel would reach the host on with no trim, so this figure and a peak read off a recording
-	// are the same number rather than two that have to be reconciled.
-	putNumber((uint32_t)(lshiftAndSaturate<AUDIO_OUTPUT_GAIN_DOUBLINGS>(peak >> 1) >> 16));
+	// The same scale a channel reaches the host on, but deliberately NOT through the saturating conversion: a
+	// figure that pins at 32767 cannot say how far past 32767 it is, which is the only question the trim needs
+	// answered. Anything above 32767 here is what the trim has to bring down.
+	putNumber((uint32_t)((peak >> 9) < 0 ? 0 : (peak >> 9)));
 	put(" tr");
 	putNumber(deluge::processing::engines::USBAudioStream::getTrim());
 	line[at] = 0;
@@ -2269,14 +2270,15 @@ bool USBAudioStream::stemsWanted() {
 }
 
 void USBAudioStream::beginRender(uint32_t numSamples) {
+	// Set whatever the stream is doing. A clip that has left the main mix has left it whether or not a computer
+	// is listening - gating this on the stream made the Deluge's own outputs change when a cable was plugged in,
+	// which is not a routing decision the user made.
+	stemWindowSamples = (numSamples > kStemWindowSamples) ? kStemWindowSamples : numSamples;
+	channelsWritten = 0;
 	if (!streamActive) {
-		stemWindowSamples = 0;
-		channelsWritten = 0;
 		return;
 	}
 	const uint32_t start = costStart();
-	stemWindowSamples = (numSamples > kStemWindowSamples) ? kStemWindowSamples : numSamples;
-	channelsWritten = 0;
 	for (uint32_t c = 0; c < kStemChannels; c++) {
 		memset(stemAccumulator[c], 0, stemWindowSamples * sizeof(int32_t));
 	}
@@ -2352,10 +2354,6 @@ void trackPeak(const int32_t* out, uint32_t numSamples) {
 }
 
 } // namespace
-
-bool USBAudioStream::routeWantsCapture(uint16_t route) {
-	return (route & UsbRoute::ANY_USB) != 0 || (route & UsbRoute::MAIN) == 0;
-}
 
 void USBAudioStream::captureStem(uint16_t route, const int32_t* mixNow, uint32_t numSamples) {
 	if (numSamples > stemWindowSamples || (route & UsbRoute::ANY_USB) == 0) {
