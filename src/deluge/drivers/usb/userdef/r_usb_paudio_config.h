@@ -17,9 +17,22 @@
 
 #pragma once
 
+/* Direction naming, because USB's own is host-relative and reads backwards here.
+ *
+ *   ISO_IN  - the IN endpoint. Audio leaving the Deluge, arriving at the host. Stage A.
+ *   ISO_OUT - the OUT endpoint. Audio leaving the host, arriving at the Deluge. Stage B.
+ *
+ * A host calls our outgoing stems its "inputs". The names below are the endpoint's, not the
+ * user's. */
+
 // Only PIPE1 and PIPE2 can carry isochronous transfers - see usb_pstd_chk_pipe_info() in
-// r_usb_pdriver.c. PIPE2 and PIPE3 belong to USB MIDI, so PIPE1 is the only one available.
+// r_usb_pdriver.c. Both are now spoken for, which is also why no feedback endpoint is possible
+// at Full Speed: a feedback endpoint is itself isochronous and there is no third pipe for it.
 #define USB_CFG_PAUDIO_ISO_IN (USB_PIPE1)
+
+// Freed by moving USB MIDI's bulk-IN to PIPE4 - see r_usb_pmidi_config.h. Bulk may live on
+// pipes 1-5, isochronous only on 1-2, so the pipe that can be moved is the one that moves.
+#define USB_CFG_PAUDIO_ISO_OUT (USB_PIPE2)
 
 // Channel count for the stream. The descriptors and the transmit path both derive their packet
 // arithmetic from this, so it is the only place it is written down.
@@ -46,6 +59,31 @@
 // First 64-byte buffer block. MIDI holds blocks 8-15 and 72-79; double buffering doubles the
 // allocation, so 1024 bytes occupies 16-47, clear of both.
 #define USB_CFG_PAUDIO_BUF_START (16u)
+
+/* ---- The return, host to device ---- */
+
+// Two channels: Siphon sums its effect lanes and hands back one stereo pair, and a master return
+// into the song's summing point needs no more. The receive path is written channel-addressable, so
+// widening this is a constant plus a wider pipe buffer - the ceiling is six, above which the two
+// directions no longer fit in a Full Speed frame together.
+#define USB_CFG_PAUDIO_RX_CHANNELS (2u)
+
+// 2 x 16 bit is 4 bytes per audio frame. 44.1 kHz does not divide into 1 ms frames, so a host may
+// send 44 or 45 frames; 48 frames of headroom costs nothing and cannot be undersized by a host that
+// rounds differently.
+#define USB_CFG_PAUDIO_RX_MAX_FRAMES (48u)
+#define USB_CFG_PAUDIO_RX_PACKET_BYTES (USB_CFG_PAUDIO_RX_CHANNELS * 2u * USB_CFG_PAUDIO_RX_MAX_FRAMES)
+
+// Rounded up to the 64-byte unit pipe buffers are allocated in.
+#define USB_CFG_PAUDIO_RX_BUF_BYTES (256u)
+
+// Blocks 48-55 once double-buffered. Re-derived at the moment of use rather than taken from a note:
+// the live allocation is MIDI at 8 and 72 (512 bytes each) and the outgoing audio pipe at 16 (1024
+// bytes), so 48-71 is unclaimed under every reading of how double buffering consumes blocks. That
+// caveat is deliberate - the existing map has an apparent overlap between MIDI's IN pipe and the
+// outgoing audio pipe if double buffering doubles the block count, and it has run for weeks without
+// trouble. Unresolved, recorded, and steered well clear of rather than relied upon.
+#define USB_CFG_PAUDIO_RX_BUF_START (48u)
 
 // Called from the peripheral interrupt handler's frame branch, 1000 times a second, to write the
 // next audio packet off the host's own clock. Declared here because that handler already includes

@@ -60,10 +60,18 @@ Macro definitions
  * left exactly as it is: rewriting a descriptor that has enumerated correctly for years, to
  * satisfy a rule no host enforces, risks a shipped feature for nothing.
  *
+ * There are two AudioStreaming interfaces, one per direction, collected under a single
+ * AudioControl interface. Each has its own terminal pair, because a terminal is one-directional:
+ * audio out is "inside the Deluge" -> "the USB stream", and audio in is the reverse.
+ *
  * 9  - AudioControl interface
- * 9  - class-specific AC header, one streaming interface in its collection
- * 12 - input terminal
- * 9  - output terminal
+ * 10 - class-specific AC header, two streaming interfaces in its collection (8 + one byte each)
+ * 12 - input terminal, out direction: the Deluge's own audio
+ * 9  - output terminal, out direction: the USB stream
+ * 12 - input terminal, in direction: the USB stream
+ * 9  - output terminal, in direction: where returning audio lands
+ *
+ * and then, twice over - once per direction:
  * 9  - AudioStreaming interface, alt 0, no endpoint
  * 9  - AudioStreaming interface, alt 1
  * 7  - class-specific AS general
@@ -71,8 +79,9 @@ Macro definitions
  * 9  - isochronous endpoint
  * 7  - class-specific isochronous endpoint
  */
-#define USB_AUDIO_AC_WTOTALLENGTH (9 + 12 + 9)
-#define USB_AUDIO_CD_WTOTALLENGTH (9 + USB_AUDIO_AC_WTOTALLENGTH + 9 + 9 + 7 + 11 + 9 + 7)
+#define USB_AUDIO_AC_WTOTALLENGTH (10 + 12 + 9 + 12 + 9)
+#define USB_AUDIO_AS_BLOCK_LENGTH (9 + 9 + 7 + 11 + 9 + 7)
+#define USB_AUDIO_CD_WTOTALLENGTH (9 + USB_AUDIO_AC_WTOTALLENGTH + (2 * USB_AUDIO_AS_BLOCK_LENGTH))
 
 // 9 for config descriptor. Add any additional config lengths here
 #define TOTAL_CONFIG_LENGTH (9 + USB_MIDI_CD_WTOTALLENGTH + USB_AUDIO_CD_WTOTALLENGTH)
@@ -101,6 +110,26 @@ Macro definitions
 #define AUDIO_TERMINAL_USB_STREAMING 0x0101
 #define AUDIO_IN_TERMINAL_ID 0x01
 #define AUDIO_OUT_TERMINAL_ID 0x02
+
+// The return's terminal pair. 0x0301 is "speaker" - there is no terminal type for "back into the
+// song's mix", and speaker is the one every host reliably presents as a playback destination.
+#define AUDIO_TERMINAL_OUTPUT_TYPE 0x0301
+#define AUDIO_RX_IN_TERMINAL_ID 0x03
+#define AUDIO_RX_OUT_TERMINAL_ID 0x04
+
+// Interface numbers. MIDI is 0 and predates all of this.
+#define AUDIO_CONTROL_INTERFACE 0x01
+#define AUDIO_STREAM_OUT_INTERFACE 0x02
+#define AUDIO_STREAM_IN_INTERFACE 0x03
+
+#define AUDIO_RX_CHANNELS USB_CFG_PAUDIO_RX_CHANNELS
+#define AUDIO_RX_MAX_PACKET_SIZE USB_CFG_PAUDIO_RX_PACKET_BYTES
+
+// Isochronous, adaptive. The device cannot be asynchronous in this direction: a conforming
+// asynchronous sink signals its rate back with a feedback endpoint, which is itself isochronous,
+// and both isochronous-capable pipes are already carrying audio. Adaptive says the device absorbs
+// the mismatch, which it does with an elastic buffer - see usb_audio_stream.cpp.
+#define AUDIO_RX_EP_ATTRIBUTES 0x09
 
 #define AUDIO_NUM_CHANNELS USB_CFG_PAUDIO_CHANNELS
 #define AUDIO_SUBFRAME_BYTES 2
@@ -167,7 +196,7 @@ uint8_t g_midi_configuration[TOTAL_CONFIG_LENGTH + (TOTAL_CONFIG_LENGTH % 2)] = 
     USB_DT_CONFIGURATION,                 /*  1:bDescriptorType */
     (uint8_t)(TOTAL_CONFIG_LENGTH % 256), /*  2:wTotalLength(L) */
     (uint8_t)(TOTAL_CONFIG_LENGTH / 256), /*  3:wTotalLength(H) */
-    3,                                    /*  4:bNumInterfaces */
+    4,                                    /*  4:bNumInterfaces */
     1,                                    /*  5:bConfigurationValue */
     0,                                    /*  6:iConfiguration */
     (uint8_t)(USB_CF_RESERVED),           /*  7:bmAttributes */
@@ -309,15 +338,16 @@ uint8_t g_midi_configuration[TOTAL_CONFIG_LENGTH + (TOTAL_CONFIG_LENGTH % 2)] = 
     0x00,                   // bInterfaceProtocol
     0x00,                   // iInterface
 
-    // Class-specific AC header. Collects the AudioStreaming interface below.
-    0x09,                                       // bLength - 8 + one interface in the collection
+    // Class-specific AC header. Collects both AudioStreaming interfaces below.
+    0x0A,                                       // bLength - 8 + one byte per interface collected
     CS_INTERFACE,                               // bDescriptorType
     AUDIO_AC_HEADER,                            // bDescriptorSubtype
     0x00, 0x01,                                 // bcdADC - 1.00
-    (uint8_t)(USB_AUDIO_AC_WTOTALLENGTH % 256), // wTotalLength(L) - this header plus both terminals
+    (uint8_t)(USB_AUDIO_AC_WTOTALLENGTH % 256), // wTotalLength(L) - this header plus all four terminals
     (uint8_t)(USB_AUDIO_AC_WTOTALLENGTH / 256), // wTotalLength(H)
-    0x01,                                       // bInCollection
-    0x02,                                       // baInterfaceNr(1) - the AudioStreaming interface
+    0x02,                                       // bInCollection
+    AUDIO_STREAM_OUT_INTERFACE,                 // baInterfaceNr(1) - audio leaving the Deluge
+    AUDIO_STREAM_IN_INTERFACE,                  // baInterfaceNr(2) - audio returning to it
 
     // Input terminal - where the audio comes from, as far as the host is concerned
     0x0C,                                       // bLength
@@ -342,6 +372,34 @@ uint8_t g_midi_configuration[TOTAL_CONFIG_LENGTH + (TOTAL_CONFIG_LENGTH % 2)] = 
     0x00,                                          // bAssocTerminal - none
     AUDIO_IN_TERMINAL_ID,                          // bSourceID
     0x00,                                          // iTerminal
+
+    /* The return's terminal pair, describing the other direction. A terminal is one-directional,
+     * so the two streams cannot share one pair: here the USB stream is the source and the
+     * destination is inside the Deluge, which is the mirror of the two above. */
+
+    // Input terminal - the USB stream arriving from the host
+    0x0C,                                          // bLength
+    CS_INTERFACE,                                  // bDescriptorType
+    AUDIO_AC_INPUT_TERMINAL,                       // bDescriptorSubtype
+    AUDIO_RX_IN_TERMINAL_ID,                       // bTerminalID
+    (uint8_t)(AUDIO_TERMINAL_USB_STREAMING % 256), // wTerminalType(L)
+    (uint8_t)(AUDIO_TERMINAL_USB_STREAMING / 256), // wTerminalType(H)
+    0x00,                                          // bAssocTerminal - none
+    AUDIO_RX_CHANNELS,                             // bNrChannels
+    0x03, 0x00,                                    // wChannelConfig - front left and front right
+    0x00,                                          // iChannelNames
+    0x00,                                          // iTerminal
+
+    // Output terminal - where returning audio lands, as far as the host is concerned
+    0x09,                                        // bLength
+    CS_INTERFACE,                                // bDescriptorType
+    AUDIO_AC_OUTPUT_TERMINAL,                    // bDescriptorSubtype
+    AUDIO_RX_OUT_TERMINAL_ID,                    // bTerminalID
+    (uint8_t)(AUDIO_TERMINAL_OUTPUT_TYPE % 256), // wTerminalType(L)
+    (uint8_t)(AUDIO_TERMINAL_OUTPUT_TYPE / 256), // wTerminalType(H)
+    0x00,                                        // bAssocTerminal - none
+    AUDIO_RX_IN_TERMINAL_ID,                     // bSourceID
+    0x00,                                        // iTerminal
 
     /* AudioStreaming Interface, alt 0 - USB audio 1.0 spec 4.5
      * Zero bandwidth. The host selects this when it is not streaming, which is what frees the
@@ -404,6 +462,74 @@ uint8_t g_midi_configuration[TOTAL_CONFIG_LENGTH + (TOTAL_CONFIG_LENGTH % 2)] = 
     0x00,                                   // bSynchAddress - no feedback endpoint
 
     // Class-specific isochronous endpoint. Nothing is host-settable, so no controls are claimed.
+    0x07,             // bLength
+    CS_ENDPOINT,      // bDescriptorType
+    AUDIO_EP_GENERAL, // bDescriptorSubtype
+    0x00,             // bmAttributes - sampling frequency is not host-settable
+    0x00,             // bLockDelayUnits
+    0x00, 0x00,       // wLockDelay
+
+    /* ================= The return: host to device ================= *
+     * Same shape as the interface above, mirrored. Its endpoint is the fourth in this
+     * configuration, so it takes the fourth row of g_usb_pstd_eptbl, which is PIPE2 - freed by
+     * moving USB MIDI's bulk-IN to PIPE4. */
+
+    /* AudioStreaming Interface, alt 0 - zero bandwidth, selected when the host is not sending.
+     * Without this the host would hold isochronous bandwidth open permanently in both directions. */
+    0x09,                      // bLength
+    USB_DT_INTERFACE,          // bDescriptorType
+    AUDIO_STREAM_IN_INTERFACE, // bInterfaceNumber
+    0x00,                      // bAlternateSetting
+    0x00,                      // bNumEndpoints
+    USB_IFCLS_AUD,             // bInterfaceClass
+    AUDIO_SUBCLASS_STREAMING,  // bInterfaceSubClass
+    0x00,                      // bInterfaceProtocol
+    0x00,                      // iInterface
+
+    // AudioStreaming Interface, alt 1 - the operational setting
+    0x09,                      // bLength
+    USB_DT_INTERFACE,          // bDescriptorType
+    AUDIO_STREAM_IN_INTERFACE, // bInterfaceNumber
+    0x01,                      // bAlternateSetting
+    0x01,                      // bNumEndpoints
+    USB_IFCLS_AUD,             // bInterfaceClass
+    AUDIO_SUBCLASS_STREAMING,  // bInterfaceSubClass
+    0x00,                      // bInterfaceProtocol
+    0x00,                      // iInterface
+
+    // Class-specific AS general. Linked to the terminal the USB stream enters at.
+    0x07,                    // bLength
+    CS_INTERFACE,            // bDescriptorType
+    AUDIO_AS_GENERAL,        // bDescriptorSubtype
+    AUDIO_RX_IN_TERMINAL_ID, // bTerminalLink
+    0x01,                    // bDelay - one frame
+    0x01, 0x00,              // wFormatTag - PCM
+
+    // Type I format. One discrete sample rate, matching the outgoing direction.
+    0x0B,                                        // bLength
+    CS_INTERFACE,                                // bDescriptorType
+    AUDIO_AS_FORMAT_TYPE,                        // bDescriptorSubtype
+    AUDIO_FORMAT_TYPE_I,                         // bFormatType
+    AUDIO_RX_CHANNELS,                           // bNrChannels
+    AUDIO_SUBFRAME_BYTES,                        // bSubframeSize
+    AUDIO_BIT_RESOLUTION,                        // bBitResolution
+    0x01,                                        // bSamFreqType - one discrete rate
+    (uint8_t)(AUDIO_SAMPLE_RATE & 0xFF),         // tSamFreq(L)
+    (uint8_t)((AUDIO_SAMPLE_RATE >> 8) & 0xFF),  // tSamFreq
+    (uint8_t)((AUDIO_SAMPLE_RATE >> 16) & 0xFF), // tSamFreq(H) - rates are 24-bit
+
+    /* Isochronous OUT endpoint. The endpoint number is a label and need not match the pipe. */
+    0x09,                                      // bLength - audio endpoints carry two extra bytes
+    USB_DT_ENDPOINT,                           // bDescriptorType
+    (uint8_t)(USB_EP_OUT | USB_EP4),           // bEndpointAddress - MIDI has EP1 IN and EP2 OUT, audio out has EP3 IN
+    AUDIO_RX_EP_ATTRIBUTES,                    // bmAttributes - isochronous, adaptive
+    (uint8_t)(AUDIO_RX_MAX_PACKET_SIZE % 256), // wMaxPacketSize(L)
+    (uint8_t)(AUDIO_RX_MAX_PACKET_SIZE / 256), // wMaxPacketSize(H)
+    0x01,                                      // bInterval - every frame; full speed requires 1
+    0x00,                                      // bRefresh
+    0x00,                                      // bSynchAddress - no feedback endpoint exists to name
+
+    // Class-specific isochronous endpoint.
     0x07,             // bLength
     CS_ENDPOINT,      // bDescriptorType
     AUDIO_EP_GENERAL, // bDescriptorSubtype

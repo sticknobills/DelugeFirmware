@@ -131,8 +131,10 @@ uint16_t g_usb_pstd_eptbl[] = {
 /* for PAUDIO */
 /**************/
 /* Rows are consumed in the order endpoint descriptors appear in the configuration descriptor
- * (usb_peri_pipe_info). This row is third, matching the isochronous endpoint in the
- * AudioStreaming interface, which follows USB MIDI's two bulk endpoints.
+ * (usb_pstd_set_eptbl_index walks the descriptor and indexes this table by position). The
+ * outgoing row is third, matching the isochronous IN endpoint in the first AudioStreaming
+ * interface, which follows USB MIDI's two bulk endpoints. The return row is fourth, matching the
+ * isochronous OUT endpoint in the second AudioStreaming interface.
  * SHTNAK is a bulk short-packet setting and is off here; CNTMD is likewise bulk-only and is
  * already off globally. */
 #if defined(USB_CFG_PAUDIO_USE)
@@ -140,6 +142,16 @@ uint16_t g_usb_pstd_eptbl[] = {
     /* TYPE    / BFRE        / DBLB         / CNTMD         / SHTNAK             / DIR      / EPNUM */
     USB_NULL | USB_BFREOFF | USB_CFG_DBLB | USB_CFG_CNTMD | USB_CFG_SHTNAKOFF | USB_NULL | USB_NULL, /* PIPECFG */
     (uint16_t)USB_BUF_SIZE(USB_CFG_PAUDIO_BUF_BYTES) | USB_BUF_NUMB(USB_CFG_PAUDIO_BUF_START),       /* PIPEBUF */
+    USB_NULL,                                                                                        /* PIPEMAXP */
+    USB_NULL,                                                                                        /* PIPEPERI */
+    USB_NULL,                                                                                        /* reserve */
+
+    /* The return. Buffer blocks 48 onward, clear of MIDI at 8 and 72 and of the outgoing pipe at
+     * 16 - see r_usb_paudio_config.h for why that allocation is derived rather than remembered. */
+    USB_CFG_PAUDIO_ISO_OUT, /* Pipe No. */
+    /* TYPE    / BFRE        / DBLB         / CNTMD         / SHTNAK             / DIR      / EPNUM */
+    USB_NULL | USB_BFREOFF | USB_CFG_DBLB | USB_CFG_CNTMD | USB_CFG_SHTNAKOFF | USB_NULL | USB_NULL, /* PIPECFG */
+    (uint16_t)USB_BUF_SIZE(USB_CFG_PAUDIO_RX_BUF_BYTES) | USB_BUF_NUMB(USB_CFG_PAUDIO_RX_BUF_START), /* PIPEBUF */
     USB_NULL,                                                                                        /* PIPEMAXP */
     USB_NULL,                                                                                        /* PIPEPERI */
     USB_NULL,                                                                                        /* reserve */
