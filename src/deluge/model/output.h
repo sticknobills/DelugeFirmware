@@ -21,6 +21,7 @@
 #include "hid/button.h"
 #include "model/clip/clip_instance_vector.h"
 #include "model/sample/sample_recorder.h"
+#include "model/usb_route.h"
 #include "modulation/params/param.h"
 #include "util/d_string.h"
 #include <cstdint>
@@ -87,6 +88,17 @@ public:
 
 	ClipInstanceVector clipInstances;
 	[[nodiscard]] Clip* getActiveClip() const;
+
+	/// UsbRoute bits for this track: which USB channels its audio is copied to, and whether it stays in the
+	/// Deluge's own outputs. Read once per render window by the output loop.
+	///
+	/// On the track rather than on a Clip, so that launching a different clip cannot change or drop where the
+	/// track's audio goes. Saved with the song.
+	uint16_t usbRouting = UsbRoute::DEFAULT;
+
+	/// Whether this track's audio still reaches the Deluge's own outputs. One function so the merge with the AUX
+	/// sends line has one place to collapse two routing masks into one.
+	[[nodiscard]] bool isInMainMix() const { return (usbRouting & UsbRoute::MAIN) != 0; }
 	String name; // Contains the display name as the user sees it.
 	             // E.g. on numeric Deluge, SYNT000 will be just "0". Definitely no leading zeros, so not "000".
 	             // On OLED Deluge I thiiink SYNT000 would be "SYNT000"?

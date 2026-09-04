@@ -20,7 +20,7 @@
 #include "dsp/stereo_sample.h"
 #include "io/debug/print.h"
 #include "io/midi/sysex.h"
-#include "model/clip/clip.h"
+#include "model/usb_route.h"
 #include "util/functions.h"
 #include <cstdint>
 #include <cstring>

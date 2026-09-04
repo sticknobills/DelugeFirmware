@@ -2270,6 +2270,33 @@ skipInstance:
 
 	outputClipInstanceListIsCurrentlyInvalid = false; // All clipInstances are valid now.
 
+	// Pre-release songs stored USB routing on the Clip. Outputs are only now linked, so this is the first point at
+	// which it can be moved onto the track it belonged to. Delete with Clip::legacyUsbRouting at public release.
+	//
+	// Two passes because a track may hold several clips with different routing. Channels are OR-ed, which loses no
+	// destination. MAIN is kept if any of them kept it: the destructive reading would silently take a track out of
+	// the speakers, so it has to be the one that needs agreement.
+	for (ClipArray* clipArray : {&sessionClips, &arrangementOnlyClips}) {
+		for (int32_t c = 0; c < clipArray->getNumElements(); c++) {
+			Clip* clip = clipArray->getClipAtIndex(c);
+			if (clip->legacyUsbRouting != Clip::kNoLegacyUsbRouting && clip->output != nullptr) {
+				clip->output->usbRouting &= (uint16_t)~UsbRoute::MAIN;
+				clip->output->usbRouting |= (uint16_t)(clip->legacyUsbRouting & UsbRoute::ANY_USB);
+			}
+		}
+	}
+	for (ClipArray* clipArray : {&sessionClips, &arrangementOnlyClips}) {
+		for (int32_t c = 0; c < clipArray->getNumElements(); c++) {
+			Clip* clip = clipArray->getClipAtIndex(c);
+			if (clip->legacyUsbRouting != Clip::kNoLegacyUsbRouting && clip->output != nullptr) {
+				if ((clip->legacyUsbRouting & UsbRoute::MAIN) != 0) {
+					clip->output->usbRouting |= UsbRoute::MAIN;
+				}
+				clip->legacyUsbRouting = Clip::kNoLegacyUsbRouting;
+			}
+		}
+	}
+
 	D_PRINTLN("aaa2");
 
 	// Ensure no arrangement-only Clips with no ClipInstance
@@ -2504,10 +2531,9 @@ void Song::renderAudio(std::span<StereoSample> outputBuffer, int32_t* reverbBuff
 			// second time. Nothing about how it renders changes, and the failure mode is a silent USB channel
 			// rather than a damaged mix.
 			//
-			// The routing is read off whichever clip is playing on this track, because the difference this
-			// bracket measures is the whole track's render and there is only one of those.
-			Clip* const routingClip = output->getActiveClip();
-			const uint16_t route = routingClip ? routingClip->usbRouting : (uint16_t)UsbRoute::DEFAULT;
+			// The routing belongs to the track, not to a clip: the difference this bracket measures is the whole
+			// track's render, and which of its clips is playing must not change where that goes.
+			const uint16_t route = output->usbRouting;
 			// Two independent questions. A copy on the cable is worth nothing with no host listening; leaving the
 			// main mix is what the user asked for either way, so it must not change when a cable is plugged in.
 			const bool wantsCopy = captureStems && (route & UsbRoute::ANY_USB) != 0;

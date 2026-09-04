@@ -30,6 +30,7 @@
 #include "model/consequence/consequence_output_existence.h"
 #include "model/output.h"
 #include "model/song/song.h"
+#include "model/usb_route.h"
 #include "playback/mode/playback_mode.h"
 #include "playback/playback_handler.h"
 #include "processing/sound/sound_instrument.h"
@@ -49,7 +50,7 @@ Clip::Clip(ClipType newType) : type(newType) {
 	wasActiveBefore = false; // Want to set this default in case a Clip was created during playback
 
 	section = 0;
-	usbRouting = UsbRoute::DEFAULT;
+	legacyUsbRouting = kNoLegacyUsbRouting;
 	output = nullptr;
 	beingRecordedFromClip = nullptr;
 	isPendingOverdub = false;
@@ -105,7 +106,6 @@ void Clip::copyBasicsFrom(Clip const* otherClip) {
 	section = otherClip->section;
 	launchStyle = otherClip->launchStyle;
 	onAutomationClipView = otherClip->onAutomationClipView;
-	usbRouting = otherClip->usbRouting;
 }
 
 void Clip::setupForRecordingAsAutoOverdub(Clip* existingClip, Song* song, OverDubType newOverdubNature) {
@@ -689,11 +689,6 @@ void Clip::writeDataToFile(Serializer& writer, Song* song) {
 	if (launchStyle != LaunchStyle::DEFAULT) {
 		writer.writeAttribute("launchStyle", launchStyleToString(launchStyle));
 	}
-	// Written only when it says something, so a song that never touches USB routing saves byte-identical to one
-	// saved by stock firmware.
-	if (usbRouting != UsbRoute::DEFAULT) {
-		writer.writeAttribute("usbRouting", usbRouting);
-	}
 }
 
 void Clip::writeMidiCommandsToFile(Serializer& writer, Song* song) {
@@ -737,8 +732,10 @@ void Clip::readTagFromFile(Deserializer& reader, char const* tagName, Song* song
 	}
 
 	else if (!strcmp(tagName, "usbRouting")) {
-		// Masked: a later firmware may define bits this one does not, and an unknown bit must not route anywhere.
-		usbRouting = (uint16_t)(reader.readTagOrAttributeValueInt() & UsbRoute::ALL);
+		// Pre-release format: routing lived on the Clip. Stashed rather than applied, because this Clip's Output is
+		// not resolved yet; Song folds it in once outputs are linked. Masked, so a bit this firmware does not define
+		// cannot route anywhere.
+		legacyUsbRouting = (uint16_t)(reader.readTagOrAttributeValueInt() & UsbRoute::ALL);
 	}
 
 	else if (!strcmp(tagName, "beingEdited")) {

@@ -20,36 +20,37 @@
 #include "gui/menu_item/integer.h"
 #include "gui/menu_item/submenu.h"
 #include "gui/menu_item/toggle.h"
-#include "model/clip/clip.h"
+#include "model/output.h"
 #include "model/song/song.h"
+#include "model/usb_route.h"
 #include "processing/engines/usb_audio_stream.h"
 #include "storage/flash_storage.h"
 
 namespace deluge::gui::menu_item::usb_audio {
 
-/// One USB destination for the clip being edited. A mono channel or a stereo pair; the bit says which.
+/// One USB destination for the track being edited. A mono channel or a stereo pair; the bit says which.
 ///
-/// Several clips may name one channel and they add there. A single channel carries the mono sum of the clip's two
+/// Several tracks may name one channel and they add there. A single channel carries the mono sum of the track's two
 /// sides, a pair carries left and right - so selecting 1 and 2 separately is not the same as selecting 1-2.
 class ChannelToggle final : public Toggle {
 public:
 	ChannelToggle(l10n::String newName, l10n::String title, uint16_t newBit) : Toggle(newName, title), bit(newBit) {}
 
 	void readCurrentValue() override {
-		Clip* clip = getCurrentClip();
-		this->setValue(clip != nullptr && (clip->usbRouting & bit) != 0);
+		Output* output = getCurrentOutput();
+		this->setValue(output != nullptr && (output->usbRouting & bit) != 0);
 	}
 
 	void writeCurrentValue() override {
-		Clip* clip = getCurrentClip();
-		if (clip == nullptr) {
+		Output* output = getCurrentOutput();
+		if (output == nullptr) {
 			return;
 		}
 		if (this->getValue()) {
-			clip->usbRouting |= bit;
+			output->usbRouting |= bit;
 		}
 		else {
-			clip->usbRouting &= (uint16_t)~bit;
+			output->usbRouting &= (uint16_t)~bit;
 		}
 	}
 
@@ -57,7 +58,7 @@ private:
 	const uint16_t bit;
 };
 
-/// Whether the clip still reaches the Deluge's own outputs. On by default; off makes the cable its only way out.
+/// Whether the track still reaches the Deluge's own outputs. On by default; off makes the cable its only way out.
 ///
 /// Its reverb tail reaches the main outputs either way - that goes into a buffer shared with every other track
 /// during the render and cannot be unpicked afterwards.
@@ -66,21 +67,21 @@ public:
 	using Toggle::Toggle;
 
 	void readCurrentValue() override {
-		Clip* clip = getCurrentClip();
-		// A clip that is not there is in the mix: this is the state that changes nothing.
-		this->setValue(clip == nullptr || clip->isInMainMix());
+		Output* output = getCurrentOutput();
+		// A track that is not there is in the mix: this is the state that changes nothing.
+		this->setValue(output == nullptr || output->isInMainMix());
 	}
 
 	void writeCurrentValue() override {
-		Clip* clip = getCurrentClip();
-		if (clip == nullptr) {
+		Output* output = getCurrentOutput();
+		if (output == nullptr) {
 			return;
 		}
 		if (this->getValue()) {
-			clip->usbRouting |= UsbRoute::MAIN;
+			output->usbRouting |= UsbRoute::MAIN;
 		}
 		else {
-			clip->usbRouting &= (uint16_t)~UsbRoute::MAIN;
+			output->usbRouting &= (uint16_t)~UsbRoute::MAIN;
 		}
 	}
 };

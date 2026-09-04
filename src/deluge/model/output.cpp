@@ -256,6 +256,12 @@ bool Output::writeDataToFile(Serializer& writer, Clip* clipForSavingOutputOnly, 
 		writer.writeAttribute("isArmedForRecording", armedForRecording);
 		writer.writeAttribute("activeModFunction", modKnobMode);
 
+		// Written only when it says something, so a song that never touches USB routing saves byte-identical to one
+		// saved by stock firmware.
+		if (usbRouting != UsbRoute::DEFAULT) {
+			writer.writeAttribute("usbRouting", usbRouting);
+		}
+
 		if (clipInstances.getNumElements()) {
 			writer.insertCommaIfNeeded();
 			writer.write("\n");
@@ -333,6 +339,11 @@ bool Output::readTagFromFile(Deserializer& reader, char const* tagName) {
 
 	else if (!strcmp(tagName, "colour")) {
 		colour = reader.readTagOrAttributeValueInt();
+	}
+
+	else if (!strcmp(tagName, "usbRouting")) {
+		// Masked: a later firmware may define bits this one does not, and an unknown bit must not route anywhere.
+		usbRouting = (uint16_t)(reader.readTagOrAttributeValueInt() & UsbRoute::ALL);
 	}
 
 	else if (!strcmp(tagName, "trackInstances") || !strcmp(tagName, "clipInstances")) {
