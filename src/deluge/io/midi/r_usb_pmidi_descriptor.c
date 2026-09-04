@@ -65,7 +65,7 @@ Macro definitions
  * audio out is "inside the Deluge" -> "the USB stream", and audio in is the reverse.
  *
  * 9  - AudioControl interface
- * 10 - class-specific AC header, two streaming interfaces in its collection (8 + one byte each)
+ * 11 - class-specific AC header, three interfaces in its collection (8 + one byte each)
  * 12 - input terminal, out direction: the Deluge's own audio
  * 9  - output terminal, out direction: the USB stream
  * 12 - input terminal, in direction: the USB stream
@@ -79,7 +79,7 @@ Macro definitions
  * 9  - isochronous endpoint
  * 7  - class-specific isochronous endpoint
  */
-#define USB_AUDIO_AC_WTOTALLENGTH (10 + 12 + 9 + 12 + 9)
+#define USB_AUDIO_AC_WTOTALLENGTH (11 + 12 + 9 + 12 + 9)
 #define USB_AUDIO_AS_BLOCK_LENGTH (9 + 9 + 7 + 11 + 9 + 7)
 #define USB_AUDIO_CD_WTOTALLENGTH (9 + USB_AUDIO_AC_WTOTALLENGTH + (2 * USB_AUDIO_AS_BLOCK_LENGTH))
 
@@ -118,6 +118,7 @@ Macro definitions
 #define AUDIO_RX_OUT_TERMINAL_ID 0x04
 
 // Interface numbers. MIDI is 0 and predates all of this.
+#define MIDI_STREAMING_INTERFACE 0x00
 #define AUDIO_CONTROL_INTERFACE 0x01
 #define AUDIO_STREAM_OUT_INTERFACE 0x02
 #define AUDIO_STREAM_IN_INTERFACE 0x03
@@ -338,16 +339,24 @@ uint8_t g_midi_configuration[TOTAL_CONFIG_LENGTH + (TOTAL_CONFIG_LENGTH % 2)] = 
     0x00,                   // bInterfaceProtocol
     0x00,                   // iInterface
 
-    // Class-specific AC header. Collects both AudioStreaming interfaces below.
-    0x0A,                                       // bLength - 8 + one byte per interface collected
+    /* Class-specific AC header. Collects every audio-class interface in this configuration - both
+     * AudioStreaming interfaces below and USB MIDI, which is an audio-class interface too
+     * (subclass MIDIStreaming) and has to belong to an AudioControl interface.
+     *
+     * MIDI was left out when this was written, because before the return there was no
+     * AudioControl interface at all and MIDI had stood alone for years. Adding one and not
+     * collecting MIDI into it left the configuration describing an audio-class interface that
+     * belongs to nothing. */
+    0x0B,                                       // bLength - 8 + one byte per interface collected
     CS_INTERFACE,                               // bDescriptorType
     AUDIO_AC_HEADER,                            // bDescriptorSubtype
     0x00, 0x01,                                 // bcdADC - 1.00
     (uint8_t)(USB_AUDIO_AC_WTOTALLENGTH % 256), // wTotalLength(L) - this header plus all four terminals
     (uint8_t)(USB_AUDIO_AC_WTOTALLENGTH / 256), // wTotalLength(H)
-    0x02,                                       // bInCollection
-    AUDIO_STREAM_OUT_INTERFACE,                 // baInterfaceNr(1) - audio leaving the Deluge
-    AUDIO_STREAM_IN_INTERFACE,                  // baInterfaceNr(2) - audio returning to it
+    0x03,                                       // bInCollection
+    MIDI_STREAMING_INTERFACE,                   // baInterfaceNr(1) - USB MIDI
+    AUDIO_STREAM_OUT_INTERFACE,                 // baInterfaceNr(2) - audio leaving the Deluge
+    AUDIO_STREAM_IN_INTERFACE,                  // baInterfaceNr(3) - audio returning to it
 
     // Input terminal - where the audio comes from, as far as the host is concerned
     0x0C,                                       // bLength
