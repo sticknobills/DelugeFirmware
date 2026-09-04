@@ -1231,29 +1231,52 @@ void usb_pstd_bemp_pipe_process_rohan_midi(uint16_t bitsts)
  ***********************************************************************************************************************/
 void usb_pstd_brdy_pipe_process_paudio(uint16_t bitsts)
 {
-    const uint16_t pipe = USB_CFG_PAUDIO_ISO_IN;
+    /* Both audio pipes, because one interrupt carries whichever of them is ready and the two directions need
+     * opposite handling: the outgoing pipe is a write that did not finish in one pass, the return is a packet that
+     * has arrived and is sitting in the FIFO. */
+    const uint16_t pipes[2] = {USB_CFG_PAUDIO_ISO_IN, USB_CFG_PAUDIO_ISO_OUT};
+    uint16_t n;
 
     usbBrdyNonZeroCount++;
 
-    if ((bitsts & USB_BITSET(pipe)) == 0)
+    for (n = 0; n < 2; n++)
     {
-        return;
-    }
-    usbBrdyAudioCount++;
+        const uint16_t pipe = pipes[n];
 
-    hw_usb_clear_status_bemp(USB_NULL, pipe);
-
-    if (USB_NULL == g_p_usb_pipe[pipe])
-    {
-        return;
-    }
-
-    if (USB_CUSE == usb_pstd_pipe2fport(pipe))
-    {
-        /* Send pipe, so this is the rest of a packet rather than anything arriving. */
-        if (USB_BUF2FIFO == usb_cstd_get_pipe_dir(USB_NULL, pipe))
+        if ((bitsts & USB_BITSET(pipe)) == 0)
         {
-            usb_pstd_buf2fifo(pipe, USB_CUSE);
+            continue;
+        }
+        if (pipe == USB_CFG_PAUDIO_ISO_IN)
+        {
+            usbBrdyAudioCount++;
+        }
+        else
+        {
+            usbBrdyReturnCount++;
+        }
+
+        hw_usb_clear_status_bemp(USB_NULL, pipe);
+
+        if (USB_NULL == g_p_usb_pipe[pipe])
+        {
+            continue;
+        }
+
+        if (USB_CUSE == usb_pstd_pipe2fport(pipe))
+        {
+            if (USB_BUF2FIFO == usb_cstd_get_pipe_dir(USB_NULL, pipe))
+            {
+                /* Send pipe, so this is the rest of a packet rather than anything arriving. */
+                usb_pstd_buf2fifo(pipe, USB_CUSE);
+            }
+            else
+            {
+                /* Receive pipe: read what arrived out of the FIFO. usb_pstd_fifo_to_buf ends the transfer and
+                 * calls the owner's completion when the packet is complete or short, which every isochronous
+                 * audio packet is - the pipe is armed for a whole frame's worth and a host sends 44 or 45. */
+                usb_pstd_fifo_to_buf(pipe, USB_CUSE);
+            }
         }
     }
 } /* End of function usb_pstd_brdy_pipe_process_paudio() */

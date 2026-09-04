@@ -82,8 +82,12 @@ extern volatile uint32_t usbBempAudioDeferred;
 /// Every non-zero-pipe BRDY interrupt. This is the other interrupt that carries a transfer forward, and the driver
 /// enables it in place of BEMP whenever a packet does not finish writing in one pass.
 extern volatile uint32_t usbBrdyNonZeroCount;
-/// Only those carrying the audio pipe's bit.
+/// Only those carrying the outgoing audio pipe's bit.
 extern volatile uint32_t usbBrdyAudioCount;
+/// Only those carrying the return pipe's bit. Every arriving audio packet passes through this counter, so it is
+/// the first place to look when the return decodes nothing: a zero here is the host not sending, and a rising
+/// count with no frames decoded is the read path.
+extern volatile uint32_t usbBrdyReturnCount;
 
 #ifdef __cplusplus
 }

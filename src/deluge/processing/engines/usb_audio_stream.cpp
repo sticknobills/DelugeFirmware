@@ -246,6 +246,231 @@ bool primed = false;
 /// nothing plugged in does not pay for the conversion, and set in one place so the two sides cannot disagree.
 bool streamActive = false;
 
+/* ---- The return, host to device ---------------------------------------------------------------------------
+ *
+ * Stage B. Nothing here is audible: the packets are counted, decoded into a ring and drained at the render rate,
+ * so that what B3 will hear can be measured before anything is connected to the mix.
+ *
+ * The driver's own CPU read path carries this rather than the DMA controller the roadmap named. The return is
+ * 176 bytes a frame against the outgoing 990, so the copy the transmit side offloaded costs about a ninth here -
+ * and offloading it there bought a lower CPU share at the price of latency (2026-08-29). Receive has no such
+ * bargain to strike until the cost is measured, and usb_pstd_fifo_to_buf is the path the vendor driver already
+ * gets right. Priced in B6, revisited then.
+ */
+
+/// Must match the second AudioStreaming interface's number in r_usb_pmidi_descriptor.c.
+constexpr uint16_t kReturnInterfaceNumber = 3;
+
+constexpr uint32_t kRxChannels = USB_CFG_PAUDIO_RX_CHANNELS;
+constexpr uint32_t kRxFrameBytes = kRxChannels * kSubframeBytes;
+constexpr uint32_t kRxMaxPacketBytes = USB_CFG_PAUDIO_RX_PACKET_BYTES;
+constexpr uint32_t kRxMaxFrames = kRxMaxPacketBytes / kRxFrameBytes;
+
+static_assert(kRxMaxPacketBytes <= USB_CFG_PAUDIO_RX_BUF_BYTES, "A return packet must fit the pipe buffer");
+static_assert(kRxMaxFrames > kSampleRate / 1000, "A host may send a 45-frame packet and it must fit");
+
+/// 93 ms of return audio. Far more than the path needs, and sized like the outgoing ring for the same reason: a
+/// card load freezes every task for longer than one render window, and a ring that wraps during one loses audio
+/// silently rather than reporting a gap.
+constexpr uint32_t kRxRingFrames = 4096u;
+constexpr uint32_t kRxRingMask = kRxRingFrames - 1u;
+
+/// How far behind the arriving audio the reader sits, which is this direction's latency and the whole of its
+/// tolerance for a host that is late. 128 frames, 2.9 ms, one render window.
+///
+/// The device is adaptive here and cannot ask the host to change rate - no feedback endpoint is possible at Full
+/// Speed with both isochronous pipes carrying audio - so this buffer is the only thing absorbing the mismatch.
+/// B4 measures the drift before anything tries to correct it.
+constexpr uint32_t kRxLeadFrames = 128u;
+
+PLACE_SDRAM_BSS int16_t rxRing[kRxRingFrames * kRxChannels];
+
+/// Free-running like the outgoing pair, and masked only where they index. rxWriteFrame is advanced by the
+/// completion interrupt and rxReadFrame by the render path, so each has one writer.
+volatile uint32_t rxWriteFrame = 0;
+volatile uint32_t rxReadFrame = 0;
+bool rxRingCleared = false;
+bool rxPrimed = false;
+
+/// Whether the host currently holds the return interface at its streaming setting.
+bool returnActive = false;
+
+/// Two landing areas, alternating. The driver reads into this memory across the interrupt that completes the
+/// previous packet, so the buffer being decoded is never the one being filled.
+alignas(4) uint8_t rxPackets[2][kRxMaxPacketBytes] = {};
+uint32_t rxPacketSlot = 0;
+
+usb_utr_t rxTransfer = {};
+bool rxTransferInitialised = false;
+bool rxTransferInFlight = false;
+
+/// DIAGNOSTIC.
+uint32_t statRxPackets = 0;  ///< completions seen
+uint32_t statRxFrames = 0;   ///< audio frames decoded out of them
+uint32_t statRxEmpty = 0;    ///< completions carrying no audio at all
+uint32_t statRxPartial = 0;  ///< a byte count that is not a whole number of frames - never expected
+uint32_t statRxOverrun = 0;  ///< frames dropped because the reader had not taken the last ones
+uint32_t statRxUnderrun = 0; ///< render windows the ring could not fill
+uint32_t statRxDrained = 0;  ///< frames handed to the render path
+uint32_t statRxArms = 0;     ///< transfers armed
+uint32_t statRxArmErr = 0;   ///< arms the driver refused
+uint32_t statRxLastErr = 0;
+uint32_t statRxSizes[4] = {}; ///< 43 and under / 44 / 45 / 46 and over, in frames
+int32_t rxPeak[kRxChannels] = {};
+
+/// Largest signed magnitude on each channel since the last report. The one instrument that says the audio is real
+/// rather than merely arriving: a host that opens the endpoint and sends silence and one that sends music produce
+/// the same packet count and the same frame count.
+void trackReturnPeak(const int16_t* frames, uint32_t numFrames) {
+	for (uint32_t f = 0; f < numFrames; f++) {
+		for (uint32_t c = 0; c < kRxChannels; c++) {
+			int32_t v = frames[f * kRxChannels + c];
+			if (v < 0) {
+				v = -v;
+			}
+			if (v > rxPeak[c]) {
+				rxPeak[c] = v;
+			}
+		}
+	}
+}
+
+/// Copies one arrived packet into the ring, oldest-first, and reports what would not fit.
+///
+/// Runs in the completion interrupt and is the ring's only writer. An overrun is counted in frames rather than
+/// packets, because what a listener would lose is frames and a packet count cannot be turned into one later.
+void ingestReturnPacket(const uint8_t* data, uint32_t bytes) {
+	const uint32_t frames = bytes / kRxFrameBytes;
+	if (bytes % kRxFrameBytes != 0u) {
+		statRxPartial++;
+	}
+	if (frames == 0u) {
+		statRxEmpty++;
+		return;
+	}
+	statRxPackets++;
+	statRxFrames += frames;
+	if constexpr (kDiagnostics) {
+		const uint32_t nominal = kSampleRate / 1000u;
+		const uint32_t bucket = frames < nominal ? 0u : (frames == nominal ? 1u : (frames == nominal + 1u ? 2u : 3u));
+		statRxSizes[bucket]++;
+	}
+
+	const int16_t* samples = (const int16_t*)data;
+	trackReturnPeak(samples, frames);
+
+	// The reader's position bounds what may be written, so a stalled reader loses the newest audio rather than
+	// having the oldest torn out from under it mid-window.
+	const uint32_t held = rxWriteFrame - rxReadFrame;
+	const uint32_t room = held >= kRxRingFrames ? 0u : kRxRingFrames - held;
+	const uint32_t toWrite = frames <= room ? frames : room;
+	if (toWrite < frames) {
+		statRxOverrun += frames - toWrite;
+	}
+
+	uint32_t w = rxWriteFrame;
+	for (uint32_t f = 0; f < toWrite; f++) {
+		const uint32_t slot = (w + f) & kRxRingMask;
+		for (uint32_t c = 0; c < kRxChannels; c++) {
+			rxRing[slot * kRxChannels + c] = samples[f * kRxChannels + c];
+		}
+	}
+	rxWriteFrame = w + toWrite;
+}
+
+void armReturnTransfer();
+
+/// The driver hands a finished isochronous read back here with the *remaining* count in tranlen, so what arrived
+/// is what was asked for less what is left. Re-arms immediately: an isochronous pipe left un-armed simply does
+/// not answer, and the host has no way to notice or retry.
+void returnTransferComplete(usb_utr_t* ptr, uint16_t /*data1*/, uint16_t /*data2*/) {
+	rxTransferInFlight = false;
+	const uint32_t remaining = ptr != nullptr ? (uint32_t)ptr->tranlen : kRxMaxPacketBytes;
+	const uint32_t received = remaining > kRxMaxPacketBytes ? 0u : kRxMaxPacketBytes - remaining;
+	ingestReturnPacket(rxPackets[rxPacketSlot], received);
+	rxPacketSlot ^= 1u;
+	if (returnActive) {
+		armReturnTransfer();
+	}
+}
+
+/// Points the driver at the next landing area and asks it to fill it.
+void armReturnTransfer() {
+	if (!rxTransferInitialised) {
+		rxTransfer.complete = returnTransferComplete;
+		rxTransfer.p_setup = nullptr;
+		rxTransfer.segment = USB_TRAN_END;
+		rxTransfer.ip = USB_CFG_USE_USBIP;
+		rxTransfer.ipp = usb_hstd_get_usb_ip_adr(USB_CFG_USE_USBIP);
+		rxTransferInitialised = true;
+	}
+	rxTransfer.keyword = USB_CFG_PAUDIO_ISO_OUT;
+	rxTransfer.tranlen = kRxMaxPacketBytes;
+	rxTransfer.p_tranadr = (void*)rxPackets[rxPacketSlot];
+	statRxArms++;
+	const usb_er_t err = usb_pstd_transfer_start(&rxTransfer);
+	statRxLastErr = (uint32_t)err;
+	// Held only when the driver took it, for the same reason the transmit side does: a flag set on a refused
+	// transfer is a stream that never re-arms and never says why.
+	rxTransferInFlight = (err == USB_OK);
+	if (err != USB_OK) {
+		statRxArmErr++;
+	}
+}
+
+/// Takes one render window's worth of return audio out of the ring and throws it away.
+///
+/// B2 has nowhere to put it. Draining at exactly the rate B3 will read at is what makes the lead, the overrun and
+/// the underrun counters describe the steady state the mix path will actually meet - an undrained ring simply
+/// fills once and reports overruns forever, which measures nothing.
+void drainReturn(uint32_t numSamples) {
+	if (!returnActive) {
+		return;
+	}
+	const uint32_t held = rxWriteFrame - rxReadFrame;
+	if (!rxPrimed) {
+		// Nothing is read until the ring has built its lead, so the first window does not start already behind.
+		if (held < kRxLeadFrames + numSamples) {
+			return;
+		}
+		rxPrimed = true;
+	}
+	if (held < numSamples) {
+		statRxUnderrun++;
+		return;
+	}
+	rxReadFrame += numSamples;
+	statRxDrained += numSamples;
+}
+
+/// Follows the host in and out of the return interface. Mirrors the outgoing half rather than sharing it: the
+/// host selects the two interfaces independently, and a DAW recording stems without sending anything back is an
+/// ordinary way to use this.
+void serviceReturn() {
+	if (!rxRingCleared) {
+		memset(rxRing, 0, sizeof(rxRing));
+		rxRingCleared = true;
+	}
+
+	if (!g_usb_peri_connected || g_usb_pstd_alt_num[kReturnInterfaceNumber] != kStreamingAltSetting) {
+		returnActive = false;
+		rxTransferInFlight = false;
+		rxPrimed = false;
+		rxReadFrame = rxWriteFrame;
+		return;
+	}
+
+	returnActive = true;
+	if (!rxTransferInFlight) {
+		// Interrupts off across the driver's own FIFO access. Receive shares the CPU FIFO port with USB MIDI and
+		// with the outgoing pipe's re-arm, and a pipe selected on that port by two writers at once is what
+		// truncates a packet.
+		DISABLE_ALL_INTERRUPTS();
+		armReturnTransfer();
+		ENABLE_ALL_INTERRUPTS();
+	}
+}
+
 /// Copied out of the ring before submitting, because the driver reads this memory after the call returns and the
 /// producer must stay free to write.
 ///
@@ -1625,6 +1850,77 @@ void reportStats() {
 		Debug::sysexDebugPrint(*Debug::midiDebugCable, ptrLine, true);
 	}
 
+	// DIAGNOSTIC. The return, host to device. Own line and own buffer, so the outgoing half's line does not grow
+	// and the two directions can be read apart.
+	//
+	// Counted rather than claimed, field by field, because a debug line that outgrew its stack buffer froze this
+	// machine once already and the comment saying it was sized for the worst case is what stopped anyone
+	// re-checking. Tags including their leading space, then ten digits for each unsigned counter:
+	//   AUI alt 17 | act 14 | inf 14 | brdy 15 | arm 14 | aerr 15 | err 14 | pkt 14 | frm 14 | mt 13 |
+	//   part 15 | ovr 14 | unr 14 | drn 14 | wf 13 | rf 13 | held 15 | pr 4
+	//   sz 3 + 4 buckets at 11 = 47 | pk 3 + kRxChannels at 11 = 25 at two channels
+	// 335 worst case, plus the terminator. 384 leaves room for two more fields; widening the return past two
+	// channels adds 11 apiece and must be re-counted here.
+	{
+		char rxLine[384];
+		p = rxLine;
+		emit("AUI alt");
+		emitDec(g_usb_pstd_alt_num[kReturnInterfaceNumber]);
+		emit(" act");
+		emitDec(returnActive ? 1u : 0u);
+		emit(" inf");
+		emitDec(rxTransferInFlight ? 1u : 0u);
+		// Interrupts the chip raised for this pipe, counted in the driver. A zero here with a live host is the
+		// host not sending; a rising count with frm stuck at zero is the read path rather than the wire.
+		emit(" brdy");
+		emitDec(usbBrdyReturnCount);
+		emit(" arm");
+		emitDec(statRxArms);
+		emit(" aerr");
+		emitDec(statRxArmErr);
+		emit(" err");
+		emitDec(statRxLastErr);
+		emit(" pkt");
+		emitDec(statRxPackets);
+		emit(" frm");
+		emitDec(statRxFrames);
+		emit(" mt");
+		emitDec(statRxEmpty);
+		emit(" part");
+		emitDec(statRxPartial);
+		emit(" ovr");
+		emitDec(statRxOverrun);
+		emit(" unr");
+		emitDec(statRxUnderrun);
+		emit(" drn");
+		emitDec(statRxDrained);
+		// The ring's own position. held is the reader's lead in frames, which is the latency B3 inherits.
+		emit(" wf");
+		emitDec(rxWriteFrame);
+		emit(" rf");
+		emitDec(rxReadFrame);
+		emit(" held");
+		emitDec(rxWriteFrame - rxReadFrame);
+		emit(" pr");
+		emitDec(rxPrimed ? 1u : 0u);
+		// Packet sizes, in audio frames: under 44 / 44 / 45 / over 45. A host that is not sending 44.1 kHz shows
+		// here before anything else notices.
+		emit(" sz");
+		for (uint32_t i = 0; i < 4; i++) {
+			emit(i == 0 ? ":" : ",");
+			emitDec(statRxSizes[i]);
+		}
+		// Peak per channel. The only field that separates a host sending silence from a host sending music -
+		// every other number above reads the same either way.
+		emit(" pk");
+		for (uint32_t c = 0; c < kRxChannels; c++) {
+			emit(c == 0 ? ":" : ",");
+			emitDec((uint32_t)rxPeak[c]);
+		}
+		*p = '\0';
+		Debug::sysexDebugPrint(*Debug::midiDebugCable, rxLine, true);
+	}
+
 	// DIAGNOSTIC. Where the CPU this build costs the instrument actually goes, so the next change is aimed at a
 	// measured share rather than at the one candidate that got tested. Own buffer for the reason the others carry.
 	//
@@ -1775,6 +2071,26 @@ void reportStats() {
 	for (uint32_t i = 0; i < 3; i++) {
 		statDmaFrameSpan[i] = 0;
 	}
+	// Every counter on the AUI line is per-interval, so the whole line reads as one instrument at one rate. The
+	// exceptions are stated on the line itself: wf, rf and held are positions rather than counts, and err is the
+	// last code rather than a tally.
+	statRxPackets = 0;
+	statRxFrames = 0;
+	statRxEmpty = 0;
+	statRxPartial = 0;
+	statRxOverrun = 0;
+	statRxUnderrun = 0;
+	statRxDrained = 0;
+	statRxArms = 0;
+	statRxArmErr = 0;
+	usbBrdyReturnCount = 0;
+	for (uint32_t i = 0; i < 4; i++) {
+		statRxSizes[i] = 0;
+	}
+	for (uint32_t c = 0; c < kRxChannels; c++) {
+		rxPeak[c] = 0;
+	}
+
 	// usbBempBitsSeen is deliberately not cleared: which pipes are live at all is the question, not how often.
 }
 
@@ -2116,6 +2432,10 @@ void USBAudioStream::routine() {
 /// timed with the rest. This is the path the audio task is billed for, and direness is read straight off that
 /// bill, so it is the single most important of the six figures.
 static void serviceBody() {
+	// Independent of everything below: a host may hold either interface without the other, and a DAW recording
+	// stems while sending nothing back is the ordinary case.
+	serviceReturn();
+
 	if (!ringCleared) {
 		memset(ring, 0, sizeof(ring));
 		if constexpr (kAudioStamps) {
@@ -2457,6 +2777,10 @@ void USBAudioStream::costOutputLoop(uint32_t start) {
 }
 
 void USBAudioStream::feedMix(const StereoSample* mix, uint32_t numSamples, uint32_t renderOffset) {
+	// The return is consumed here because this is where B3 will sum it in, so B2's ring statistics are taken
+	// against the reader that will actually exist rather than against no reader at all.
+	drainReturn(numSamples);
+
 	// Taken before the early return, not after: what an installed-but-idle build costs is one of the things being
 	// separated, and a timer that starts after the guard can never see it.
 	const uint32_t feedStart = costStart();
