@@ -52,6 +52,22 @@
 // to sustain it.
 #define USB_CFG_PAUDIO_CHANNELS (8u)
 
+// The largest packet the outgoing endpoint may carry, in audio frames.
+//
+// This is a *bandwidth reservation*, not a buffer size: a Full Speed frame reserves at most
+// 1350 bytes for all timed audio traffic in both directions combined, and the host reserves
+// against what an endpoint declares rather than what it sends. Declared at the endpoint's
+// theoretical ceiling - 63 frames, 1008 bytes - the pair of directions came to about 1218 bytes
+// with per-packet overhead, over ninety percent of the allowance before the host's own margin.
+//
+// 46 frames is 736 bytes, which takes the pair to about 955. The transmit path sends 44 or 45,
+// so nominal traffic is unaffected; what it costs is the catch-up burst, which wanted 53 and is
+// now clamped to 46, so recovery from a stall takes longer.
+//
+// One constant, because the descriptor and the packet builder must not disagree about this. They
+// did: the descriptor declared 63 frames and the builder capped itself at 62.
+#define USB_CFG_PAUDIO_MAX_FRAMES (46u)
+
 // 11 x 16 bit is 22 bytes per audio frame, so the largest packet is 45 * 22 = 990 bytes. Pipe
 // buffers are allocated in 64-byte units, so 1024 is the smallest that fits.
 #define USB_CFG_PAUDIO_BUF_BYTES (1024u)

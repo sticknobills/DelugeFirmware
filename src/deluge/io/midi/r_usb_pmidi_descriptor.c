@@ -146,8 +146,7 @@ Macro definitions
 // Break-even is 44100 / frames-per-packet writes a second, so every extra frame the packet can hold
 // lowers the write rate the transmit path has to sustain: 980/s at 45 frames, 959/s at 46.
 #define AUDIO_FRAME_BYTES (AUDIO_NUM_CHANNELS * AUDIO_SUBFRAME_BYTES)
-#define AUDIO_ISO_LIMIT_BYTES 1023
-#define AUDIO_MAX_PACKET_SIZE ((AUDIO_ISO_LIMIT_BYTES / AUDIO_FRAME_BYTES) * AUDIO_FRAME_BYTES)
+#define AUDIO_MAX_PACKET_SIZE (USB_CFG_PAUDIO_MAX_FRAMES * AUDIO_FRAME_BYTES)
 /***********************************************************************************************************************
 Exported global variables (to be accessed by other files)
 ***********************************************************************************************************************/

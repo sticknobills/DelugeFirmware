@@ -123,6 +123,8 @@ constexpr uint32_t kFrameRemainder = kSampleRate % 1000;
 /// carry what the engine renders - 980/s at 45 frames, 959/s at 46 - and it measures 900-904 under load. Derived
 /// from kFrameBytes rather than written down, so changing the channel count moves this with it.
 constexpr uint32_t kIsoLimitBytes = 1023;
+static_assert(USB_CFG_PAUDIO_MAX_FRAMES * kFrameBytes <= kIsoLimitBytes,
+              "A Full Speed isochronous packet cannot exceed 1023 bytes");
 
 /// Every packet is a whole number of 32-byte blocks, because that is the unit the DMA controller moves in.
 ///
@@ -137,7 +139,9 @@ constexpr uint32_t kIsoLimitBytes = 1023;
 constexpr uint32_t kDmaBlockBytes = 32u;
 constexpr uint32_t kFramesPerBlock = kDmaBlockBytes / kFrameBytes;
 static_assert(kDmaBlockBytes % kFrameBytes == 0, "A DMA block must be a whole number of audio frames");
-constexpr uint32_t kMaxFramesPerPacket = (kIsoLimitBytes / kFrameBytes) / kFramesPerBlock * kFramesPerBlock;
+/// Taken from the endpoint's own declaration rather than from the bus ceiling, so the packet the builder may
+/// emit and the packet the host reserved bandwidth for are one number. They were two, and differed by a frame.
+constexpr uint32_t kMaxFramesPerPacket = USB_CFG_PAUDIO_MAX_FRAMES / kFramesPerBlock * kFramesPerBlock;
 constexpr uint32_t kMaxPacketBytes = kMaxFramesPerPacket * kFrameBytes;
 static_assert(kMaxPacketBytes % kDmaBlockBytes == 0, "Packets must be whole DMA blocks");
 
