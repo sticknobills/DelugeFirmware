@@ -88,6 +88,18 @@ constexpr bool kDiagnostics = true;
 /// what routing costs needs the instruments on and the stamps off, which one flag could not express. Implies
 /// kDiagnostics: the encoder and the marks are compiled with the rest of the instruments.
 constexpr bool kAudioStamps = false;
+
+/// DIAGNOSTIC. Puts the Deluge's own finished mix on channels 7 and 8, in place of whatever stems are routed
+/// there.
+///
+/// The one thing the outgoing stream cannot otherwise show: a stem is captured before the master chain and the
+/// return is summed in after it, so nothing on the wire contains the returned audio. Without this the round trip
+/// can only be judged by ear, and a round-trip *latency* cannot be judged by ear at all.
+///
+/// Off for anything a listener judges - it costs two channels of real routing. On for the latency and unity-gain
+/// measurements, which is the only reason it exists. Routing the finished mix as a *feature* is stage D, and is a
+/// different decision from this one.
+constexpr bool kMixOnChannels78 = false;
 static_assert(!kAudioStamps || kDiagnostics, "The stamps are part of the instruments and need them compiled in");
 
 /// Must match the AudioStreaming interface's number in r_usb_pmidi_descriptor.c.
@@ -2965,6 +2977,13 @@ void USBAudioStream::feedMix(const StereoSample* mix, uint32_t numSamples, uint3
 					frame[c] = 0;
 				}
 			}
+		}
+		if constexpr (kMixOnChannels78) {
+			// After the stem walk above, so these two win: the channels carry the mix rather than a stem. The
+			// same width reduction the mix pair uses, so a level read here is directly comparable with one read
+			// off a stem - which is the whole point of measuring a round trip this way.
+			frame[kChannels - 2] = (int16_t)(mix[i].l >> 16);
+			frame[kChannels - 1] = (int16_t)(mix[i].r >> 16);
 		}
 		if constexpr (kAudioStamps) {
 			// The producer's own frame count, travelling with the audio it belongs to. Whatever reaches the host
