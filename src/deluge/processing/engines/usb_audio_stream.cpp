@@ -99,7 +99,7 @@ constexpr bool kAudioStamps = false;
 /// Off for anything a listener judges - it costs two channels of real routing. On for the latency and unity-gain
 /// measurements, which is the only reason it exists. Routing the finished mix as a *feature* is stage D, and is a
 /// different decision from this one.
-constexpr bool kMixOnChannels78 = true;
+constexpr bool kMixOnChannels78 = false;
 static_assert(!kAudioStamps || kDiagnostics, "The stamps are part of the instruments and need them compiled in");
 
 /// Must match the AudioStreaming interface's number in r_usb_pmidi_descriptor.c.
