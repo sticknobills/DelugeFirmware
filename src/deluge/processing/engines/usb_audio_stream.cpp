@@ -767,7 +767,13 @@ bool returnEnabled = true;
 /// Nominally, not exactly - B3.5 owns the measured unity round trip, and until it lands the level control is how
 /// a rig disagrees.
 constexpr uint32_t kReturnShift = 1u + 16u - AUDIO_OUTPUT_GAIN_DOUBLINGS;
-int32_t returnMultiplierQ8 = 0;
+
+/// Sixteen fractional bits, not eight. At eight the trim's inverse rounded 1008.35 to 1008, which is a systematic
+/// -0.0066 dB on every sample of every round trip - small, but a gain error rather than noise, so it compounds
+/// through a chain rather than averaging out. Sixteen takes the same figure to -0.0016 dB. Modelled over the
+/// whole input range before the change, not judged by ear.
+constexpr uint32_t kReturnMultiplierBits = 16u;
+int32_t returnMultiplierQ16 = 0;
 
 /// Ramp applied on top, in Q16, so a stream that stops or a ring that runs dry fades rather than steps.
 ///
@@ -779,18 +785,35 @@ int32_t returnFade = 0;
 
 void recomputeReturnMultiplier() {
 	if (stemTrimMultiplier <= 0 || !returnEnabled || returnLevelSetting == 0) {
-		returnMultiplierQ8 = 0;
+		returnMultiplierQ16 = 0;
 		return;
 	}
-	// The trim's own inverse in Q8: the outgoing side multiplied by trimMultiplier / 2^24.
-	const uint32_t trimInverseQ8 = (uint32_t)(((uint64_t)1u << 32) / (uint32_t)stemTrimMultiplier);
+	// The trim's own inverse: the outgoing side multiplied by trimMultiplier / 2^24.
+	const uint32_t trimInverse =
+	    (uint32_t)(((uint64_t)1u << (24u + kReturnMultiplierBits)) / (uint32_t)stemTrimMultiplier);
 	// Then the user's level, built on the same 1.2 dB ladder as the trim so the two controls feel alike.
 	int32_t levelMultiplier = 1 << 24;
 	for (uint32_t step = returnLevelSetting; step < deluge::processing::engines::USBAudioStream::kReturnLevelMax;
 	     step++) {
 		levelMultiplier = (int32_t)(((int64_t)levelMultiplier * 57139) >> 16);
 	}
-	returnMultiplierQ8 = (int32_t)(((int64_t)trimInverseQ8 * levelMultiplier) >> 24);
+	returnMultiplierQ16 = (int32_t)(((int64_t)trimInverse * levelMultiplier) >> 24);
+}
+
+/// One arriving sample, back at the mix's own scale.
+///
+/// Saturating, and not merely for tidiness. The multiplier is the trim's inverse, so a low trim means a large
+/// one: at a trim of 10 a full-scale return lands at 4.0e9, which wraps an int32 to a large negative number. A
+/// gain error is quiet and a wrap is a polarity inversion at full scale, so the guard is worth its comparison.
+[[gnu::always_inline]] inline int32_t returnToMixScale(int16_t sample) {
+	const int64_t wide = ((int64_t)((int32_t)sample << kReturnShift) * returnMultiplierQ16) >> kReturnMultiplierBits;
+	if (wide > INT32_MAX) {
+		return INT32_MAX;
+	}
+	if (wide < INT32_MIN) {
+		return INT32_MIN;
+	}
+	return (int32_t)wide;
 }
 
 /// Sums one render window of returning audio into the mix, and advances the ring by exactly what it took.
@@ -843,9 +866,8 @@ void mixReturnInto(StereoSample* buffer, uint32_t numSamples) {
 			continue;
 		}
 		const int16_t* const frame = &rxRing[((r + i) & kRxRingMask) * kRxChannels];
-		const int32_t left = (int32_t)(((int64_t)((int32_t)frame[0] << kReturnShift) * returnMultiplierQ8) >> 8);
-		const int32_t right =
-		    (int32_t)(((int64_t)((int32_t)frame[kRxChannels > 1 ? 1 : 0] << kReturnShift) * returnMultiplierQ8) >> 8);
+		const int32_t left = returnToMixScale(frame[0]);
+		const int32_t right = returnToMixScale(frame[kRxChannels > 1 ? 1 : 0]);
 		if (returnFade >= kReturnFadeFull) {
 			buffer[i].l += left;
 			buffer[i].r += right;
