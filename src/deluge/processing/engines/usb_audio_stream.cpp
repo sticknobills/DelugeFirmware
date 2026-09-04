@@ -292,12 +292,21 @@ constexpr uint32_t kRxRingFrames = 4096u;
 constexpr uint32_t kRxRingMask = kRxRingFrames - 1u;
 
 /// How far behind the arriving audio the reader sits, which is this direction's latency and the whole of its
-/// tolerance for a host that is late. 128 frames, 2.9 ms, one render window.
+/// tolerance for a host or an engine that is late.
+///
+/// 128 frames - one render window - measured on hardware at 84 under-runs a second on the dense reference song,
+/// with the ring hovering at 67-94 frames against the 128 a whole window needs. The reader takes a window at a
+/// time, so a cushion of exactly one window has no margin at all by construction, and every scrap of engine
+/// jitter empties it. The outgoing ring learned this and holds two windows; this one was written at one anyway.
+///
+/// 512 frames, 11.6 ms, four windows: the reader still needs 128 at a time, so this leaves three windows of
+/// slack for the engine's bursts and the host's own 512-frame buffering. It is latency, and B3.5 is where that
+/// gets traded against the round trip properly - but silence is worse than delay.
 ///
 /// The device is adaptive here and cannot ask the host to change rate - no feedback endpoint is possible at Full
 /// Speed with both isochronous pipes carrying audio - so this buffer is the only thing absorbing the mismatch.
 /// B4 measures the drift before anything tries to correct it.
-constexpr uint32_t kRxLeadFrames = 128u;
+constexpr uint32_t kRxLeadFrames = 512u;
 
 PLACE_SDRAM_BSS int16_t rxRing[kRxRingFrames * kRxChannels];
 
@@ -2053,9 +2062,10 @@ void reportStats() {
 	// numbers separated by commas is 6 x 38 = 228. 244 worst case, and the two refusal lines are shorter than
 	// either.
 	{
-		// Eleven fields of <tag>:<permille>,<calls>,<mean>. Worst case a tag is 7 characters, permille 4 digits,
-		// calls and mean 10 each, plus two commas: 33. Eleven of those is 363, and the header "AUX el" with a
-		// ten-digit interval is 16 more. 448 leaves room for two further fields. Nothing below bounds-checks, and
+		// Twelve fields of <tag>:<permille>,<calls>,<mean>. Worst case a tag is 7 characters, permille 4 digits,
+		// calls and mean 10 each, plus two commas: 33. Twelve of those is 396, and the header "AUX el" with a
+		// ten-digit interval is 16 more: 412. 448 leaves room for one further field, and the next one added
+		// must widen the buffer. Nothing below bounds-checks, and
 		// a debug line that outgrew its buffer froze this machine once already - so this is counted, not claimed.
 		char costLine[448];
 		p = costLine;
@@ -2106,6 +2116,8 @@ void reportStats() {
 			emitCost(" snap:", costStemSnapshot);
 			emitCost(" cap:", costStemCapture);
 			emitCost(" clr:", costStemClear);
+			// Never printed until now: stage B's only addition to the render path, and B6 has to price it.
+			emitCost(" rtn:", costReturnMix);
 			emitCost(" eng:", costEngine);
 			emitCost(" outs:", costOutputs);
 		}
@@ -2113,6 +2125,7 @@ void reportStats() {
 		Debug::sysexDebugPrint(*Debug::midiDebugCable, costLine, true);
 		costIntervalStart = live1;
 		costTimer = PathCost{};
+		costReturnMix = PathCost{};
 		costFifoWrite = PathCost{};
 		costService = PathCost{};
 		costBuild = PathCost{};
