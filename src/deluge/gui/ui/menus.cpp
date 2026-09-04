@@ -1954,11 +1954,19 @@ PLACE_SDRAM_BSS menu_item::Submenu soundEditorRootMenuKitGlobalFX{
 // is on the other end of the cable, not anything about the song.
 PLACE_SDRAM_BSS usb_audio::Level usbAudioLevelMenu{STRING_FOR_USB_LEVEL, STRING_FOR_USB_LEVEL};
 
+// The return, host to device. Audio arriving on the cable is summed into the song immediately after every track
+// has summed, so it meets the whole song chain exactly as the Deluge's own audio does.
+PLACE_SDRAM_BSS usb_audio::ReturnToggle usbAudioReturnMenu{STRING_FOR_USB_RETURN, STRING_FOR_USB_RETURN};
+PLACE_SDRAM_BSS usb_audio::ReturnLevel usbAudioReturnLevelMenu{STRING_FOR_USB_RETURN_LEVEL,
+                                                               STRING_FOR_USB_RETURN_LEVEL};
+
 PLACE_SDRAM_BSS Submenu usbAudioSettingsMenu{
     STRING_FOR_USB_ROUTING,
     STRING_FOR_USB_ROUTING,
     {
         &usbAudioLevelMenu,
+        &usbAudioReturnMenu,
+        &usbAudioReturnLevelMenu,
     },
 };
 

@@ -104,6 +104,26 @@ public:
 	static void setTrim(uint32_t trim);
 	static uint32_t getTrim();
 
+	/// Sums one render window of returning audio into the song's mix.
+	///
+	/// Called immediately after every track has summed and before anything song-level, so the return gets the
+	/// song's mod FX, delay, reverb send, master filters, volume and compressor exactly as the Deluge's own audio
+	/// does - which is what makes a device on the other end of the cable behave like an insert rather than a
+	/// separate instrument. Costs nothing when no host is sending.
+	static void mixReturn(StereoSample* buffer, uint32_t numSamples);
+
+	/// Level applied to the returning audio, 0-50, 1.2 dB a step, and whether it is summed in at all.
+	///
+	/// The default is unity against the outgoing trim's own inverse, so a device that returns what it was given
+	/// is nominally level-transparent. Nominally: the measured unity round trip is B3.5, and this is how a rig
+	/// disagrees until then.
+	static constexpr uint32_t kReturnLevelMax = 50;
+	static constexpr uint32_t kReturnLevelDefault = 50;
+	static void setReturnLevel(uint32_t level);
+	static uint32_t getReturnLevel();
+	static void setReturnEnabled(bool enabled);
+	static bool getReturnEnabled();
+
 	/// Largest magnitude any stem has reached since the last read, at capture scale and therefore before the
 	/// width reduction that would clip it. The instrument the trim is set from.
 	static int32_t readAndClearStemPeak();

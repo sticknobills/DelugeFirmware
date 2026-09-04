@@ -2566,6 +2566,16 @@ void Song::renderAudio(std::span<StereoSample> outputBuffer, int32_t* reverbBuff
 #endif
 	}
 	deluge::processing::engines::USBAudioStream::costOutputLoop(outputLoopStart);
+
+	// Audio arriving over the cable joins the song here: after every track has summed and before anything
+	// song-level, so it meets the mod FX, the delay, the reverb send, the master filters, the volume and the
+	// compressor exactly as the Deluge's own tracks do. A track sent out and returned therefore lands back where
+	// it left, which is what makes the round trip an insert rather than a second instrument.
+	//
+	// Before the MIX recorder below, deliberately: a recording of the mix is a recording of the song, and the
+	// return is part of the song by the time it reaches here.
+	deluge::processing::engines::USBAudioStream::mixReturn(outputBuffer.data(), (uint32_t)outputBuffer.size());
+
 	AudioEngine::logAction("done rendering outputs");
 	// If recording the "MIX", this is the place where we want to grab it - before any master FX or volume applied
 	// Go through each SampleRecorder, feeding them audio

@@ -571,6 +571,8 @@ PLACE_SDRAM_DATA Language seven_segment{
         {STRING_FOR_USB_PAIR_78, "7-8"},
         {STRING_FOR_USB_MAIN, "MAIN"},
         {STRING_FOR_USB_LEVEL, "LVL"},
+        {STRING_FOR_USB_RETURN, "RTN"},
+        {STRING_FOR_USB_RETURN_LEVEL, "RLVL"},
     },
     &built_in::english,
 };

@@ -196,6 +196,8 @@ enum Entries {
 198: reserved for the AUX sends stereo-split flag, which lives on a sibling branch - taken here it would
      collide the moment the two features merge
 199: usbAudioTrim + 1, so that a virgin byte of zero reads as "never written" and takes the default
+200: usbAudioReturnLevel + 1, offset for the same reason
+201: usbAudioReturnEnabled + 1, likewise - 0 means never written, 1 off, 2 on
 */
 
 uint8_t defaultScale;
@@ -243,6 +245,8 @@ uint8_t defaultHoldTime;
 ScreensaverMode screensaverMode;
 uint8_t screensaverTimeoutMinutes;
 uint8_t usbAudioTrim;
+bool usbAudioReturnEnabled;
+uint8_t usbAudioReturnLevel;
 int32_t holdTime;
 
 uint8_t defaultSwingInterval;
@@ -362,6 +366,8 @@ void resetSettings() {
 	screensaverMode = kDefaultScreensaverMode;
 	screensaverTimeoutMinutes = kDefaultScreensaverTimeoutMinutes;
 	usbAudioTrim = deluge::processing::engines::USBAudioStream::kTrimDefault;
+	usbAudioReturnEnabled = true;
+	usbAudioReturnLevel = deluge::processing::engines::USBAudioStream::kReturnLevelDefault;
 
 	defaultSwingInterval = 8 - defaultMagnitude; // 16th notes
 
@@ -831,6 +837,17 @@ void readSettings() {
 	                   ? (uint8_t)deluge::processing::engines::USBAudioStream::kTrimDefault
 	                   : (uint8_t)(storedTrim - 1);
 	deluge::processing::engines::USBAudioStream::setTrim(usbAudioTrim);
+
+	const uint8_t storedReturnLevel = buffer[200];
+	usbAudioReturnLevel =
+	    (storedReturnLevel == 0 || storedReturnLevel > deluge::processing::engines::USBAudioStream::kReturnLevelMax + 1)
+	        ? (uint8_t)deluge::processing::engines::USBAudioStream::kReturnLevelDefault
+	        : (uint8_t)(storedReturnLevel - 1);
+	const uint8_t storedReturnEnabled = buffer[201];
+	usbAudioReturnEnabled = (storedReturnEnabled == 0) ? true : (storedReturnEnabled == 2);
+	// Level before enabled: both recompute the same multiplier, and the enabled flag is the one that may zero it.
+	deluge::processing::engines::USBAudioStream::setReturnLevel(usbAudioReturnLevel);
+	deluge::processing::engines::USBAudioStream::setReturnEnabled(usbAudioReturnEnabled);
 }
 
 static bool areAutomationSettingsValid(std::span<uint8_t> buffer) {
@@ -1068,6 +1085,8 @@ void writeSettings() {
 	buffer[196] = util::to_underlying(screensaverMode);
 	buffer[197] = screensaverTimeoutMinutes;
 	buffer[199] = (uint8_t)(usbAudioTrim + 1);
+	buffer[200] = (uint8_t)(usbAudioReturnLevel + 1);
+	buffer[201] = usbAudioReturnEnabled ? 2 : 1;
 
 	R_SFLASH_EraseSector(0x80000 - 0x1000, SPIBSC_CH, SPIBSC_CMNCR_BSZ_SINGLE, 1, SPIBSC_OUTPUT_ADDR_24);
 	R_SFLASH_ByteProgram(0x80000 - 0x1000, buffer.data(), 256, SPIBSC_CH, SPIBSC_CMNCR_BSZ_SINGLE, SPIBSC_1BIT,

@@ -1020,6 +1020,8 @@ PLACE_SDRAM_DATA Language english{
         {STRING_FOR_USB_PAIR_78, "USB Pair 7-8"},
         {STRING_FOR_USB_MAIN, "Main Mix"},
         {STRING_FOR_USB_LEVEL, "USB Level"},
+        {STRING_FOR_USB_RETURN, "USB Return"},
+        {STRING_FOR_USB_RETURN_LEVEL, "Return Level"},
     },
 };
 } // namespace deluge::l10n::built_in

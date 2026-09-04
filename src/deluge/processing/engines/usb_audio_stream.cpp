@@ -418,31 +418,6 @@ void armReturnTransfer() {
 	}
 }
 
-/// Takes one render window's worth of return audio out of the ring and throws it away.
-///
-/// B2 has nowhere to put it. Draining at exactly the rate B3 will read at is what makes the lead, the overrun and
-/// the underrun counters describe the steady state the mix path will actually meet - an undrained ring simply
-/// fills once and reports overruns forever, which measures nothing.
-void drainReturn(uint32_t numSamples) {
-	if (!returnActive) {
-		return;
-	}
-	const uint32_t held = rxWriteFrame - rxReadFrame;
-	if (!rxPrimed) {
-		// Nothing is read until the ring has built its lead, so the first window does not start already behind.
-		if (held < kRxLeadFrames + numSamples) {
-			return;
-		}
-		rxPrimed = true;
-	}
-	if (held < numSamples) {
-		statRxUnderrun++;
-		return;
-	}
-	rxReadFrame += numSamples;
-	statRxDrained += numSamples;
-}
-
 /// Follows the host in and out of the return interface. Mirrors the outgoing half rather than sharing it: the
 /// host selects the two interfaces independently, and a DAW recording stems without sending anything back is an
 /// ordinary way to use this.
@@ -684,6 +659,7 @@ struct PathCost {
 };
 PathCost costTimer = {};       ///< the whole write-timer interrupt, every branch including the ones that do nothing
 PathCost costFifoWrite = {};   ///< the FIFO copy alone, nested inside costTimer
+PathCost costReturnMix = {};   ///< summing the return into the song's mix, the only cost stage B adds to the render
 PathCost costService = {};     ///< all of service(), which the audio task is billed for and direness is read from
 PathCost costBuild = {};       ///< buildQueuedPackets, ring memcpy included, nested inside costService
 PathCost costSubmit = {};      ///< the driver's own submit path, nested inside costService
@@ -773,6 +749,117 @@ bool costCounterEnabled = false;
 	if constexpr (kDiagnostics) {
 		c += n;
 	}
+}
+
+/// Level applied to the returning audio, 0-50 on the same 1.2 dB ladder as the outgoing trim, and whether it is
+/// summed in at all. Per-machine: like the trim, it describes the gain staging of what is on the other end of the
+/// cable rather than anything about the song.
+uint32_t returnLevelSetting = deluge::processing::engines::USBAudioStream::kReturnLevelDefault;
+bool returnEnabled = true;
+
+/// The whole conversion from an arriving 16-bit sample back to the mix's own scale, held as one multiplier so the
+/// hot path is a multiply and a shift.
+///
+/// Derived from the outgoing stem conversion rather than guessed at, so the round trip is nominally unity: a stem
+/// leaves as ((mix * trim) >> 24 >> 1) << AUDIO_OUTPUT_GAIN_DOUBLINGS >> 16, a net right shift of kReturnShift
+/// with the trim ratio applied, and this is its inverse at whatever the trim currently is.
+///
+/// Nominally, not exactly - B3.5 owns the measured unity round trip, and until it lands the level control is how
+/// a rig disagrees.
+constexpr uint32_t kReturnShift = 1u + 16u - AUDIO_OUTPUT_GAIN_DOUBLINGS;
+int32_t returnMultiplierQ8 = 0;
+
+/// Ramp applied on top, in Q16, so a stream that stops or a ring that runs dry fades rather than steps.
+///
+/// A step from a live sample to zero is a click, and the host is entitled to stop sending at any moment without
+/// saying so - an isochronous endpoint has no way to announce it. 128 samples is about 3 ms.
+constexpr int32_t kReturnFadeFull = 1 << 16;
+constexpr int32_t kReturnFadeStep = kReturnFadeFull / 128;
+int32_t returnFade = 0;
+
+void recomputeReturnMultiplier() {
+	if (stemTrimMultiplier <= 0 || !returnEnabled || returnLevelSetting == 0) {
+		returnMultiplierQ8 = 0;
+		return;
+	}
+	// The trim's own inverse in Q8: the outgoing side multiplied by trimMultiplier / 2^24.
+	const uint32_t trimInverseQ8 = (uint32_t)(((uint64_t)1u << 32) / (uint32_t)stemTrimMultiplier);
+	// Then the user's level, built on the same 1.2 dB ladder as the trim so the two controls feel alike.
+	int32_t levelMultiplier = 1 << 24;
+	for (uint32_t step = returnLevelSetting; step < deluge::processing::engines::USBAudioStream::kReturnLevelMax;
+	     step++) {
+		levelMultiplier = (int32_t)(((int64_t)levelMultiplier * 57139) >> 16);
+	}
+	returnMultiplierQ8 = (int32_t)(((int64_t)trimInverseQ8 * levelMultiplier) >> 24);
+}
+
+/// Sums one render window of returning audio into the mix, and advances the ring by exactly what it took.
+///
+/// The ring's only reader, which is what makes the pointer pair safe: the completion interrupt writes and this
+/// reads, one writer each.
+void mixReturnInto(StereoSample* buffer, uint32_t numSamples) {
+	if (!returnActive) {
+		// Parked on the writer, so the next host does not arrive to a ring that already looks full.
+		rxReadFrame = rxWriteFrame;
+		rxPrimed = false;
+	}
+	else if (!rxPrimed) {
+		// Nothing is read until the ring has built its lead, so the first window does not start already behind.
+		if ((rxWriteFrame - rxReadFrame) >= kRxLeadFrames + numSamples) {
+			rxPrimed = true;
+		}
+	}
+
+	const uint32_t held = rxWriteFrame - rxReadFrame;
+	const bool haveAudio = returnActive && returnEnabled && rxPrimed && held >= numSamples;
+	if (returnActive && returnEnabled && rxPrimed && held < numSamples) {
+		statRxUnderrun++;
+	}
+
+	// Nothing to add and nothing left to fade: the ordinary state of a machine with nothing plugged in, and it
+	// costs one comparison.
+	if (!haveAudio && returnFade == 0) {
+		return;
+	}
+
+	const uint32_t start = costStart();
+	const uint32_t r = rxReadFrame;
+	for (uint32_t i = 0; i < numSamples; i++) {
+		// One step a sample in whichever direction the state calls for, so arriving and leaving cost the same
+		// 3 ms and neither is a step change.
+		if (haveAudio) {
+			returnFade += kReturnFadeStep;
+			if (returnFade > kReturnFadeFull) {
+				returnFade = kReturnFadeFull;
+			}
+		}
+		else {
+			returnFade -= kReturnFadeStep;
+			if (returnFade < 0) {
+				returnFade = 0;
+			}
+			// Fading out over audio that is no longer arriving is fading out over nothing, so the ramp simply
+			// runs down against silence.
+			continue;
+		}
+		const int16_t* const frame = &rxRing[((r + i) & kRxRingMask) * kRxChannels];
+		const int32_t left = (int32_t)(((int64_t)((int32_t)frame[0] << kReturnShift) * returnMultiplierQ8) >> 8);
+		const int32_t right =
+		    (int32_t)(((int64_t)((int32_t)frame[kRxChannels > 1 ? 1 : 0] << kReturnShift) * returnMultiplierQ8) >> 8);
+		if (returnFade >= kReturnFadeFull) {
+			buffer[i].l += left;
+			buffer[i].r += right;
+		}
+		else {
+			buffer[i].l += (int32_t)(((int64_t)left * returnFade) >> 16);
+			buffer[i].r += (int32_t)(((int64_t)right * returnFade) >> 16);
+		}
+	}
+	if (haveAudio) {
+		rxReadFrame = r + numSamples;
+		statRxDrained += numSamples;
+	}
+	addCost(costReturnMix, start);
 }
 
 /// Branch counters. "Nothing was sent" cannot distinguish the task never running, the task
@@ -2735,6 +2822,34 @@ void USBAudioStream::removeTrackFromMix(int32_t* mixNow, uint32_t numSamples) {
 	addCost(costStemSnapshot, start);
 }
 
+void USBAudioStream::mixReturn(StereoSample* buffer, uint32_t numSamples) {
+	if (buffer == nullptr || numSamples == 0) {
+		return;
+	}
+	mixReturnInto(buffer, numSamples);
+}
+
+void USBAudioStream::setReturnLevel(uint32_t level) {
+	if (level > kReturnLevelMax) {
+		level = kReturnLevelMax;
+	}
+	returnLevelSetting = level;
+	recomputeReturnMultiplier();
+}
+
+uint32_t USBAudioStream::getReturnLevel() {
+	return returnLevelSetting;
+}
+
+void USBAudioStream::setReturnEnabled(bool enabled) {
+	returnEnabled = enabled;
+	recomputeReturnMultiplier();
+}
+
+bool USBAudioStream::getReturnEnabled() {
+	return returnEnabled;
+}
+
 void USBAudioStream::setTrim(uint32_t trim) {
 	if (trim > kTrimMax) {
 		trim = kTrimMax;
@@ -2752,6 +2867,8 @@ void USBAudioStream::setTrim(uint32_t trim) {
 		multiplier = (int32_t)(((int64_t)multiplier * 57139) >> 16);
 	}
 	stemTrimMultiplier = multiplier;
+	// The return's conversion is this one's inverse, so the two cannot be set independently.
+	recomputeReturnMultiplier();
 }
 
 uint32_t USBAudioStream::getTrim() {
@@ -2777,10 +2894,6 @@ void USBAudioStream::costOutputLoop(uint32_t start) {
 }
 
 void USBAudioStream::feedMix(const StereoSample* mix, uint32_t numSamples, uint32_t renderOffset) {
-	// The return is consumed here because this is where B3 will sum it in, so B2's ring statistics are taken
-	// against the reader that will actually exist rather than against no reader at all.
-	drainReturn(numSamples);
-
 	// Taken before the early return, not after: what an installed-but-idle build costs is one of the things being
 	// separated, and a timer that starts after the guard can never see it.
 	const uint32_t feedStart = costStart();

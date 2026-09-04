@@ -122,4 +122,46 @@ public:
 	}
 };
 
+/// Whether audio arriving on the cable is summed into the song at all.
+///
+/// Per-machine rather than per-song, for the same reason the trim is: it describes what is connected, not what is
+/// being played. Off is the state a machine with nothing plugged in should be indistinguishable from.
+class ReturnToggle final : public Toggle {
+public:
+	using Toggle::Toggle;
+
+	void readCurrentValue() override {
+		this->setValue(deluge::processing::engines::USBAudioStream::getReturnEnabled());
+	}
+
+	void writeCurrentValue() override {
+		deluge::processing::engines::USBAudioStream::setReturnEnabled(this->getValue());
+		FlashStorage::usbAudioReturnEnabled = this->getValue();
+	}
+};
+
+/// Level applied to the returning audio, 0-50, 1.2 dB a step.
+///
+/// The default is unity against the outgoing trim's own inverse, so a device that hands back what it was given is
+/// nominally level-transparent. Nominally: the measured unity round trip is its own step, and this is how a rig
+/// disagrees until then.
+class ReturnLevel final : public Integer {
+public:
+	using Integer::Integer;
+
+	[[nodiscard]] int32_t getMinValue() const override { return 0; }
+	[[nodiscard]] int32_t getMaxValue() const override {
+		return (int32_t)deluge::processing::engines::USBAudioStream::kReturnLevelMax;
+	}
+
+	void readCurrentValue() override {
+		this->setValue((int32_t)deluge::processing::engines::USBAudioStream::getReturnLevel());
+	}
+
+	void writeCurrentValue() override {
+		deluge::processing::engines::USBAudioStream::setReturnLevel((uint32_t)this->getValue());
+		FlashStorage::usbAudioReturnLevel = (uint8_t)this->getValue();
+	}
+};
+
 } // namespace deluge::gui::menu_item::usb_audio
