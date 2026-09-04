@@ -299,14 +299,19 @@ constexpr uint32_t kRxRingMask = kRxRingFrames - 1u;
 /// time, so a cushion of exactly one window has no margin at all by construction, and every scrap of engine
 /// jitter empties it. The outgoing ring learned this and holds two windows; this one was written at one anyway.
 ///
-/// 512 frames, 11.6 ms, four windows: the reader still needs 128 at a time, so this leaves three windows of
-/// slack for the engine's bursts and the host's own 512-frame buffering. It is latency, and B3.5 is where that
-/// gets traded against the round trip properly - but silence is worse than delay.
+/// 1024 frames, 23 ms. Measured on hardware: playing the dense song knocks the cushion from 512 down to about
+/// 80 and it stays there, so the engine takes the return in bursts of roughly 450 frames, and any cushion
+/// smaller than that burst sits permanently on the floor. Latency, and B3.5 trades it once the burst is
+/// understood rather than merely covered.
+///
+/// The earlier note, kept because its reasoning still holds: the reader still needs 128 at a time, so this leaves three
+/// windows of slack for the engine's bursts and the host's own 512-frame buffering. It is latency, and B3.5 is where
+/// that gets traded against the round trip properly - but silence is worse than delay.
 ///
 /// The device is adaptive here and cannot ask the host to change rate - no feedback endpoint is possible at Full
 /// Speed with both isochronous pipes carrying audio - so this buffer is the only thing absorbing the mismatch.
 /// B4 measures the drift before anything tries to correct it.
-constexpr uint32_t kRxLeadFrames = 512u;
+constexpr uint32_t kRxLeadFrames = 1024u;
 
 PLACE_SDRAM_BSS int16_t rxRing[kRxRingFrames * kRxChannels];
 
@@ -330,15 +335,16 @@ bool rxTransferInitialised = false;
 bool rxTransferInFlight = false;
 
 /// DIAGNOSTIC.
-uint32_t statRxPackets = 0;  ///< completions seen
-uint32_t statRxFrames = 0;   ///< audio frames decoded out of them
-uint32_t statRxEmpty = 0;    ///< completions carrying no audio at all
-uint32_t statRxPartial = 0;  ///< a byte count that is not a whole number of frames - never expected
-uint32_t statRxOverrun = 0;  ///< frames dropped because the reader had not taken the last ones
-uint32_t statRxUnderrun = 0; ///< render windows the ring could not fill
-uint32_t statRxDrained = 0;  ///< frames handed to the render path
-uint32_t statRxArms = 0;     ///< transfers armed
-uint32_t statRxArmErr = 0;   ///< arms the driver refused
+uint32_t statRxPackets = 0;     ///< completions seen
+uint32_t statRxFrames = 0;      ///< audio frames decoded out of them
+uint32_t statRxEmpty = 0;       ///< completions carrying no audio at all
+uint32_t statRxPartial = 0;     ///< a byte count that is not a whole number of frames - never expected
+uint32_t statRxOverrun = 0;     ///< frames dropped because the reader had not taken the last ones
+uint32_t statRxUnderrun = 0;    ///< render windows the ring could not fill completely
+uint32_t statRxShortFrames = 0; ///< frames missing across those windows - what was actually lost
+uint32_t statRxDrained = 0;     ///< frames handed to the render path
+uint32_t statRxArms = 0;        ///< transfers armed
+uint32_t statRxArmErr = 0;      ///< arms the driver refused
 uint32_t statRxLastErr = 0;
 uint32_t statRxSizes[4] = {}; ///< 43 and under / 44 / 45 / 46 and over, in frames
 int32_t rxPeak[kRxChannels] = {};
@@ -845,6 +851,12 @@ void recomputeReturnMultiplier() {
 ///
 /// The ring's only reader, which is what makes the pointer pair safe: the completion interrupt writes and this
 /// reads, one writer each.
+///
+/// Takes what is there rather than insisting on a whole window. The first version demanded the full window and
+/// discarded all of it otherwise - measured on hardware at 15-30 shortfalls a second on the dense reference
+/// song, each throwing away a window that was mostly present. Worse, each was treated as the stream going away
+/// and rolled the fade down and back up; at that rate it is an amplitude wobble around 20 Hz, an accidental
+/// tremolo, and it is the "warbling" that took most of a session to explain.
 void mixReturnInto(StereoSample* buffer, uint32_t numSamples) {
 	if (!returnActive) {
 		// Parked on the writer, so the next host does not arrive to a ring that already looks full.
@@ -859,23 +871,23 @@ void mixReturnInto(StereoSample* buffer, uint32_t numSamples) {
 	}
 
 	const uint32_t held = rxWriteFrame - rxReadFrame;
-	const bool haveAudio = returnActive && returnEnabled && rxPrimed && held >= numSamples;
-	if (returnActive && returnEnabled && rxPrimed && held < numSamples) {
+	const bool streaming = returnActive && returnEnabled && rxPrimed;
+	const uint32_t available = streaming ? (held < numSamples ? held : numSamples) : 0u;
+	if (streaming && available < numSamples) {
 		statRxUnderrun++;
+		statRxShortFrames += numSamples - available;
 	}
 
-	// Nothing to add and nothing left to fade: the ordinary state of a machine with nothing plugged in, and it
-	// costs one comparison.
-	if (!haveAudio && returnFade == 0) {
+	// The fade follows whether the host is streaming at all, not whether this window happened to be full. A
+	// shortfall is a few missing frames, not a departure.
+	if (!streaming && returnFade == 0) {
 		return;
 	}
 
 	const uint32_t start = costStart();
 	const uint32_t r = rxReadFrame;
 	for (uint32_t i = 0; i < numSamples; i++) {
-		// One step a sample in whichever direction the state calls for, so arriving and leaving cost the same
-		// 3 ms and neither is a step change.
-		if (haveAudio) {
+		if (streaming) {
 			returnFade += kReturnFadeStep;
 			if (returnFade > kReturnFadeFull) {
 				returnFade = kReturnFadeFull;
@@ -886,8 +898,10 @@ void mixReturnInto(StereoSample* buffer, uint32_t numSamples) {
 			if (returnFade < 0) {
 				returnFade = 0;
 			}
-			// Fading out over audio that is no longer arriving is fading out over nothing, so the ramp simply
-			// runs down against silence.
+		}
+		// Past what arrived there is nothing to add, and what did arrive is still mixed at full level - so a
+		// shortfall costs the missing frames and nothing else.
+		if (i >= available) {
 			continue;
 		}
 		const int16_t* const frame = &rxRing[((r + i) & kRxRingMask) * kRxChannels];
@@ -902,10 +916,8 @@ void mixReturnInto(StereoSample* buffer, uint32_t numSamples) {
 			buffer[i].r += (int32_t)(((int64_t)right * returnFade) >> 16);
 		}
 	}
-	if (haveAudio) {
-		rxReadFrame = r + numSamples;
-		statRxDrained += numSamples;
-	}
+	rxReadFrame = r + available;
+	statRxDrained += available;
 	addCost(costReturnMix, start);
 }
 
@@ -1991,9 +2003,9 @@ void reportStats() {
 	// machine once already and the comment saying it was sized for the worst case is what stopped anyone
 	// re-checking. Tags including their leading space, then ten digits for each unsigned counter:
 	//   AUI alt 17 | act 14 | inf 14 | brdy 15 | arm 14 | aerr 15 | err 14 | pkt 14 | frm 14 | mt 13 |
-	//   part 15 | ovr 14 | unr 14 | drn 14 | wf 13 | rf 13 | held 15 | pr 4
+	//   part 15 | ovr 14 | unr 14 | shf 14 | drn 14 | wf 13 | rf 13 | held 15 | pr 4
 	//   sz 3 + 4 buckets at 11 = 47 | pk 3 + kRxChannels at 11 = 25 at two channels
-	// 335 worst case, plus the terminator. 384 leaves room for two more fields; widening the return past two
+	// 349 worst case, plus the terminator. 384 leaves room for two more fields; widening the return past two
 	// channels adds 11 apiece and must be re-counted here.
 	{
 		char rxLine[384];
@@ -2026,6 +2038,10 @@ void reportStats() {
 		emitDec(statRxOverrun);
 		emit(" unr");
 		emitDec(statRxUnderrun);
+		// Windows short, and frames short across them. A window missing one frame and a window missing every
+		// frame counted the same before, and they are not the same thing.
+		emit(" shf");
+		emitDec(statRxShortFrames);
 		emit(" drn");
 		emitDec(statRxDrained);
 		// The ring's own position. held is the reader's lead in frames, which is the latency B3 inherits.
@@ -2218,6 +2234,7 @@ void reportStats() {
 	statRxPartial = 0;
 	statRxOverrun = 0;
 	statRxUnderrun = 0;
+	statRxShortFrames = 0;
 	statRxDrained = 0;
 	statRxArms = 0;
 	statRxArmErr = 0;
