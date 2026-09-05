@@ -572,11 +572,18 @@ inline void setDireness(size_t numSamples) { // Consider direness and culling - 
 	const size_t windowSamples = numSamples;
 	// number of samples it took to do the last render
 	const int32_t dspTimeRaw = (int32_t)(getAverageRunTimeForTask(routine_task_id) * 44100.);
-	// REVERTED 2026-08-30, on hardware, within the session that tried it. Dividing by renders-per-call is
-	// arithmetically right and behaviourally wrong: the culling threshold below was tuned against the inflated
-	// figure, so correcting the input without re-tuning the threshold removes the protection. The dense reference
-	// song held 17-19 voices instead of culling to ~13, ran the engine to 94% of the processor, and crackled
-	// audibly. The inflation is real - see dspr and rpc on the report line - but it cannot be fixed here alone.
+	// REVERTED 2026-08-30, and the reason recorded then was wrong. Dividing by renders-per-call took the dense
+	// reference song to 17-19 voices, 94% of the processor and audible crackle - but not because a correct
+	// correction met a threshold tuned against an inflated figure.
+	//
+	// Measured 2026-09-07: rendersPerCallX100 is capped at 2 by the `numRoutines < 2` loop below, and a busy song
+	// sits on the cap - 199 in every one of 320 seconds, zero variance, host streaming or not. Dividing by it is
+	// dividing by the constant 2.0, which simply halves the input and stops the culling. It is not a correction
+	// and there is nothing here to re-tune.
+	//
+	// The inflation it was meant to correct is also not general: opening the stream raises this figure by 28% on
+	// a sparse song and *lowers* it on a dense one. The voice loss it was blamed for was the hard cull firing on
+	// single outliers, fixed in cullVoices() instead.
 	auto dspTime = dspTimeRaw;
 	size_t nonDSP = numSamples - dspTime;
 	// we don't care about the number that were rendered in the last go, only the ones taken by the first routine call
