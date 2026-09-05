@@ -99,9 +99,24 @@ constexpr bool kAudioStamps = false;
 /// Off for anything a listener judges - it costs two channels of real routing. On for the latency and unity-gain
 /// measurements, which is the only reason it exists. Routing the finished mix as a *feature* is stage D, and is a
 /// different decision from this one.
-constexpr bool kMixOnChannels78 = false;
+constexpr bool kMixOnChannels78 = true;
+
+/// DIAGNOSTIC. Puts the return's own read position on channel 5 and the sample it read there on channel 6, one
+/// entry per output sample, so a recording says which ring frame fed each sample and what that frame held.
+///
+/// The question this exists to split: the returning audio is intact in the ring and read out of order, or it is
+/// read in perfect order and was already wrong when it landed. Every counter on the device reads healthy either
+/// way, so nothing here can tell those apart on its own.
+///
+/// Not the 2026-09-05 stamp that was circular. That one wrote an array by render-window position and read it back
+/// by render-window position, so it could only report what had been put in it. This carries a *ring* index out
+/// through the stem path - written at render, read at output, across the drain, onto the wire - so it is read on
+/// the axis under test, and channel 6 carries the ring's own content beside it for the other half of the split.
+constexpr bool kReturnTrace = true;
 
 static_assert(!kAudioStamps || kDiagnostics, "The stamps are part of the instruments and need them compiled in");
+static_assert(!kReturnTrace || !kAudioStamps, "The return trace and the producer stamps want the same channels");
+static_assert(!kReturnTrace || kDiagnostics, "The return trace is an instrument and needs them compiled in");
 
 /// Must match the AudioStreaming interface's number in r_usb_pmidi_descriptor.c.
 constexpr uint16_t kAudioInterfaceNumber = 2;
@@ -229,6 +244,21 @@ constexpr uint32_t kStemChannels = deluge::processing::engines::USBAudioStream::
 int32_t stemAccumulator[kStemChannels][kStemWindowSamples];
 int32_t stemSnapshot[kStemWindowSamples * 2];
 uint32_t stemWindowSamples = 0;
+
+/// DIAGNOSTIC, kReturnTrace. One render window of "which ring frame fed this sample, and what did it hold".
+///
+/// Indexed by render-window position because that is the only index the output stage can pair a stem sample with
+/// its mix sample by. What is *stored* is the ring's own position, which is the axis the fault lives on.
+///
+/// The index is masked to 12 bits and scaled by 8: the capture path dithers every sample by +/-1, so an unscaled
+/// counter reads as a step to the next frame, and 2026-08-26 lost a build to exactly that. Twelve bits wraps every
+/// 93 ms, which is unambiguous when the reader walks it as differences rather than absolutes. Negative means no
+/// return audio reached this sample at all, which silence alone could not say.
+constexpr int16_t kReturnTraceScale = 8;
+constexpr uint32_t kReturnTraceMask = 0x0FFFu;
+constexpr int16_t kReturnTraceIdle = -kReturnTraceScale;
+int16_t rxTraceIndex[kStemWindowSamples];
+int16_t rxTraceValue[kStemWindowSamples];
 
 /// Which channels have been written this window, so the first clip to name a channel assigns and any after it add.
 ///
@@ -371,8 +401,14 @@ uint32_t statRxRePrimes = 0;    ///< deliberate rebuilds of the cushion, each on
 uint32_t statRxHeldMin = 0xFFFFFFFFu;
 uint32_t statRxHeldMax = 0;
 uint32_t statRxDrained = 0; ///< frames handed to the render path
-uint32_t statRxArms = 0;    ///< transfers armed
-uint32_t statRxArmErr = 0;  ///< arms the driver refused
+
+/// DIAGNOSTIC. The accounting identity the cushion fix rests on: samples the return was mixed across, against
+/// samples that reached the codec. Summed over the same interval, so they are directly comparable and neither is
+/// derived from the other.
+uint32_t statReturnRendered = 0;
+uint32_t statReturnOutputted = 0;
+uint32_t statRxArms = 0;   ///< transfers armed
+uint32_t statRxArmErr = 0; ///< arms the driver refused
 uint32_t statRxLastErr = 0;
 uint32_t statRxSizes[4] = {}; ///< 43 and under / 44 / 45 / 46 and over, in frames
 int32_t rxPeak[kRxChannels] = {};
@@ -933,6 +969,9 @@ void mixReturnInto(StereoSample* buffer, uint32_t numSamples) {
 	}
 
 	const bool streaming = returnActive && returnEnabled && rxPrimed;
+	if (streaming) {
+		bump(statReturnRendered, numSamples);
+	}
 	const uint32_t available = streaming ? (held < numSamples ? held : numSamples) : 0u;
 
 	// The fade follows whether the host is streaming at all, not whether this window happened to be full. A
@@ -962,6 +1001,14 @@ void mixReturnInto(StereoSample* buffer, uint32_t numSamples) {
 			continue;
 		}
 		const int16_t* const frame = &rxRing[((r + i) & kRxRingMask) * kRxChannels];
+		if constexpr (kReturnTrace) {
+			// The position this sample was taken from, and what was sitting there - recorded at the moment of the
+			// read, so neither can be reconstructed later from anything that would agree with itself.
+			if (i < stemWindowSamples) {
+				rxTraceIndex[i] = (int16_t)(((r + i) & kReturnTraceMask) * (uint32_t)kReturnTraceScale);
+				rxTraceValue[i] = frame[0];
+			}
+		}
 		const int32_t left = returnToMixScale(frame[0]);
 		const int32_t right = returnToMixScale(frame[kRxChannels > 1 ? 1 : 0]);
 		if (returnFade >= kReturnFadeFull) {
@@ -990,6 +1037,7 @@ void advanceReturnBy(uint32_t numSamplesOutputted) {
 	if (!returnActive || !rxPrimed) {
 		return;
 	}
+	bump(statReturnOutputted, numSamplesOutputted);
 	const uint32_t held = rxWriteFrame - rxReadFrame;
 	const uint32_t take = numSamplesOutputted < held ? numSamplesOutputted : held;
 	if (take < numSamplesOutputted) {
@@ -2083,11 +2131,14 @@ void reportStats() {
 	// re-checking. Tags including their leading space, then ten digits for each unsigned counter:
 	//   AUI alt 17 | act 14 | inf 14 | brdy 15 | arm 14 | aerr 15 | err 14 | pkt 14 | frm 14 | mt 13 |
 	//   part 15 | ovr 14 | unr 14 | shf 14 | rp 13 | hmin 15 | hmax 15 | drn 14 | wf 13 | rf 13 | held 15 | pr 4
-	//   sz 3 + 4 buckets at 11 = 47 | pk 3 + kRxChannels at 11 = 25 at two channels
-	// 392 worst case, plus the terminator. 384 leaves room for two more fields; widening the return past two
-	// channels adds 11 apiece and must be re-counted here.
+	//   sz 3 + 4 buckets at 11 = 47 | pk 3 + kRxChannels at 11 = 25 at two channels | rnd 14 | out 14
+	// Those add to 403, plus the terminator. The previous count said 392 and sat in a 384 buffer, so it had been
+	// wrong in the direction that overflows since it was written - the fields as listed came to 375, and the
+	// "room for two more fields" it claimed was room for half of one. Adding the two below to that buffer would
+	// have smashed the stack once a second, which is the fault that froze this machine on 2026-08-22.
+	// 448 leaves genuine room for three more; widening the return past two channels adds 11 apiece.
 	{
-		char rxLine[384];
+		char rxLine[448];
 		p = rxLine;
 		emit("AUI alt");
 		emitDec(g_usb_pstd_alt_num[kReturnInterfaceNumber]);
@@ -2153,6 +2204,15 @@ void reportStats() {
 			emit(c == 0 ? ":" : ",");
 			emitDec((uint32_t)rxPeak[c]);
 		}
+		// Samples the return was mixed across, against samples that actually left the machine. These must be
+		// equal: the mix reads one window and the advance below consumes what the codec took, and if the engine
+		// really did discard part of every render then the first would exceed the second by that share. The note
+		// says it discards about a tenth; the render loop says a window is fully drained before the next one
+		// starts. Both cannot be true, and the fix for the cushion was designed on the first.
+		emit(" rnd");
+		emitDec(statReturnRendered);
+		emit(" out");
+		emitDec(statReturnOutputted);
 		*p = '\0';
 		Debug::sysexDebugPrint(*Debug::midiDebugCable, rxLine, true);
 	}
@@ -2325,6 +2385,8 @@ void reportStats() {
 	statRxHeldMin = 0xFFFFFFFFu;
 	statRxHeldMax = 0;
 	statRxDrained = 0;
+	statReturnRendered = 0;
+	statReturnOutputted = 0;
 	statRxArms = 0;
 	statRxArmErr = 0;
 	usbBrdyReturnCount = 0;
@@ -2846,6 +2908,14 @@ void USBAudioStream::beginRender(uint32_t numSamples) {
 	for (uint32_t c = 0; c < kStemChannels; c++) {
 		memset(stemAccumulator[c], 0, stemWindowSamples * sizeof(int32_t));
 	}
+	if constexpr (kReturnTrace) {
+		// Marked idle here rather than in the mix, which returns early whenever the host is not sending. A window
+		// left holding the previous one's positions would read as a repeat, which is the fault being hunted.
+		for (uint32_t i = 0; i < stemWindowSamples; i++) {
+			rxTraceIndex[i] = kReturnTraceIdle;
+			rxTraceValue[i] = 0;
+		}
+	}
 	addCost(costStemClear, start);
 }
 
@@ -3102,6 +3172,19 @@ void USBAudioStream::feedMix(const StereoSample* mix, uint32_t numSamples, uint3
 				for (uint32_t c = 0; c < kStemChannels; c++) {
 					frame[c] = 0;
 				}
+			}
+		}
+		if constexpr (kReturnTrace) {
+			// Channels 5 and 6, after the stem walk so these win. Paired with the mix on 7-8 below by the same
+			// stemIndex the stems use, which is what keeps a position and the audio it produced in one frame.
+			const uint32_t traceIndex = renderOffset + i;
+			if (traceIndex < stemWindowSamples) {
+				frame[4] = rxTraceIndex[traceIndex];
+				frame[5] = rxTraceValue[traceIndex];
+			}
+			else {
+				frame[4] = kReturnTraceIdle;
+				frame[5] = 0;
 			}
 		}
 		if constexpr (kMixOnChannels78) {
