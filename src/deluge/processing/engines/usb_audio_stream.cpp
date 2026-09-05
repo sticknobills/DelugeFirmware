@@ -841,6 +841,15 @@ constexpr int32_t kReturnFadeFull = 1 << 16;
 constexpr int32_t kReturnFadeStep = kReturnFadeFull / 128;
 int32_t returnFade = 0;
 
+/// DIAGNOSTIC. Which ring frame fed each sample of the render window, so the recording says exactly what the
+/// reader consumed and in what order.
+///
+/// Every counter reports the return delivering every frame while it audibly glitches once per render window, so
+/// the counters are measuring the wrong thing. A repeat, a skip and a reordering are three different faults and
+/// sound alike; stamped, they are three different pictures. Same trick the outgoing stream uses.
+int16_t returnStamp[kStemWindowSamples];
+uint32_t returnStampCount = 0;
+
 void recomputeReturnMultiplier() {
 	if (stemTrimMultiplier <= 0 || !returnEnabled || returnLevelSetting == 0) {
 		returnMultiplierQ16 = 0;
@@ -945,6 +954,11 @@ void mixReturnInto(StereoSample* buffer, uint32_t numSamples) {
 		if (i >= available) {
 			continue;
 		}
+		if constexpr (kMixOnChannels78) {
+			if (i < kStemWindowSamples) {
+				returnStamp[i] = (int16_t)((r + i) & 0x7FFFu);
+			}
+		}
 		const int16_t* const frame = &rxRing[((r + i) & kRxRingMask) * kRxChannels];
 		const int32_t left = returnToMixScale(frame[0]);
 		const int32_t right = returnToMixScale(frame[kRxChannels > 1 ? 1 : 0]);
@@ -957,6 +971,10 @@ void mixReturnInto(StereoSample* buffer, uint32_t numSamples) {
 			buffer[i].r += (int32_t)(((int64_t)right * returnFade) >> 16);
 		}
 	}
+	if constexpr (kMixOnChannels78) {
+		returnStampCount = available < kStemWindowSamples ? available : kStemWindowSamples;
+	}
+
 	// Deliberately does not advance the read pointer. The engine renders more samples than it outputs - it sizes
 	// a render from the codec's free space and then doubles it to get ahead - and discards whatever did not fit,
 	// re-rendering it next time. Advancing here consumed the discarded part too, about a tenth of the return,
@@ -3087,6 +3105,12 @@ void USBAudioStream::feedMix(const StereoSample* mix, uint32_t numSamples, uint3
 					frame[c] = 0;
 				}
 			}
+		}
+		if constexpr (kMixOnChannels78) {
+			// The ring position that fed this output sample. Channel 5 should step by exactly one per sample;
+			// anything else is the fault, named.
+			const uint32_t stemIndex = renderOffset + i;
+			frame[4] = stemIndex < returnStampCount ? returnStamp[stemIndex] : (int16_t)-1;
 		}
 		if constexpr (kMixOnChannels78) {
 			// After the stem walk above, so these two win: the channels carry the mix rather than a stem. The
