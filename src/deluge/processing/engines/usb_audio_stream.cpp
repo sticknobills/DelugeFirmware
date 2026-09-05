@@ -848,6 +848,8 @@ bool startReturnDma() {
 	// Last, so the pipe only starts accepting once there is something waiting to collect from it.
 	hw_usb_set_pid_nonzero_pipe_rohan(USB_CFG_PAUDIO_ISO_OUT, USB_PID_BUF);
 	rxDmaRunning = true;
+	// The vendor handler must stop treating this pipe as its own from here; see usbReturnPipeUnderDma.
+	usbReturnPipeUnderDma = 1u;
 	ENABLE_ALL_INTERRUPTS();
 	return true;
 }
@@ -908,6 +910,7 @@ void drainReturnDma() {
 			reg->D1FIFOSEL = USB_MBW_32;
 			hw_usb_clear_brdyenb(USB_NULL, USB_CFG_PAUDIO_ISO_OUT);
 			rxDmaRunning = false;
+			usbReturnPipeUnderDma = 0u;
 			rxTransferInFlight = false;
 			// The ring keeps its contents; only the collection is rebuilt. serviceReturn arms and hands over
 			// again on its next pass, which is the same path that built it at the start of the stream.
@@ -994,6 +997,7 @@ void serviceReturn() {
 				DMACn(kRxDmaChannel).CHCTRL_n = kDmaChctrlClearEnable;
 				usb_hstd_get_usb_ip_adr(USB_CFG_USE_USBIP)->D1FIFOSEL = USB_MBW_32;
 				rxDmaRunning = false;
+				usbReturnPipeUnderDma = 0u;
 			}
 		}
 		return;

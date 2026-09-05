@@ -144,6 +144,16 @@ extern volatile uint16_t usbRetCtrAt[USB_RET_PROBE_POINTS];
 /// Read the return pipe's control register at probe point `k` and record any transition into it.
 void usbRetProbe(uint32_t k);
 
+/// Non-zero while the DMA controller, not the interrupt, is draining the audio return pipe.
+///
+/// The vendor driver's ready-interrupt handler decides what to do with a pipe from a transfer record that this
+/// stream registers once, at stream start, and that stays registered after the pipe is handed to the controller.
+/// With the vendor DMA configuration disabled, that handler resolves every pipe to the CPU FIFO, so it would
+/// read the return pipe out through the processor and end the transfer - which NAKs the pipe underneath the
+/// controller. Measured 2026-09-06: one MIDI message arriving costs exactly one of those, because a ready
+/// interrupt only happens when MIDI arrives and the return pipe is flagged ready on essentially all of them.
+extern volatile uint8_t usbReturnPipeUnderDma;
+
 #ifdef __cplusplus
 }
 #endif

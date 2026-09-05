@@ -1299,6 +1299,23 @@ void usb_pstd_brdy_pipe_process_paudio(uint16_t bitsts)
         hw_usb_clear_status_bemp(USB_NULL, pipe);
         usbRetProbe(pipe == USB_CFG_PAUDIO_ISO_IN ? 8u : 9u);
 
+        /* The controller owns the return pipe once the handover has run, and this handler would take it back.
+         * The transfer record registered at stream start is still here, and with the vendor DMA configuration
+         * disabled usb_pstd_pipe2fport() resolves every pipe to the CPU FIFO - so the branch below would read
+         * the pipe out through the processor and end the transfer, which NAKs it underneath the controller.
+         *
+         * Measured 2026-09-06: one MIDI message arriving cost exactly one of those. A ready interrupt only
+         * happens when MIDI arrives, because MIDI's pipe is the only one with the interrupt enabled, and the
+         * status register this handler is given is unmasked - so the return pipe's own ready flag comes through
+         * on nearly every one of them, at a thousand packets a second.
+         *
+         * Placed below the status clear and the counters, so this handler keeps doing the two jobs that
+         * are genuinely its own and stops only at the point where it would touch the pipe. */
+        if ((pipe == USB_CFG_PAUDIO_ISO_OUT) && (usbReturnPipeUnderDma != 0u))
+        {
+            continue;
+        }
+
         if (USB_NULL == g_p_usb_pipe[pipe])
         {
             continue;
