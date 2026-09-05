@@ -45,6 +45,15 @@ public:
 	/// Takes voices the engine gave up on because it ran out of time, by the route it used.
 	static void recordCull(uint32_t forceReleased, uint32_t terminated, uint32_t killed);
 
+	/// Called at the top of the audio routine, and measures the gap since the previous one itself.
+	///
+	/// The codec's buffer holds one window of audio, so a gap wider than that window is audio the codec did not
+	/// receive and replayed instead - which is what a click is. Upstream already tests this condition and prints
+	/// a warning; this counts it, so a build can be compared against a control on a number rather than by ear
+	/// against a song that clicks on its own account. The clock is read here rather than passed in, so the caller
+	/// needs nothing but this header.
+	static void recordRoutineEntry();
+
 	/// Emits the report and clears the interval's counters. Scheduler entry point.
 	static void routine();
 };

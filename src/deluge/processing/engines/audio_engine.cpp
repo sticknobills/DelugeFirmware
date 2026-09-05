@@ -598,6 +598,11 @@ bool calledFromScheduler = false;
 		D_PRINTLN("Audio routine latency high: %.3fms", (current_time - last_call_time) * 1000.);
 	}
 	last_call_time = current_time;
+
+	// The same condition as the warning above, counted rather than printed, and taken off the cycle counter so it
+	// survives a release build. The ear cannot separate a click this build caused from one the song makes on its
+	// own, and this can.
+	deluge::processing::engines::EngineLoadReport::recordRoutineEntry();
 #ifndef USE_TASK_MANAGER // if not using task manager, midi and analog clock are processed together with audio
 	// process midi clock
 	playbackHandler.midiRoutine();

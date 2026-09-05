@@ -16,6 +16,7 @@
  */
 
 #include "processing/engines/engine_load_report.h"
+#include "definitions.h"
 #include "definitions_cxx.hpp"
 #include "io/debug/print.h"
 #include "io/midi/sysex.h"
@@ -45,6 +46,23 @@ uint32_t statForceReleased = 0;
 uint32_t statTerminated = 0;
 uint32_t statKilled = 0;
 
+/// The codec runs at a fixed rate whatever the engine does, so a gap between renders converts to samples the
+/// codec consumed. 400 MHz against 44.1 kHz.
+constexpr uint32_t kCyclesPerSample = 9070u;
+
+/// One codec buffer. A gap wider than this is audio that was not there when the hardware asked for it.
+constexpr uint32_t kStarveGapSamples = SSI_TX_BUFFER_NUM_SAMPLES;
+
+uint32_t statStarves = 0;
+uint32_t statStarveSamples = 0;
+uint32_t statGapMax = 0;
+
+/// The cycle counter has to be switched on before it reads anything, and a counter that is off reads a constant
+/// zero rather than an error - which would report a machine that never starves. Enabled here rather than relied
+/// on from elsewhere, so this file still measures when it is compiled into a stock control.
+bool gapCounterEnabled = false;
+uint32_t lastEntryCycles = 0;
+
 void clearInterval() {
 	statRenders = 0;
 	statDspSum = 0;
@@ -57,6 +75,9 @@ void clearInterval() {
 	statForceReleased = 0;
 	statTerminated = 0;
 	statKilled = 0;
+	statStarves = 0;
+	statStarveSamples = 0;
+	statGapMax = 0;
 }
 
 } // namespace
@@ -80,6 +101,28 @@ void EngineLoadReport::recordRender(int32_t dspTimeSamples, int32_t dspTimeRaw, 
 	if (direness > statDirenessMax) {
 		statDirenessMax = direness;
 	}
+}
+
+void EngineLoadReport::recordRoutineEntry() {
+	if (!gapCounterEnabled) {
+		Debug::init();
+		gapCounterEnabled = true;
+		lastEntryCycles = Debug::readCycleCounter();
+		return;
+	}
+	const uint32_t nowCycles = Debug::readCycleCounter();
+	// The difference, never the absolute value: the counter wraps every 10.7 s and a gap is milliseconds, so
+	// unsigned subtraction is right across the wrap and detecting it is not needed.
+	const uint32_t gapSamples = (uint32_t)(nowCycles - lastEntryCycles) / kCyclesPerSample;
+	lastEntryCycles = nowCycles;
+	if (gapSamples > statGapMax) {
+		statGapMax = gapSamples;
+	}
+	if (gapSamples <= kStarveGapSamples) {
+		return;
+	}
+	statStarves++;
+	statStarveSamples += gapSamples - kStarveGapSamples;
 }
 
 void EngineLoadReport::recordCull(uint32_t forceReleased, uint32_t terminated, uint32_t killed) {
@@ -108,9 +151,9 @@ void EngineLoadReport::routine() {
 		return;
 	}
 
-	// The version string is the widest field at around 24 characters; the twelve numeric fields reach about ten
-	// digits each behind a four-character tag. 320 covers that with room for another field.
-	char line[320];
+	// Worst case: "EL fw:" (6) plus a 24-character version, plus fifteen numeric fields of a five-character tag
+	// and ten digits each (225), plus the terminator - 256. 384 leaves room for two more fields.
+	char line[384];
 	char* p = line;
 	auto emit = [&p](const char* t) {
 		while (*t != '\0') {
@@ -169,6 +212,19 @@ void EngineLoadReport::routine() {
 	emitDec(statTerminated);
 	emit(" ckl");
 	emitDec(statKilled);
+	// A render happened, so time passed. A widest gap of zero means the clock is not running, not that the engine
+	// is never late - so the instrument says so instead of reporting a machine that never starves.
+	emit(" stv");
+	if (statRenders != 0u && statGapMax == 0u) {
+		emit("?");
+	}
+	else {
+		emitDec(statStarves);
+	}
+	emit(" stvs");
+	emitDec(statStarveSamples);
+	emit(" gmx");
+	emitDec(statGapMax);
 	*p = '\0';
 	Debug::sysexDebugPrint(*Debug::midiDebugCable, line, true);
 
