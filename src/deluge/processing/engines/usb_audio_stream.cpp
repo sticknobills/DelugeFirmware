@@ -285,10 +285,16 @@ constexpr uint32_t kRxMaxFrames = kRxMaxPacketBytes / kRxFrameBytes;
 static_assert(kRxMaxPacketBytes <= USB_CFG_PAUDIO_RX_BUF_BYTES, "A return packet must fit the pipe buffer");
 static_assert(kRxMaxFrames > kSampleRate / 1000, "A host may send a 45-frame packet and it must fit");
 
-/// 93 ms of return audio. Far more than the path needs, and sized like the outgoing ring for the same reason: a
+/// 186 ms of return audio, 32 KB of SDRAM.
+///
+/// Doubled when the cushion went to 2048: the cushion plus the engine's worst burst peaks near 2800 frames, and
+/// a 4096 ring left too little above that to absorb a host that delivers early. Overruns are silent data loss,
+/// and the memory is not worth arguing about.
+///
+/// Previously: Far more than the path needs, and sized like the outgoing ring for the same reason: a
 /// card load freezes every task for longer than one render window, and a ring that wraps during one loses audio
 /// silently rather than reporting a gap.
-constexpr uint32_t kRxRingFrames = 4096u;
+constexpr uint32_t kRxRingFrames = 8192u;
 constexpr uint32_t kRxRingMask = kRxRingFrames - 1u;
 
 /// How far behind the arriving audio the reader sits, which is this direction's latency and the whole of its
