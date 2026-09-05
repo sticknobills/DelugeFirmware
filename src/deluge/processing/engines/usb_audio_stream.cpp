@@ -494,14 +494,19 @@ void serviceReturn() {
 	}
 
 	returnActive = true;
+	// The test belongs inside the critical section, not outside it. The completion interrupt arms its own next
+	// transfer a thousand times a second; landing between a test out here and the mask below let this arm a
+	// second receive over a live one, re-pointing the driver's data pointer and length mid-transfer. Packet
+	// counts stayed perfect - every packet still completed - while the audio was written into the wrong place,
+	// which is why every counter reported a healthy stream through 41% corrupted content.
+	//
+	// It fires far more under load, because that is when the task runs at irregular times against a fixed 1 kHz
+	// interrupt. Hence clean when idle and broken with a song playing.
+	DISABLE_ALL_INTERRUPTS();
 	if (!rxTransferInFlight) {
-		// Interrupts off across the driver's own FIFO access. Receive shares the CPU FIFO port with USB MIDI and
-		// with the outgoing pipe's re-arm, and a pipe selected on that port by two writers at once is what
-		// truncates a packet.
-		DISABLE_ALL_INTERRUPTS();
 		armReturnTransfer();
-		ENABLE_ALL_INTERRUPTS();
 	}
+	ENABLE_ALL_INTERRUPTS();
 }
 
 /// Copied out of the ring before submitting, because the driver reads this memory after the call returns and the
