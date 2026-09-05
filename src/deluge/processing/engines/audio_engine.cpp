@@ -440,7 +440,7 @@ constexpr int32_t kHardCullRunRequired = 2;
 
 /// How many consecutive renders the emergency cull condition has held for.
 ///
-/// Measured 2026-09-07 on the dense reference song, firmware d1b5edd2: every render whose figure crossed the
+/// Measured 2026-09-05 on the dense reference song, firmware d1b5edd2: every render whose figure crossed the
 /// emergency line produced exactly one hard cull - 241 seconds out of 241, the two counts identical every
 /// second - while the codec never once ran short, widest stall 108 samples against the 128 that would be a real
 /// failure. So the crossings were not rescuing anything. Opening the USB stream adds 0.7 of them a second, and
@@ -576,7 +576,7 @@ inline void setDireness(size_t numSamples) { // Consider direness and culling - 
 	// reference song to 17-19 voices, 94% of the processor and audible crackle - but not because a correct
 	// correction met a threshold tuned against an inflated figure.
 	//
-	// Measured 2026-09-07: rendersPerCallX100 is capped at 2 by the `numRoutines < 2` loop below, and a busy song
+	// Measured 2026-09-05: rendersPerCallX100 is capped at 2 by the `numRoutines < 2` loop below, and a busy song
 	// sits on the cap - 199 in every one of 320 seconds, zero variance, host streaming or not. Dividing by it is
 	// dividing by the constant 2.0, which simply halves the input and stops the culling. It is not a correction
 	// and there is nothing here to re-tune.

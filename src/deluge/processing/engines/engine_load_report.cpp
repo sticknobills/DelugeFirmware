@@ -50,7 +50,7 @@ uint32_t statKilled = 0;
 ///
 /// A mean cannot see this: the decision is a threshold crossing, so what matters is how much of the
 /// distribution sits past 50 (direness) and past 80 (the base cull limit), not where its centre is. Measured
-/// 2026-09-07: opening the USB stream lowers the mean by 4% while culling rises, which a mean and a peak
+/// 2026-09-05: opening the USB stream lowers the mean by 4% while culling rises, which a mean and a peak
 /// together cannot explain.
 ///
 /// Edges chosen from the constants the engine actually tests, not from round numbers: direnessThreshold is 50,
@@ -298,7 +298,7 @@ void EngineLoadReport::routine() {
 	*p = '\0';
 	Debug::sysexDebugPrint(*Debug::midiDebugCable, line, true);
 
-	// Second line rather than more fields on the first, so every capture taken before 2026-09-07 stays
+	// Second line rather than more fields on the first, so every capture taken before 2026-09-05 stays
 	// comparable field-for-field with one taken after it, and neither line goes near the 1024-byte SysEx buffer
 	// that silently truncates.
 	//

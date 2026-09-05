@@ -41,7 +41,7 @@ public:
 	///
 	/// `effectiveSamples` is the number the direness and culling tests are **actually** made against - the same
 	/// figure after the second render of a call has its predecessor's window subtracted. It is not equal to
-	/// either of the other two on every render, and until 2026-09-07 it was reported nowhere, so every published
+	/// either of the other two on every render, and until 2026-09-05 it was reported nowhere, so every published
 	/// mean described a number no decision was taken on.
 	static void recordRender(int32_t dspTimeSamples, int32_t dspTimeRaw, size_t windowSamples, int32_t direness,
 	                         uint32_t rendersPerCallX100, int32_t effectiveSamples);
