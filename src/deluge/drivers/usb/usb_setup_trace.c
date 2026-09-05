@@ -37,6 +37,11 @@ volatile uint32_t usbAudioForcedTerm = 0;
 volatile uint32_t usbBrdyNonZeroCount = 0;
 volatile uint32_t usbBrdyAudioCount = 0;
 volatile uint32_t usbBrdyReturnCount = 0;
+volatile uint32_t usbMidiRxInterrupts = 0;
+volatile uint32_t usbMidiRxStale = 0;
+volatile uint32_t usbMidiRxPackets = 0;
+volatile uint32_t usbMidiRxBytes = 0;
+volatile uint32_t usbMidiRxArms = 0;
 
 static void push(uint16_t type, uint16_t value, uint16_t index, uint16_t length, uint16_t isMark) {
 	uint16_t next = (uint16_t)((writeIndex + 1u) & TRACE_MASK);

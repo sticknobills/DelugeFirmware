@@ -17,6 +17,7 @@
 
 #include "io/midi/midi_engine.h"
 #include "definitions_cxx.hpp"
+#include "drivers/usb/usb_setup_trace.h"
 #include "gui/l10n/l10n.h"
 #include "gui/ui/sound_editor.h"
 #include "hid/display/display.h"
@@ -930,6 +931,8 @@ void MidiEngine::checkIncomingUsbMidi() {
 
 					usbLock = 1;
 					g_p_usb_pipe[USB_CFG_PMIDI_BULK_IN] = &g_usb_midi_recv_utr[ip][0];
+					// DIAGNOSTIC. One arm per packet consumed, so this is the receive rate seen from our side.
+					usbMidiRxArms = usbMidiRxArms + 1u;
 					usb_receive_start_rohan_midi(USB_CFG_PMIDI_BULK_IN);
 					usbLock = 0;
 				}

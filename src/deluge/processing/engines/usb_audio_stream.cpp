@@ -658,8 +658,31 @@ uint16_t readRxDmaStatus() {
 bool rxDmaRunning = false;
 uint32_t rxDmaReadOffset = 0;     ///< how far the drain has got through the buffer above, in bytes
 uint32_t statRxHandoverRedos = 0; ///< times the pipe was found disturbed and the handover was rebuilt
-uint32_t statRxDmaLaps = 0;       ///< times the controller overtook the drain - audio genuinely lost
-uint32_t statRxDmaBytes = 0;      ///< bytes drained, so the rate can be checked against 176,400/s
+
+/// DIAGNOSTIC. Which of the two disturbances the rebuild above was answering.
+///
+/// The rebuild fires on either of two unrelated conditions - somebody re-enabled this pipe's ready interrupt, or
+/// the pipe was found shut - and the counter that has carried it since 2026-09-05 cannot tell them apart. They
+/// have different causes and different fixes, so a fix aimed at the wrong one is a wasted build. Counted at the
+/// point each condition is evaluated rather than inferred afterwards.
+uint32_t statRxRedoInterrupt = 0; ///< rebuilds where this pipe's ready interrupt had been re-enabled
+uint32_t statRxRedoShut = 0;      ///< rebuilds where the pipe was found not accepting
+uint32_t statRxRedoBoth = 0;      ///< rebuilds where both were true at once
+
+/// The chip's own state at the first rebuild of each reporting interval, latched rather than read at report time.
+///
+/// A register read a second later describes the machine after the repair, not during the fault. Only the first is
+/// kept: the interval's rate says how often, and this says what it looked like.
+bool redoSnapTaken = false;
+uint16_t redoSnapPipeCtr = 0; ///< PIPExCTR for the return pipe - b1-0 is the PID this fires on
+uint16_t redoSnapBrdyEnb = 0; ///< which pipes have their ready interrupt enabled
+uint16_t redoSnapBrdySts = 0; ///< which pipes are flagged ready
+uint16_t redoSnapNrdySts = 0; ///< which pipes the device refused a transaction on
+uint16_t redoSnapIntSts0 = 0; ///< the interrupt status the module is presenting
+uint16_t redoSnapDmaStat = 0; ///< the collecting channel's own status word
+uint16_t redoSnapFrmNum = 0;  ///< host frame, so two rebuilds can be told apart in time
+uint32_t statRxDmaLaps = 0;   ///< times the controller overtook the drain - audio genuinely lost
+uint32_t statRxDmaBytes = 0;  ///< bytes drained, so the rate can be checked against 176,400/s
 
 constexpr uint16_t kFrameNumberMask = 0x07FFu; ///< FRMNUM b10-0; b15 is OVRN and b14 CRCE.
 /// Defined with the transmit instruments further down; declared here because the receive completion is the first
@@ -861,6 +884,26 @@ void drainReturnDma() {
 		const bool pipeShut = (*pipectr & USB_PID_BUF) != USB_PID_BUF;
 		if (interruptBack || pipeShut) {
 			statRxHandoverRedos++;
+			// DIAGNOSTIC. Which condition, and what the chip looked like while it held.
+			if (interruptBack) {
+				statRxRedoInterrupt++;
+			}
+			if (pipeShut) {
+				statRxRedoShut++;
+			}
+			if (interruptBack && pipeShut) {
+				statRxRedoBoth++;
+			}
+			if (!redoSnapTaken) {
+				redoSnapTaken = true;
+				redoSnapPipeCtr = *pipectr;
+				redoSnapBrdyEnb = reg->BRDYENB;
+				redoSnapBrdySts = reg->BRDYSTS;
+				redoSnapNrdySts = reg->NRDYSTS;
+				redoSnapIntSts0 = reg->INTSTS0;
+				redoSnapDmaStat = (uint16_t)(DMACn(kRxDmaChannel).CHSTAT_n & 0xFFFFu);
+				redoSnapFrmNum = reg->FRMNUM;
+			}
 			DMACn(kRxDmaChannel).CHCTRL_n = kDmaChctrlClearEnable;
 			reg->D1FIFOSEL = USB_MBW_32;
 			hw_usb_clear_brdyenb(USB_NULL, USB_CFG_PAUDIO_ISO_OUT);
@@ -2767,6 +2810,63 @@ void reportStats() {
 		Debug::sysexDebugPrint(*Debug::midiDebugCable, cfgLine, true);
 	}
 
+	// DIAGNOSTIC. Which disturbance the rebuilds above were answering, what the chip looked like during the first
+	// of them, and how much MIDI actually crossed the wire in the same interval.
+	//
+	// Own line and own buffer, counted rather than claimed: "AUM" plus ri/rs/rb at 4+11 each is 45, six latched
+	// registers at 5+4 each is 54, and five MIDI counters at 5+11 each is 80. 179 worst case plus the terminator,
+	// so 224 leaves room for one more field and the next one after that has to widen the buffer.
+	{
+		char midiLine[224];
+		p = midiLine;
+		auto emitHex4 = [&p](uint32_t v) {
+			for (int shift = 12; shift >= 0; shift -= 4) {
+				*p++ = "0123456789ABCDEF"[(v >> shift) & 0xF];
+			}
+		};
+		emit("AUM ri");
+		emitDec(statRxRedoInterrupt);
+		emit(" rs");
+		emitDec(statRxRedoShut);
+		emit(" rb");
+		emitDec(statRxRedoBoth);
+		// Dashes rather than zeros when no rebuild happened this interval: no reading and a zero reading are
+		// different findings, and this build exists because they have been confused before.
+		if (redoSnapTaken) {
+			emit(" Rpc");
+			emitHex4(redoSnapPipeCtr);
+			emit(" Rbe");
+			emitHex4(redoSnapBrdyEnb);
+			emit(" Rbs");
+			emitHex4(redoSnapBrdySts);
+			emit(" Rnr");
+			emitHex4(redoSnapNrdySts);
+			emit(" Ris");
+			emitHex4(redoSnapIntSts0);
+			emit(" Rds");
+			emitHex4(redoSnapDmaStat);
+			emit(" Rfn");
+			emitHex4(redoSnapFrmNum);
+		}
+		else {
+			emit(" Rpc---- Rbe---- Rbs---- Rnr---- Ris---- Rds---- Rfn----");
+		}
+		// The other half of the question: whether a host holding a MIDI output port is actually sending anything.
+		// If these sit at zero while the rebuilds run, nothing crossing the wire is disturbing the pipe.
+		emit(" mi");
+		emitDec(usbMidiRxInterrupts);
+		emit(" mst");
+		emitDec(usbMidiRxStale);
+		emit(" mpk");
+		emitDec(usbMidiRxPackets);
+		emit(" mby");
+		emitDec(usbMidiRxBytes);
+		emit(" marm");
+		emitDec(usbMidiRxArms);
+		*p = '\0';
+		Debug::sysexDebugPrint(*Debug::midiDebugCable, midiLine, true);
+	}
+
 	// DIAGNOSTIC. Where the CPU this build costs the instrument actually goes, so the next change is aimed at a
 	// measured share rather than at the one candidate that got tested. Own buffer for the reason the others carry.
 	//
@@ -2944,6 +3044,15 @@ void reportStats() {
 	statRxArms = 0;
 	statRxArmErr = 0;
 	usbBrdyReturnCount = 0;
+	statRxRedoInterrupt = 0;
+	statRxRedoShut = 0;
+	statRxRedoBoth = 0;
+	redoSnapTaken = false;
+	usbMidiRxInterrupts = 0;
+	usbMidiRxStale = 0;
+	usbMidiRxPackets = 0;
+	usbMidiRxBytes = 0;
+	usbMidiRxArms = 0;
 	for (uint32_t i = 0; i < 4; i++) {
 		statRxSizes[i] = 0;
 	}

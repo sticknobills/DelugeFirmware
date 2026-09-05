@@ -900,6 +900,10 @@ void usb_pstd_brdy_pipe_process_rohan_midi(uint16_t bitsts)
 
     (void)bitsts;
 
+    /* Observational. Whether a host holding a MIDI output port is actually sending anything is the other half of
+     * the return-pipe question, and nothing counted it. */
+    usbMidiRxInterrupts++;
+
     uint16_t pipe = USB_CFG_PMIDI_BULK_IN;
 
     // because this is polled theres no synchronization with the state of the bus so we have to handle some edge cases
@@ -908,6 +912,7 @@ void usb_pstd_brdy_pipe_process_rohan_midi(uint16_t bitsts)
     // this handler is called, so a packet arriving while we drain re-raises it afterwards). Nothing to do.
     if (!connectedUSBMIDIDevices[0][0].currentlyWaitingToReceive)
     {
+        usbMidiRxStale++;
         return;
     }
 
@@ -957,6 +962,10 @@ void usb_pstd_brdy_pipe_process_rohan_midi(uint16_t bitsts)
 
     // Only sets received bytes for first device
     // I've just pasted the relevant contents of usbReceiveComplete() in here
+    /* Observational, before the count is handed on. */
+    usbMidiRxPackets++;
+    usbMidiRxBytes += (uint32_t)total;
+
     connectedUSBMIDIDevices[0][0].numBytesReceived = total;
 
     connectedUSBMIDIDevices[0][0].currentlyWaitingToReceive = 0; // Take note that we need to set up another receive

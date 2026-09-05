@@ -89,6 +89,21 @@ extern volatile uint32_t usbBrdyAudioCount;
 /// count with no frames decoded is the read path.
 extern volatile uint32_t usbBrdyReturnCount;
 
+/* MIDI receive activity, so a fault that only appears when a host holds a MIDI output port can be checked against
+ * whether that port is actually carrying anything. Every one of these is a count, not a trace: the receive path
+ * runs from an interrupt and cannot afford a ring. */
+
+/// Entries to the MIDI receive handler, whichever pipe raised the interrupt that got it there.
+extern volatile uint32_t usbMidiRxInterrupts;
+/// Those that found no receive armed - a ready flag left over from a packet already drained.
+extern volatile uint32_t usbMidiRxStale;
+/// Packets actually read out of the FIFO.
+extern volatile uint32_t usbMidiRxPackets;
+/// Bytes in them. Zero here with a non-zero packet count is a host sending empty transfers.
+extern volatile uint32_t usbMidiRxBytes;
+/// Receives armed by the MIDI engine's poll, which happens once per packet consumed.
+extern volatile uint32_t usbMidiRxArms;
+
 #ifdef __cplusplus
 }
 #endif
