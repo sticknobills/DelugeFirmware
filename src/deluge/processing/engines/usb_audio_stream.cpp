@@ -100,6 +100,18 @@ constexpr bool kAudioStamps = false;
 /// measurements, which is the only reason it exists. Routing the finished mix as a *feature* is stage D, and is a
 /// different decision from this one.
 constexpr bool kMixOnChannels78 = true;
+
+/// DIAGNOSTIC. Take the return one frame per output sample, in the output stage, instead of a window at a time
+/// inside the render.
+///
+/// The measured fault is a jump of exactly one render window, once per render window, which points at the
+/// relationship between rendering and output rather than at USB. The engine renders more than it outputs and
+/// discards the rest; every attempt to reconcile the return with that has failed. Here the ring advances by one
+/// frame per sample that actually leaves the machine, so the mismatch cannot exist.
+///
+/// The cost is that the return no longer passes through the song's master chain, which is the whole point of
+/// where B3 put it - so this answers a question rather than shipping.
+constexpr bool kReturnAtOutputStage = true;
 static_assert(!kAudioStamps || kDiagnostics, "The stamps are part of the instruments and need them compiled in");
 
 /// Must match the AudioStreaming interface's number in r_usb_pmidi_descriptor.c.
@@ -2996,7 +3008,36 @@ void USBAudioStream::removeTrackFromMix(int32_t* mixNow, uint32_t numSamples) {
 	addCost(costStemSnapshot, start);
 }
 
+bool USBAudioStream::takeReturnFrame(int32_t* left, int32_t* right) {
+	*left = 0;
+	*right = 0;
+	if (!returnActive || !returnEnabled) {
+		return false;
+	}
+	const uint32_t held = rxWriteFrame - rxReadFrame;
+	if (!rxPrimed) {
+		if (held >= kRxLeadFrames) {
+			rxPrimed = true;
+		}
+		return false;
+	}
+	if (held == 0) {
+		rxPrimed = false;
+		statRxRePrimes++;
+		return false;
+	}
+	const int16_t* const frame = &rxRing[(rxReadFrame & kRxRingMask) * kRxChannels];
+	*left = returnToMixScale(frame[0]);
+	*right = returnToMixScale(frame[kRxChannels > 1 ? 1 : 0]);
+	rxReadFrame++;
+	statRxDrained++;
+	return true;
+}
+
 void USBAudioStream::mixReturn(StereoSample* buffer, uint32_t numSamples) {
+	if constexpr (kReturnAtOutputStage) {
+		return;
+	}
 	if (buffer == nullptr || numSamples == 0) {
 		return;
 	}
@@ -3069,7 +3110,9 @@ void USBAudioStream::costOutputLoop(uint32_t start) {
 
 void USBAudioStream::feedMix(const StereoSample* mix, uint32_t numSamples, uint32_t renderOffset) {
 	// The return is consumed here, against the samples that actually reached the codec.
-	advanceReturnBy(numSamples);
+	if constexpr (!kReturnAtOutputStage) {
+		advanceReturnBy(numSamples);
+	}
 
 	// Taken before the early return, not after: what an installed-but-idle build costs is one of the things being
 	// separated, and a timer that starts after the guard can never see it.

@@ -1244,6 +1244,16 @@ bool doSomeOutputting() {
 			}
 		}
 
+		// DIAGNOSTIC: the return, one frame per sample that actually leaves here. See kReturnAtOutputStage.
+		{
+			int32_t returnL = 0;
+			int32_t returnR = 0;
+			if (deluge::processing::engines::USBAudioStream::takeReturnFrame(&returnL, &returnR)) {
+				lAdjusted += returnL >> AUDIO_OUTPUT_GAIN_DOUBLINGS;
+				rAdjusted += returnR >> AUDIO_OUTPUT_GAIN_DOUBLINGS;
+			}
+		}
+
 		outputBufferForResampling[numSamplesOutputted].l = lshiftAndSaturate<AUDIO_OUTPUT_GAIN_DOUBLINGS>(lAdjusted);
 		outputBufferForResampling[numSamplesOutputted].r = lshiftAndSaturate<AUDIO_OUTPUT_GAIN_DOUBLINGS>(rAdjusted);
 		if (!stemExport.processStarted || (stemExport.processStarted && !stemExport.renderOffline)) {
