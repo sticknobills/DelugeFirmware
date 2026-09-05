@@ -1957,6 +1957,7 @@ PLACE_SDRAM_BSS usb_audio::Level usbAudioLevelMenu{STRING_FOR_USB_LEVEL, STRING_
 // The return, host to device. Audio arriving on the cable is summed into the song immediately after every track
 // has summed, so it meets the whole song chain exactly as the Deluge's own audio does.
 PLACE_SDRAM_BSS usb_audio::ReturnToggle usbAudioReturnMenu{STRING_FOR_USB_RETURN, STRING_FOR_USB_RETURN};
+PLACE_SDRAM_BSS usb_audio::ReclaimToggle usbAudioReclaimMenu{STRING_FOR_USB_RECLAIM, STRING_FOR_USB_RECLAIM};
 PLACE_SDRAM_BSS usb_audio::ReturnLevel usbAudioReturnLevelMenu{STRING_FOR_USB_RETURN_LEVEL,
                                                                STRING_FOR_USB_RETURN_LEVEL};
 
@@ -1967,6 +1968,7 @@ PLACE_SDRAM_BSS Submenu usbAudioSettingsMenu{
         &usbAudioLevelMenu,
         &usbAudioReturnMenu,
         &usbAudioReturnLevelMenu,
+        &usbAudioReclaimMenu,
     },
 };
 

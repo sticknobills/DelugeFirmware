@@ -573,6 +573,7 @@ PLACE_SDRAM_DATA Language seven_segment{
         {STRING_FOR_USB_LEVEL, "LVL"},
         {STRING_FOR_USB_RETURN, "RTN"},
         {STRING_FOR_USB_RETURN_LEVEL, "RLVL"},
+        {STRING_FOR_USB_RECLAIM, "RCLM"},
     },
     &built_in::english,
 };

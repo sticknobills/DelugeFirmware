@@ -124,6 +124,15 @@ public:
 	static void setReturnEnabled(bool enabled);
 	static bool getReturnEnabled();
 
+	/// DIAGNOSTIC A/B, not a user control. On restores the behaviour the 2026-09-06 fix removed: the vendor's
+	/// ready-interrupt handler is allowed to take the return pipe back from the DMA controller, which NAKs it once
+	/// per MIDI packet that arrives. Off is the fixed behaviour and the default on every boot.
+	///
+	/// Exists because comparing the two costs a flash cycle otherwise, and this fault has already spent five of
+	/// them. Deliberately not saved to flash: a diagnostic that survives a reboot is a trap for the next session.
+	static void setReturnReclaimAllowed(bool allowed);
+	static bool getReturnReclaimAllowed();
+
 	/// Largest magnitude any stem has reached since the last read, at capture scale and therefore before the
 	/// width reduction that would clip it. The instrument the trim is set from.
 	static int32_t readAndClearStemPeak();

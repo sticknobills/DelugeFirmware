@@ -126,6 +126,21 @@ public:
 ///
 /// Per-machine rather than per-song, for the same reason the trim is: it describes what is connected, not what is
 /// being played. Off is the state a machine with nothing plugged in should be indistinguishable from.
+/// DIAGNOSTIC A/B for the 2026-09-06 return-pipe fault. On restores the pre-fix behaviour; off is the fix.
+/// Not saved to flash on purpose - it comes back off at every boot, so a session cannot inherit it by accident.
+class ReclaimToggle final : public Toggle {
+public:
+	using Toggle::Toggle;
+
+	void readCurrentValue() override {
+		this->setValue(deluge::processing::engines::USBAudioStream::getReturnReclaimAllowed());
+	}
+
+	void writeCurrentValue() override {
+		deluge::processing::engines::USBAudioStream::setReturnReclaimAllowed(this->getValue());
+	}
+};
+
 class ReturnToggle final : public Toggle {
 public:
 	using Toggle::Toggle;

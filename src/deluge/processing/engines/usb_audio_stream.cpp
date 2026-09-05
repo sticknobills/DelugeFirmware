@@ -656,6 +656,13 @@ uint16_t readRxDmaStatus() {
 }
 
 bool rxDmaRunning = false;
+
+/// DIAGNOSTIC A/B. When true the vendor handler is allowed to reclaim the return pipe, which is what it did
+/// before 2026-09-06. Off on every boot; see the header.
+bool returnReclaimAllowed = false;
+
+/// Keeps the flag the vendor handler reads in step with both of the things that decide it.
+void refreshReturnPipeGuard();
 uint32_t rxDmaReadOffset = 0;     ///< how far the drain has got through the buffer above, in bytes
 uint32_t statRxHandoverRedos = 0; ///< times the pipe was found disturbed and the handover was rebuilt
 
@@ -763,6 +770,10 @@ void armReturnTransfer() {
 	}
 }
 
+void refreshReturnPipeGuard() {
+	usbReturnPipeUnderDma = (rxDmaRunning && !returnReclaimAllowed) ? 1u : 0u;
+}
+
 /// Hands the return pipe to the DMA controller and stops servicing it from the interrupt.
 ///
 /// Order matters and is the vendor driver's: the port must be pointed at the pipe and confirmed to have taken
@@ -849,7 +860,7 @@ bool startReturnDma() {
 	hw_usb_set_pid_nonzero_pipe_rohan(USB_CFG_PAUDIO_ISO_OUT, USB_PID_BUF);
 	rxDmaRunning = true;
 	// The vendor handler must stop treating this pipe as its own from here; see usbReturnPipeUnderDma.
-	usbReturnPipeUnderDma = 1u;
+	refreshReturnPipeGuard();
 	ENABLE_ALL_INTERRUPTS();
 	return true;
 }
@@ -910,7 +921,7 @@ void drainReturnDma() {
 			reg->D1FIFOSEL = USB_MBW_32;
 			hw_usb_clear_brdyenb(USB_NULL, USB_CFG_PAUDIO_ISO_OUT);
 			rxDmaRunning = false;
-			usbReturnPipeUnderDma = 0u;
+			refreshReturnPipeGuard();
 			rxTransferInFlight = false;
 			// The ring keeps its contents; only the collection is rebuilt. serviceReturn arms and hands over
 			// again on its next pass, which is the same path that built it at the start of the stream.
@@ -997,7 +1008,7 @@ void serviceReturn() {
 				DMACn(kRxDmaChannel).CHCTRL_n = kDmaChctrlClearEnable;
 				usb_hstd_get_usb_ip_adr(USB_CFG_USE_USBIP)->D1FIFOSEL = USB_MBW_32;
 				rxDmaRunning = false;
-				usbReturnPipeUnderDma = 0u;
+				refreshReturnPipeGuard();
 			}
 		}
 		return;
@@ -3772,6 +3783,15 @@ void USBAudioStream::setReturnEnabled(bool enabled) {
 
 bool USBAudioStream::getReturnEnabled() {
 	return returnEnabled;
+}
+
+void USBAudioStream::setReturnReclaimAllowed(bool allowed) {
+	returnReclaimAllowed = allowed;
+	refreshReturnPipeGuard();
+}
+
+bool USBAudioStream::getReturnReclaimAllowed() {
+	return returnReclaimAllowed;
 }
 
 void USBAudioStream::setTrim(uint32_t trim) {
