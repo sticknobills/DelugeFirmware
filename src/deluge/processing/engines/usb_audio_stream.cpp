@@ -657,6 +657,7 @@ uint16_t readRxDmaStatus() {
 
 bool rxDmaRunning = false;
 uint32_t rxDmaReadOffset = 0;     ///< how far the drain has got through the buffer above, in bytes
+uint32_t statRxPidReasserts = 0;  ///< times the pipe had to be re-opened after something NAKed it
 uint32_t statRxBrdyReasserts = 0; ///< times the pipe's ready interrupt had to be switched off again
 uint32_t statRxDmaLaps = 0;       ///< times the controller overtook the drain - audio genuinely lost
 uint32_t statRxDmaBytes = 0;      ///< bytes drained, so the rate can be checked against 176,400/s
@@ -896,9 +897,23 @@ void drainReturnDma() {
 		// code owns and nothing resubmits, so it cannot do what the 2026-08-22 watchdog did. It is here because
 		// the guards above cover the paths that are known, and the cost of an unknown one is a build that is
 		// unusable the moment a host opens a MIDI port.
-		if ((usb_hstd_get_usb_ip_adr(USB_CFG_USE_USBIP)->BRDYENB & (1u << USB_CFG_PAUDIO_ISO_OUT)) != 0u) {
+		usb_regadr_t reg = usb_hstd_get_usb_ip_adr(USB_CFG_USE_USBIP);
+		if ((reg->BRDYENB & (1u << USB_CFG_PAUDIO_ISO_OUT)) != 0u) {
 			hw_usb_clear_brdyenb(USB_NULL, USB_CFG_PAUDIO_ISO_OUT);
 			statRxBrdyReasserts++;
+		}
+		// And held open. Measured 2026-09-05: with the re-arm correctly removed, a host claiming the MIDI
+		// interface leaves this pipe set to refuse packets - PID 1 to 0 at the same instant, never restored - and
+		// the return goes silent rather than wrong. The driver's own MIDI handling does it; the re-arm had been
+		// putting it back as a side effect, which is why removing the re-arm swapped one fault for another.
+		//
+		// Restored here rather than by arming, because arming means the driver's receive path and that is what
+		// switches the ready interrupt back on. This writes the one field, resubmits nothing, and cannot give the
+		// pipe a second consumer.
+		volatile uint16_t* const pipectr = &reg->PIPE1CTR + (USB_CFG_PAUDIO_ISO_OUT - 1);
+		if ((*pipectr & USB_PID_BUF) != USB_PID_BUF) {
+			hw_usb_set_pid_nonzero_pipe_rohan(USB_CFG_PAUDIO_ISO_OUT, USB_PID_BUF);
+			statRxPidReasserts++;
 		}
 	}
 	// Advanced past everything the controller produced, including anything dropped for want of ring room, so the
