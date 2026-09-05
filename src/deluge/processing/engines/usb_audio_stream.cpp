@@ -407,6 +407,30 @@ uint32_t statRxDrained = 0; ///< frames handed to the render path
 /// derived from the other.
 uint32_t statReturnRendered = 0;
 uint32_t statReturnOutputted = 0;
+
+/// DIAGNOSTIC. Host frames between consecutive receive completions, bucketed 0,1,2,3,4+.
+///
+/// The one number that says how long the machine is deaf. A packet arrives every host frame, so a gap of one is a
+/// healthy stream and a gap of n means n-1 frames went by with the pipe unable to answer. Bucketed rather than
+/// averaged, because a steady two and an alternating one-and-three have the same mean and mean opposite things:
+/// the first is a pipe that never keeps up, the second is a pipe blocked in bursts.
+///
+/// This decides the fix. The pipe holds at most two packets - double buffering is the ceiling, and continuous
+/// transfer mode is bulk-only on this part (hardware manual p1519) - so if the gaps run past two, no buffer
+/// setting can ever close this and the data has to be moved without the processor.
+uint32_t statRxGap[5] = {};
+uint16_t rxLastCompletionFrame = 0;
+bool rxLastCompletionFrameValid = false;
+
+/// DIAGNOSTIC. The return pipe's own configuration, read back from the hardware rather than from the table that
+/// was meant to set it.
+///
+/// Double buffering is what makes the difference between losing every packet that arrives while the machine is
+/// deaf and losing every second one. The pipe table asks for it; whether the driver's own pipe setup preserves it
+/// is a separate question, and the register is the only thing that answers it. Kept beside the driver's shadow of
+/// the same value so the two cross-check.
+uint16_t rxPipeCfgLive = 0;
+uint16_t rxPipeBufLive = 0;
 uint32_t statRxArms = 0;   ///< transfers armed
 uint32_t statRxArmErr = 0; ///< arms the driver refused
 uint32_t statRxLastErr = 0;
@@ -475,11 +499,27 @@ void ingestReturnPacket(const uint8_t* data, uint32_t bytes) {
 
 void armReturnTransfer();
 
+constexpr uint16_t kFrameNumberMask = 0x07FFu; ///< FRMNUM b10-0; b15 is OVRN and b14 CRCE.
+/// Defined with the transmit instruments further down; declared here because the receive completion is the first
+/// thing that needs it and sits above them.
+uint16_t readFrameNumber();
+
 /// The driver hands a finished isochronous read back here with the *remaining* count in tranlen, so what arrived
 /// is what was asked for less what is left. Re-arms immediately: an isochronous pipe left un-armed simply does
 /// not answer, and the host has no way to notice or retry.
 void returnTransferComplete(usb_utr_t* ptr, uint16_t /*data1*/, uint16_t /*data2*/) {
 	rxTransferInFlight = false;
+	if constexpr (kDiagnostics) {
+		// Taken first, so the measurement is of when the packet was handed back rather than of how long this
+		// handler then took.
+		const uint16_t frameNow = readFrameNumber();
+		if (rxLastCompletionFrameValid) {
+			const uint32_t gap = (uint32_t)((frameNow - rxLastCompletionFrame) & kFrameNumberMask);
+			statRxGap[gap > 4u ? 4u : gap]++;
+		}
+		rxLastCompletionFrame = frameNow;
+		rxLastCompletionFrameValid = true;
+	}
 	const uint32_t remaining = ptr != nullptr ? (uint32_t)ptr->tranlen : kRxMaxPacketBytes;
 	const uint32_t received = remaining > kRxMaxPacketBytes ? 0u : kRxMaxPacketBytes - remaining;
 
@@ -1259,8 +1299,6 @@ uint32_t statPollFound = 0;                    ///< Polls where a plane became w
 uint32_t statPollMissed = 0;                   ///< Polls where it never did.
 uint32_t statPollFirstIteration = 0xFFFFFFFFu; ///< Fewest iterations taken to see it. Latched, never cleared.
 
-constexpr uint16_t kFrameNumberMask = 0x07FFu; ///< FRMNUM b10-0; b15 is OVRN and b14 CRCE.
-
 /// FRMNUM alone rather than the whole register set, because this runs twice per completion inside the interrupt.
 /// PIPEnCTR alone. Directly addressable, so unlike the configuration registers this needs no steering of the
 /// shared pipe selector and is safe to read from an interrupt at any rate.
@@ -1268,6 +1306,26 @@ uint16_t readPipeCtr() {
 	usb_regadr_t reg = usb_hstd_get_usb_ip_adr(USB_CFG_USE_USBIP);
 	volatile uint16_t* pipectr = &reg->PIPE1CTR + (USB_CFG_PAUDIO_ISO_IN - 1);
 	return *pipectr;
+}
+
+/// The return pipe's own PIPECFG and PIPEBUF, read from the hardware.
+///
+/// These two live behind PIPESEL, which is a shared selector the driver steers for its own transfers - so this
+/// saves it, reads, and puts it back with interrupts masked. Three register reads once per report, against a
+/// driver that touches the same selector from an interrupt a thousand times a second.
+///
+/// Read rather than assumed because the pipe table asking for double buffering and the pipe actually having it
+/// are different claims, and only one of them is checkable. Source says what should happen; registers say what
+/// did - which is how the transmit stall was found in August.
+void readReturnPipeConfig() {
+	usb_regadr_t reg = usb_hstd_get_usb_ip_adr(USB_CFG_USE_USBIP);
+	DISABLE_ALL_INTERRUPTS();
+	const uint16_t savedSel = reg->PIPESEL;
+	reg->PIPESEL = USB_CFG_PAUDIO_ISO_OUT;
+	rxPipeCfgLive = reg->PIPECFG;
+	rxPipeBufLive = reg->PIPEBUF;
+	reg->PIPESEL = savedSel;
+	ENABLE_ALL_INTERRUPTS();
 }
 
 uint16_t readFrameNumber() {
@@ -2217,6 +2275,34 @@ void reportStats() {
 		Debug::sysexDebugPrint(*Debug::midiDebugCable, rxLine, true);
 	}
 
+	// DIAGNOSTIC. The two numbers that decide how the return's losses can be fixed at all: how long the pipe goes
+	// unanswered, and whether it has the second buffer plane that is supposed to cover it.
+	//
+	// Own line and own buffer. "AUN" plus five gap buckets at 11 is 59, plus cfg, buf and dblb at 5+4 each is 27,
+	// and the shadow copy 9: 99 worst case. 160 is ample and leaves room to grow.
+	{
+		readReturnPipeConfig();
+		char cfgLine[160];
+		p = cfgLine;
+		emit("AUN gap");
+		for (uint32_t i = 0; i < 5; i++) {
+			emit(i == 0 ? ":" : ",");
+			emitDec(statRxGap[i]);
+		}
+		emit(" cfg");
+		emitDec(rxPipeCfgLive);
+		emit(" buf");
+		emitDec(rxPipeBufLive);
+		// b9 of PIPECFG. The whole question in one bit.
+		emit(" dblb");
+		emitDec((rxPipeCfgLive >> 9) & 1u);
+		// The driver's own record of the same register, so a disagreement is visible rather than silent.
+		emit(" shdw");
+		emitDec(pipeCfgs[USB_CFG_PAUDIO_ISO_OUT]);
+		*p = '\0';
+		Debug::sysexDebugPrint(*Debug::midiDebugCable, cfgLine, true);
+	}
+
 	// DIAGNOSTIC. Where the CPU this build costs the instrument actually goes, so the next change is aimed at a
 	// measured share rather than at the one candidate that got tested. Own buffer for the reason the others carry.
 	//
@@ -2387,6 +2473,9 @@ void reportStats() {
 	statRxDrained = 0;
 	statReturnRendered = 0;
 	statReturnOutputted = 0;
+	for (uint32_t i = 0; i < 5; i++) {
+		statRxGap[i] = 0;
+	}
 	statRxArms = 0;
 	statRxArmErr = 0;
 	usbBrdyReturnCount = 0;
