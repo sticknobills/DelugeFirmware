@@ -2867,6 +2867,38 @@ void reportStats() {
 		Debug::sysexDebugPrint(*Debug::midiDebugCable, midiLine, true);
 	}
 
+	// DIAGNOSTIC. Where in the MIDI receive path the return pipe stops accepting.
+	//
+	// Twelve buckets, each the step at which the pipe was first seen shut: 0-5 walk the MIDI ready handler,
+	// 6-9 the re-arm, 10-11 bracket the audio half of the same interrupt. A bucket that never fires while the
+	// rebuilds run means the pipe is being shut outside every point probed, which is its own finding.
+	//
+	// Own buffer: "AUZ s" plus twelve counters at 3+11 is 173, plus twelve registers at 3+4 is 84. 262 worst
+	// case, so 320 leaves room and the next field added has to widen it.
+	{
+		char probeLine[320];
+		p = probeLine;
+		auto emitHex4b = [&p](uint32_t v) {
+			for (int shift = 12; shift >= 0; shift -= 4) {
+				*p++ = "0123456789ABCDEF"[(v >> shift) & 0xF];
+			}
+		};
+		emit("AUZ s");
+		for (uint32_t i = 0; i < USB_RET_PROBE_POINTS; i++) {
+			emit(i == 0 ? ":" : ",");
+			emitDec(usbRetShutAt[i]);
+		}
+		emit(" c:");
+		for (uint32_t i = 0; i < USB_RET_PROBE_POINTS; i++) {
+			if (i != 0) {
+				emit(",");
+			}
+			emitHex4b(usbRetCtrAt[i]);
+		}
+		*p = '\0';
+		Debug::sysexDebugPrint(*Debug::midiDebugCable, probeLine, true);
+	}
+
 	// DIAGNOSTIC. Where the CPU this build costs the instrument actually goes, so the next change is aimed at a
 	// measured share rather than at the one candidate that got tested. Own buffer for the reason the others carry.
 	//
@@ -3053,6 +3085,9 @@ void reportStats() {
 	usbMidiRxPackets = 0;
 	usbMidiRxBytes = 0;
 	usbMidiRxArms = 0;
+	for (uint32_t i = 0; i < USB_RET_PROBE_POINTS; i++) {
+		usbRetShutAt[i] = 0;
+	}
 	for (uint32_t i = 0; i < 4; i++) {
 		statRxSizes[i] = 0;
 	}

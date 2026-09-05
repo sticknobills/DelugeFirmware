@@ -41,6 +41,7 @@
 #include "deluge/io/midi/midi_device_manager.h"
 
 #include "deluge/drivers/uart/uart.h"
+#include "deluge/drivers/usb/usb_setup_trace.h"
 #include "deluge/io/midi/midi_engine.h"
 
 #if ((USB_CFG_DTC == USB_CFG_ENABLE) || (USB_CFG_DMA == USB_CFG_ENABLE))
@@ -739,6 +740,7 @@ void usb_receive_start_rohan_midi(uint16_t pipe)
     /* Evacuation pointer */
     pp     = g_p_usb_pipe[pipe];
     length = pp->tranlen;
+    usbRetProbe(6);
 
 #if 0
     /* Check transfer count */
@@ -778,6 +780,7 @@ void usb_receive_start_rohan_midi(uint16_t pipe)
     /* Changes the FIFO port by the pipe. */
     // usb_cstd_chg_curpipe(ptr, pipe, useport, USB_FALSE);
     usb_cstd_chg_curpipe_rohan_fast(pipe);
+    usbRetProbe(7);
 
     // Corner cut here vs original code - it'll always be less than 1 packet, just go.
 
@@ -792,9 +795,11 @@ void usb_receive_start_rohan_midi(uint16_t pipe)
     // hw_usb_set_pid(NULL, pipe, USB_PID_BUF);
     hw_usb_set_pid_nonzero_pipe_rohan(
         pipe, USB_PID_BUF); // I guess this is how it says "request me an incoming data transfer"?
+    usbRetProbe(8);
 
     /* Enable Ready Interrupt */
     hw_usb_set_brdyenb(NULL, pipe);
+    usbRetProbe(9);
 
     /* Enable Not Ready Interrupt */
     // usb_cstd_nrdy_enable(ptr, pipe);

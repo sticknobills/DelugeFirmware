@@ -104,6 +104,27 @@ extern volatile uint32_t usbMidiRxBytes;
 /// Receives armed by the MIDI engine's poll, which happens once per packet consumed.
 extern volatile uint32_t usbMidiRxArms;
 
+/* Where the audio return pipe stops accepting.
+ *
+ * Measured 2026-09-06: one MIDI message arriving costs exactly one return-pipe rebuild - 200 sent, 202 rebuilds -
+ * and every one of them is the pipe found *shut*, never its interrupt re-enabled. What shuts it is unknown, and
+ * reading the source produced several coherent candidates, which is the point at which this domain's own rule
+ * says stop reading and probe.
+ *
+ * Each probe point reads the return pipe's control register and records the step at which its accept bits first
+ * go away. Only the transition counts, so a pipe already shut and waiting to be rebuilt does not fill every
+ * later bucket. If the counts sum to less than the rebuilds, the pipe is being shut somewhere not probed, which
+ * is itself the answer to a different question. */
+#define USB_RET_PROBE_POINTS 12u
+
+/// Transitions from accepting to not, counted at the probe point where each was first seen.
+extern volatile uint32_t usbRetShutAt[USB_RET_PROBE_POINTS];
+/// The register value last read at each point, so a shut pipe can be told from a cleared one.
+extern volatile uint16_t usbRetCtrAt[USB_RET_PROBE_POINTS];
+
+/// Read the return pipe's control register at probe point `k` and record any transition into it.
+void usbRetProbe(uint32_t k);
+
 #ifdef __cplusplus
 }
 #endif

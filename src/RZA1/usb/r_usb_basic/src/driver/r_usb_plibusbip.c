@@ -448,6 +448,7 @@ void usb_pstd_receive_start_rohan(uint16_t pipe)
     /* Select NAK */
     //usb_cstd_select_nak(USB_NULL, pipe);
     usb_cstd_set_nak_fast_rohan(pipe);
+    usbRetProbe(1);
 
     /* Set data count */
     g_usb_data_cnt[pipe] = length;
@@ -895,6 +896,30 @@ void usb_pstd_data_end(uint16_t pipe, uint16_t status)
 
 void usbReceiveComplete(int ip, int deviceNum, int tranlen);
 
+volatile uint32_t usbRetShutAt[USB_RET_PROBE_POINTS] = {0};
+volatile uint16_t usbRetCtrAt[USB_RET_PROBE_POINTS]  = {0};
+
+/* Whether the last probe, wherever it was, found the return pipe accepting. Deliberately shared across the probe
+ * points rather than reset per pass: the transition is what is being located, and it can happen between two points
+ * in different functions. */
+static uint16_t retPipeWasAccepting = 1u;
+
+void usbRetProbe(uint32_t k)
+{
+    volatile uint16_t* const pipectr = (volatile uint16_t*)&(USB200.PIPE1CTR) + (USB_CFG_PAUDIO_ISO_OUT - 1);
+    const uint16_t value             = *pipectr;
+    const uint16_t accepting         = ((value & USB_PID) == USB_PID_BUF) ? 1u : 0u;
+    if (k < USB_RET_PROBE_POINTS)
+    {
+        usbRetCtrAt[k] = value;
+        if (retPipeWasAccepting && !accepting)
+        {
+            usbRetShutAt[k]++;
+        }
+    }
+    retPipeWasAccepting = accepting;
+}
+
 void usb_pstd_brdy_pipe_process_rohan_midi(uint16_t bitsts)
 {
 
@@ -903,6 +928,7 @@ void usb_pstd_brdy_pipe_process_rohan_midi(uint16_t bitsts)
     /* Observational. Whether a host holding a MIDI output port is actually sending anything is the other half of
      * the return-pipe question, and nothing counted it. */
     usbMidiRxInterrupts++;
+    usbRetProbe(0);
 
     uint16_t pipe = USB_CFG_PMIDI_BULK_IN;
 
@@ -930,8 +956,10 @@ void usb_pstd_brdy_pipe_process_rohan_midi(uint16_t bitsts)
             break;
         }
     }
+    usbRetProbe(2);
 
     uint16_t end_flag = usb_read_data_fast_rohan(pipe); // Reads the armed packet into receiveData
+    usbRetProbe(3);
 
     if (USB_READEND != end_flag) // I condensed USB_READSHRT into READEND
     {
@@ -962,6 +990,8 @@ void usb_pstd_brdy_pipe_process_rohan_midi(uint16_t bitsts)
 
     // Only sets received bytes for first device
     // I've just pasted the relevant contents of usbReceiveComplete() in here
+    usbRetProbe(4);
+
     /* Observational, before the count is handed on. */
     usbMidiRxPackets++;
     usbMidiRxBytes += (uint32_t)total;
@@ -969,6 +999,7 @@ void usb_pstd_brdy_pipe_process_rohan_midi(uint16_t bitsts)
     connectedUSBMIDIDevices[0][0].numBytesReceived = total;
 
     connectedUSBMIDIDevices[0][0].currentlyWaitingToReceive = 0; // Take note that we need to set up another receive
+    usbRetProbe(5);
 }
 
 /***********************************************************************************************************************
@@ -1247,6 +1278,7 @@ void usb_pstd_brdy_pipe_process_paudio(uint16_t bitsts)
     uint16_t n;
 
     usbBrdyNonZeroCount++;
+    usbRetProbe(10);
 
     for (n = 0; n < 2; n++)
     {
@@ -1288,6 +1320,7 @@ void usb_pstd_brdy_pipe_process_paudio(uint16_t bitsts)
             }
         }
     }
+    usbRetProbe(11);
 } /* End of function usb_pstd_brdy_pipe_process_paudio() */
 
 /***********************************************************************************************************************
