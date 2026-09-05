@@ -114,7 +114,26 @@ extern volatile uint32_t usbMidiRxArms;
  * Each probe point reads the return pipe's control register and records the step at which its accept bits first
  * go away. Only the transition counts, so a pipe already shut and waiting to be rebuilt does not fill every
  * later bucket. If the counts sum to less than the rebuilds, the pipe is being shut somewhere not probed, which
- * is itself the answer to a different question. */
+ * is itself the answer to a different question.
+ *
+ * The first placement put six points through the MIDI handler and two around the audio one, and every transition
+ * landed in the gap between entering and leaving the audio handler - a gap containing several statements. These
+ * points bracket individual statements inside it instead, and add the interrupt decode above both handlers,
+ * because the status-register write there is the only thing that touches the return pipe at all.
+ *
+ *   0  interrupt decode, ready status read and not yet cleared
+ *   1  immediately after the whole ready status register is written back
+ *   2  MIDI ready handler entered
+ *   3  after MIDI's own pipe is NAKed
+ *   4  after the wait for MIDI's pipe to go idle
+ *   5  after MIDI's packet is read out of the FIFO
+ *   6  MIDI ready handler left
+ *   7  audio ready handler entered
+ *   8  after the outgoing audio pipe's empty status is cleared
+ *   9  after the return pipe's own empty status is cleared
+ *  10  audio ready handler left
+ *  11  MIDI receive re-armed
+ */
 #define USB_RET_PROBE_POINTS 12u
 
 /// Transitions from accepting to not, counted at the probe point where each was first seen.

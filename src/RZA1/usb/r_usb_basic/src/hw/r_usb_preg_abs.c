@@ -150,6 +150,7 @@ int usb_pstd_interrupt_handler(uint16_t* type, uint16_t* status)
 
         // uint16_t bsts  = (uint16_t)(brdysts & brdyenb);
         uint16_t bsts = brdysts;
+        usbRetProbe(0);
 
         // Pipe 0
         if (bsts & USB_BRDY0)
@@ -175,6 +176,7 @@ int usb_pstd_interrupt_handler(uint16_t* type, uint16_t* status)
 #else  /* USB_CFG_USE_USBIP == USB_CFG_IP1 */
             USB201.BRDYSTS = (uint16_t)~bsts;
 #endif /* USB_CFG_USE_USBIP == USB_CFG_IP1 */
+            usbRetProbe(1);
             *type   = USB_INT_BRDY;
             *status = bsts;
         }

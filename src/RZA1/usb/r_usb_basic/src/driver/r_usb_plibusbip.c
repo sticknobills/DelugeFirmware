@@ -448,7 +448,7 @@ void usb_pstd_receive_start_rohan(uint16_t pipe)
     /* Select NAK */
     //usb_cstd_select_nak(USB_NULL, pipe);
     usb_cstd_set_nak_fast_rohan(pipe);
-    usbRetProbe(1);
+    usbRetProbe(3);
 
     /* Set data count */
     g_usb_data_cnt[pipe] = length;
@@ -928,7 +928,7 @@ void usb_pstd_brdy_pipe_process_rohan_midi(uint16_t bitsts)
     /* Observational. Whether a host holding a MIDI output port is actually sending anything is the other half of
      * the return-pipe question, and nothing counted it. */
     usbMidiRxInterrupts++;
-    usbRetProbe(0);
+    usbRetProbe(2);
 
     uint16_t pipe = USB_CFG_PMIDI_BULK_IN;
 
@@ -956,10 +956,10 @@ void usb_pstd_brdy_pipe_process_rohan_midi(uint16_t bitsts)
             break;
         }
     }
-    usbRetProbe(2);
+    usbRetProbe(4);
 
     uint16_t end_flag = usb_read_data_fast_rohan(pipe); // Reads the armed packet into receiveData
-    usbRetProbe(3);
+    usbRetProbe(5);
 
     if (USB_READEND != end_flag) // I condensed USB_READSHRT into READEND
     {
@@ -990,7 +990,6 @@ void usb_pstd_brdy_pipe_process_rohan_midi(uint16_t bitsts)
 
     // Only sets received bytes for first device
     // I've just pasted the relevant contents of usbReceiveComplete() in here
-    usbRetProbe(4);
 
     /* Observational, before the count is handed on. */
     usbMidiRxPackets++;
@@ -999,7 +998,7 @@ void usb_pstd_brdy_pipe_process_rohan_midi(uint16_t bitsts)
     connectedUSBMIDIDevices[0][0].numBytesReceived = total;
 
     connectedUSBMIDIDevices[0][0].currentlyWaitingToReceive = 0; // Take note that we need to set up another receive
-    usbRetProbe(5);
+    usbRetProbe(6);
 }
 
 /***********************************************************************************************************************
@@ -1278,7 +1277,7 @@ void usb_pstd_brdy_pipe_process_paudio(uint16_t bitsts)
     uint16_t n;
 
     usbBrdyNonZeroCount++;
-    usbRetProbe(10);
+    usbRetProbe(7);
 
     for (n = 0; n < 2; n++)
     {
@@ -1298,6 +1297,7 @@ void usb_pstd_brdy_pipe_process_paudio(uint16_t bitsts)
         }
 
         hw_usb_clear_status_bemp(USB_NULL, pipe);
+        usbRetProbe(pipe == USB_CFG_PAUDIO_ISO_IN ? 8u : 9u);
 
         if (USB_NULL == g_p_usb_pipe[pipe])
         {
@@ -1320,7 +1320,7 @@ void usb_pstd_brdy_pipe_process_paudio(uint16_t bitsts)
             }
         }
     }
-    usbRetProbe(11);
+    usbRetProbe(10);
 } /* End of function usb_pstd_brdy_pipe_process_paudio() */
 
 /***********************************************************************************************************************
