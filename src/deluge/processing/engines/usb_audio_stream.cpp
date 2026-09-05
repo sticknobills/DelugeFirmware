@@ -545,7 +545,11 @@ constexpr uint32_t kRxDmaRequest = 0x0087u;
 /// measured stall is 17 ms.
 constexpr uint32_t kRxDmaFrames = 4096u;
 constexpr uint32_t kRxDmaBytes = kRxDmaFrames * kRxFrameBytes;
-alignas(CACHE_LINE_SIZE) uint8_t rxDmaBuffer[kRxDmaBytes];
+/// SDRAM, like ssiRxBuffer which this is modelled on, and for the reason that one is there: 16 KB is a lot to
+/// take out of internal RAM. Taking it silently broke every unsolicited debug line in the build - including the
+/// audio engine's own, from a module this branch does not touch - while the audio itself ran perfectly. The
+/// linker did not complain, and nothing pointed at memory; only the section sizes did.
+PLACE_SDRAM_BSS alignas(CACHE_LINE_SIZE) uint8_t rxDmaBuffer[kRxDmaBytes];
 
 /// LVL: the USB request is a level rather than an edge, same as every other peripheral here.
 constexpr uint32_t kRxDmaLevel = (1u << 6);
@@ -670,15 +674,19 @@ bool startReturnDma() {
 	// pointing D1FIFO at the same pipe is an illegal state, and what it costs is not the audio - it is every
 	// later use of the shared port, which is USB MIDI. That is exactly what happened: audio ran, the return went
 	// clean, and the Deluge stopped answering on its debug channel entirely.
-	{
-		volatile uint16_t* const cfifosel = &reg->CFIFOSEL;
-		if ((*cfifosel & USB_CURPIPE) == USB_CFG_PAUDIO_ISO_OUT) {
-			*cfifosel = (uint16_t)(*cfifosel & ~USB_CURPIPE);
-			uint32_t parked = 0;
-			while ((*cfifosel & USB_CURPIPE) != 0u) {
-				if (++parked > 10000u) {
-					break;
-				}
+	//
+	// Through the driver's own accessor, not by writing the register. It decides whether the port needs moving by
+	// comparing against its shadow (fifoSels, usb_cstd_chg_curpipe) and skips the write when the shadow already
+	// says what the caller wants - so a register changed behind it leaves the driver certain the port is
+	// somewhere it is not. That trap is written down at the top of this file, and the first two attempts at this
+	// walked into it: the audio ran perfectly while the Deluge went silent on its debug channel, which is the
+	// worst possible failure to have to diagnose. rmw_fifosel writes both.
+	if ((fifoSels[USB_CUSE] & USB_CURPIPE) == USB_CFG_PAUDIO_ISO_OUT) {
+		hw_usb_rmw_fifosel(USB_NULL, USB_CUSE, 0u, USB_CURPIPE);
+		uint32_t parked = 0;
+		while ((reg->CFIFOSEL & USB_CURPIPE) != 0u) {
+			if (++parked > 10000u) {
+				break;
 			}
 		}
 	}
