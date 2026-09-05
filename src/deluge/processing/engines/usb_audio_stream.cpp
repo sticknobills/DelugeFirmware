@@ -313,6 +313,14 @@ constexpr uint32_t kRxRingMask = kRxRingFrames - 1u;
 /// B4 measures the drift before anything tries to correct it.
 constexpr uint32_t kRxLeadFrames = 1024u;
 
+/// Below this the cushion is not dipping, it is gone, and the reader stops rather than limping.
+///
+/// Matched rates mean the cushion never refills by itself: whatever level a burst leaves it on, it stays on. So
+/// the reader took what little was there, 54 times a second, and lost 1.4% of the audio in eleven-frame gaps -
+/// which is the gritty sound. Rebuilding deliberately costs one short mute and then runs clean, which is the
+/// same trade the outgoing ring makes when it resyncs.
+constexpr uint32_t kRxRePrimeFloor = 256u;
+
 PLACE_SDRAM_BSS int16_t rxRing[kRxRingFrames * kRxChannels];
 
 /// Free-running like the outgoing pair, and masked only where they index. rxWriteFrame is advanced by the
@@ -342,9 +350,15 @@ uint32_t statRxPartial = 0;     ///< a byte count that is not a whole number of 
 uint32_t statRxOverrun = 0;     ///< frames dropped because the reader had not taken the last ones
 uint32_t statRxUnderrun = 0;    ///< render windows the ring could not fill completely
 uint32_t statRxShortFrames = 0; ///< frames missing across those windows - what was actually lost
-uint32_t statRxDrained = 0;     ///< frames handed to the render path
-uint32_t statRxArms = 0;        ///< transfers armed
-uint32_t statRxArmErr = 0;      ///< arms the driver refused
+uint32_t statRxRePrimes = 0;    ///< deliberate rebuilds of the cushion, each one short mute
+/// How low and how high the cushion actually swings in an interval. The engine takes the return in bursts and
+/// nothing here knew how big they were, so every cushion size so far has been a guess. Min is what the cushion
+/// has to clear; the pair together is the swing.
+uint32_t statRxHeldMin = 0xFFFFFFFFu;
+uint32_t statRxHeldMax = 0;
+uint32_t statRxDrained = 0; ///< frames handed to the render path
+uint32_t statRxArms = 0;    ///< transfers armed
+uint32_t statRxArmErr = 0;  ///< arms the driver refused
 uint32_t statRxLastErr = 0;
 uint32_t statRxSizes[4] = {}; ///< 43 and under / 44 / 45 / 46 and over, in frames
 int32_t rxPeak[kRxChannels] = {};
@@ -871,6 +885,24 @@ void mixReturnInto(StereoSample* buffer, uint32_t numSamples) {
 	}
 
 	const uint32_t held = rxWriteFrame - rxReadFrame;
+	if constexpr (kDiagnostics) {
+		if (returnActive) {
+			if (held < statRxHeldMin) {
+				statRxHeldMin = held;
+			}
+			if (held > statRxHeldMax) {
+				statRxHeldMax = held;
+			}
+		}
+	}
+
+	// Run dry rather than limp. Reading on when the cushion is gone loses a few frames every window for as long
+	// as it takes to recover, and with matched rates that is indefinitely.
+	if (rxPrimed && held < kRxRePrimeFloor) {
+		rxPrimed = false;
+		statRxRePrimes++;
+	}
+
 	const bool streaming = returnActive && returnEnabled && rxPrimed;
 	const uint32_t available = streaming ? (held < numSamples ? held : numSamples) : 0u;
 	if (streaming && available < numSamples) {
@@ -2003,9 +2035,9 @@ void reportStats() {
 	// machine once already and the comment saying it was sized for the worst case is what stopped anyone
 	// re-checking. Tags including their leading space, then ten digits for each unsigned counter:
 	//   AUI alt 17 | act 14 | inf 14 | brdy 15 | arm 14 | aerr 15 | err 14 | pkt 14 | frm 14 | mt 13 |
-	//   part 15 | ovr 14 | unr 14 | shf 14 | drn 14 | wf 13 | rf 13 | held 15 | pr 4
+	//   part 15 | ovr 14 | unr 14 | shf 14 | rp 13 | hmin 15 | hmax 15 | drn 14 | wf 13 | rf 13 | held 15 | pr 4
 	//   sz 3 + 4 buckets at 11 = 47 | pk 3 + kRxChannels at 11 = 25 at two channels
-	// 349 worst case, plus the terminator. 384 leaves room for two more fields; widening the return past two
+	// 392 worst case, plus the terminator. 384 leaves room for two more fields; widening the return past two
 	// channels adds 11 apiece and must be re-counted here.
 	{
 		char rxLine[384];
@@ -2042,6 +2074,13 @@ void reportStats() {
 		// frame counted the same before, and they are not the same thing.
 		emit(" shf");
 		emitDec(statRxShortFrames);
+		emit(" rp");
+		emitDec(statRxRePrimes);
+		// The swing the cushion has to survive, which every size so far has been guessed against.
+		emit(" hmin");
+		emitDec(statRxHeldMin == 0xFFFFFFFFu ? 0u : statRxHeldMin);
+		emit(" hmax");
+		emitDec(statRxHeldMax);
 		emit(" drn");
 		emitDec(statRxDrained);
 		// The ring's own position. held is the reader's lead in frames, which is the latency B3 inherits.
@@ -2235,6 +2274,9 @@ void reportStats() {
 	statRxOverrun = 0;
 	statRxUnderrun = 0;
 	statRxShortFrames = 0;
+	statRxRePrimes = 0;
+	statRxHeldMin = 0xFFFFFFFFu;
+	statRxHeldMax = 0;
 	statRxDrained = 0;
 	statRxArms = 0;
 	statRxArmErr = 0;
