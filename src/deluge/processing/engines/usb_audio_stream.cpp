@@ -445,11 +445,21 @@ void returnTransferComplete(usb_utr_t* ptr, uint16_t /*data1*/, uint16_t /*data2
 	rxTransferInFlight = false;
 	const uint32_t remaining = ptr != nullptr ? (uint32_t)ptr->tranlen : kRxMaxPacketBytes;
 	const uint32_t received = remaining > kRxMaxPacketBytes ? 0u : kRxMaxPacketBytes - remaining;
-	ingestReturnPacket(rxPackets[rxPacketSlot], received);
+
+	// Re-arm before decoding, not after. The pipe is double-buffered in hardware, so a second packet can arrive
+	// while this handler is still running - and until the transfer is re-armed the driver's data pointer is still
+	// aimed at the buffer being decoded here. Arriving in that window, it writes over audio that has not been
+	// copied out yet.
+	//
+	// Every packet still completes, so every counter reads a healthy stream while the contents are wrong, and the
+	// window is widest under load because that is when this handler is delayed. Pointing the hardware at the other
+	// buffer first closes it.
+	const uint32_t finished = rxPacketSlot;
 	rxPacketSlot ^= 1u;
 	if (returnActive) {
 		armReturnTransfer();
 	}
+	ingestReturnPacket(rxPackets[finished], received);
 }
 
 /// Points the driver at the next landing area and asks it to fill it.
