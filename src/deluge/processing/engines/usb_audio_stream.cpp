@@ -657,8 +657,7 @@ uint16_t readRxDmaStatus() {
 
 bool rxDmaRunning = false;
 uint32_t rxDmaReadOffset = 0;     ///< how far the drain has got through the buffer above, in bytes
-uint32_t statRxPidReasserts = 0;  ///< times the pipe had to be re-opened after something NAKed it
-uint32_t statRxBrdyReasserts = 0; ///< times the pipe's ready interrupt had to be switched off again
+uint32_t statRxHandoverRedos = 0; ///< times the pipe was found disturbed and the handover was rebuilt
 uint32_t statRxDmaLaps = 0;       ///< times the controller overtook the drain - audio genuinely lost
 uint32_t statRxDmaBytes = 0;      ///< bytes drained, so the rate can be checked against 176,400/s
 
@@ -842,33 +841,34 @@ void drainReturnDma() {
 		return;
 	}
 
-	// Above every early return below, and the placement is the point. These first sat after the copy loop,
-	// under an "if nothing arrived, return" - so once the pipe was shut nothing arrived, the drain returned,
-	// and the code meant to re-open it never ran. Measured completely inert on hardware, and this project
-	// already had the lesson written down: a fix that has to run inside the thing that is stalled cannot fix
-	// the stall.
+	// The pipe's two halves and the controller have to agree on whose turn it is, and once anything has
+	// disturbed the pipe they no longer do. Re-doing the handover is the only thing that resynchronises them.
+	//
+	// Measured, 2026-09-06, in that order: with nothing guarded, a host claiming the MIDI interface re-enabled
+	// this pipe's ready interrupt and the return went ring-modulated. Guarding that left the pipe shut instead
+	// and the return went silent. Re-opening it by writing the one register brought the audio back and the
+	// ring-mod with it - every watched register correct, the controller running, the pipe open, and packets
+	// still landing exactly two packets out, alternating, a thousand times a second. A single register poke
+	// resumes the pipe without telling the controller where it is.
+	//
+	// What does work was measured before any of this was written: stopping and re-opening the return produced a
+	// clean stream every time. So a disturbance tears the handover down and lets serviceReturn build it again,
+	// which is one path rather than a set of pokes that each half-repair it.
 	if constexpr (kReturnDma) {
-		// The interrupt the handover switched off, held off. Not a watchdog: it clears one mask bit that this
-		// code owns and nothing resubmits, so it cannot do what the 2026-08-22 watchdog did. It is here because
-		// the guards above cover the paths that are known, and the cost of an unknown one is a build that is
-		// unusable the moment a host opens a MIDI port.
 		usb_regadr_t reg = usb_hstd_get_usb_ip_adr(USB_CFG_USE_USBIP);
-		if ((reg->BRDYENB & (1u << USB_CFG_PAUDIO_ISO_OUT)) != 0u) {
-			hw_usb_clear_brdyenb(USB_NULL, USB_CFG_PAUDIO_ISO_OUT);
-			statRxBrdyReasserts++;
-		}
-		// And held open. Measured 2026-09-05: with the re-arm correctly removed, a host claiming the MIDI
-		// interface leaves this pipe set to refuse packets - PID 1 to 0 at the same instant, never restored - and
-		// the return goes silent rather than wrong. The driver's own MIDI handling does it; the re-arm had been
-		// putting it back as a side effect, which is why removing the re-arm swapped one fault for another.
-		//
-		// Restored here rather than by arming, because arming means the driver's receive path and that is what
-		// switches the ready interrupt back on. This writes the one field, resubmits nothing, and cannot give the
-		// pipe a second consumer.
 		volatile uint16_t* const pipectr = &reg->PIPE1CTR + (USB_CFG_PAUDIO_ISO_OUT - 1);
-		if ((*pipectr & USB_PID_BUF) != USB_PID_BUF) {
-			hw_usb_set_pid_nonzero_pipe_rohan(USB_CFG_PAUDIO_ISO_OUT, USB_PID_BUF);
-			statRxPidReasserts++;
+		const bool interruptBack = (reg->BRDYENB & (1u << USB_CFG_PAUDIO_ISO_OUT)) != 0u;
+		const bool pipeShut = (*pipectr & USB_PID_BUF) != USB_PID_BUF;
+		if (interruptBack || pipeShut) {
+			statRxHandoverRedos++;
+			DMACn(kRxDmaChannel).CHCTRL_n = kDmaChctrlClearEnable;
+			reg->D1FIFOSEL = USB_MBW_32;
+			hw_usb_clear_brdyenb(USB_NULL, USB_CFG_PAUDIO_ISO_OUT);
+			rxDmaRunning = false;
+			rxTransferInFlight = false;
+			// The ring keeps its contents; only the collection is rebuilt. serviceReturn arms and hands over
+			// again on its next pass, which is the same path that built it at the start of the stream.
+			return;
 		}
 	}
 	// Where the controller is writing now. Aligned down to a whole frame, so a partly-written one is left for
@@ -2729,8 +2729,9 @@ void reportStats() {
 	// unanswered, and whether it has the second buffer plane that is supposed to cover it.
 	//
 	// Own line and own buffer. "AUN" plus five gap buckets at 11 is 59, plus cfg, buf and dblb at 5+4 each is 27,
-	// the shadow copy 9, and dma, dmab and laps at 5+15+16: 135 worst case, plus the terminator. 192 leaves
-	// room for two more; counted rather than claimed, because this line grew once already.
+	// the shadow copy 9, and dma, dmab, laps and redo at 5+15+16+16: 151 worst case, plus the terminator. 192
+	// leaves room for one more; counted rather than claimed, because this line grew once already and a line
+	// grown past its buffer froze this machine on 2026-08-22.
 	{
 		readReturnPipeConfig();
 		char cfgLine[192];
@@ -2758,6 +2759,10 @@ void reportStats() {
 		emitDec(statRxDmaBytes);
 		emit(" laps");
 		emitDec(statRxDmaLaps);
+		// How often the pipe was found disturbed and the handover rebuilt. Zero is the healthy reading and any
+		// non-zero says a host touched a pipe this code owns.
+		emit(" redo");
+		emitDec(statRxHandoverRedos);
 		*p = '\0';
 		Debug::sysexDebugPrint(*Debug::midiDebugCable, cfgLine, true);
 	}
