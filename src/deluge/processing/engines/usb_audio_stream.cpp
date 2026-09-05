@@ -1185,6 +1185,16 @@ constexpr uint32_t kReturnShift = 1u + 16u - AUDIO_OUTPUT_GAIN_DOUBLINGS;
 constexpr uint32_t kReturnMultiplierBits = 16u;
 int32_t returnMultiplierQ16 = 0;
 
+/// The largest multiplier at which a full-scale arriving sample cannot overflow an int32, so the saturating
+/// compare below is unreachable and the steady-state loop can drop it.
+///
+/// A sample reaches (32768 << kReturnShift) * multiplier >> kReturnMultiplierBits, so the bound is
+/// 2^(31 + kReturnMultiplierBits - 15 - kReturnShift). Only a very low trim, which makes the inverse very large,
+/// gets anywhere near it.
+static_assert(31u + kReturnMultiplierBits > 15u + kReturnShift + 1u, "the saturation bound must fit an int32");
+constexpr int32_t kReturnSaturationFreeMax = (int32_t)(1u << (31u + kReturnMultiplierBits - 15u - kReturnShift));
+bool returnSaturationFree = false;
+
 /// Ramp applied on top, in Q16, so a stream that stops or a ring that runs dry fades rather than steps.
 ///
 /// A step from a live sample to zero is a click, and the host is entitled to stop sending at any moment without
@@ -1196,6 +1206,7 @@ int32_t returnFade = 0;
 void recomputeReturnMultiplier() {
 	if (stemTrimMultiplier <= 0 || !returnEnabled || returnLevelSetting == 0) {
 		returnMultiplierQ16 = 0;
+		returnSaturationFree = true;
 		return;
 	}
 	// The trim's own inverse: the outgoing side multiplied by trimMultiplier / 2^24.
@@ -1208,6 +1219,7 @@ void recomputeReturnMultiplier() {
 		levelMultiplier = (int32_t)(((int64_t)levelMultiplier * 57139) >> 16);
 	}
 	returnMultiplierQ16 = (int32_t)(((int64_t)trimInverse * levelMultiplier) >> 24);
+	returnSaturationFree = returnMultiplierQ16 < kReturnSaturationFreeMax;
 }
 
 /// One arriving sample, back at the mix's own scale.
@@ -1215,6 +1227,12 @@ void recomputeReturnMultiplier() {
 /// Saturating, and not merely for tidiness. The multiplier is the trim's inverse, so a low trim means a large
 /// one: at a trim of 10 a full-scale return lands at 4.0e9, which wraps an int32 to a large negative number. A
 /// gain error is quiet and a wrap is a polarity inversion at full scale, so the guard is worth its comparison.
+/// The same conversion with the guard removed, for the multipliers at which it cannot fire. Two compares against
+/// 64-bit constants, twice a sample, 44,100 times a second is worth removing where it is provably dead code.
+[[gnu::always_inline]] inline int32_t returnToMixScaleFast(int16_t sample) {
+	return (int32_t)((((int64_t)((int32_t)sample << kReturnShift) * returnMultiplierQ16) >> kReturnMultiplierBits));
+}
+
 [[gnu::always_inline]] inline int32_t returnToMixScale(int16_t sample) {
 	const int64_t wide = ((int64_t)((int32_t)sample << kReturnShift) * returnMultiplierQ16) >> kReturnMultiplierBits;
 	if (wide > INT32_MAX) {
@@ -1282,6 +1300,40 @@ void mixReturnInto(StereoSample* buffer, uint32_t numSamples) {
 
 	const uint32_t start = costStart();
 	const uint32_t r = rxReadFrame;
+
+	// The steady state, which is every window once a host has settled: a full window present, the fade already
+	// up, and a trim at which the conversion cannot overflow. Everything the general loop re-tests per sample is
+	// settled once here instead, and the ring is walked as straight runs so the wrap is tested per run rather
+	// than per frame. This loop runs inside the render, which is the path with the hard deadline - the receive
+	// side costs five times more and is deliberately somewhere that being late is harmless.
+	if (streaming && returnFade >= kReturnFadeFull && available == numSamples && returnSaturationFree) {
+		uint32_t done = 0;
+		while (done < numSamples) {
+			const uint32_t slot = (r + done) & kRxRingMask;
+			uint32_t run = kRxRingFrames - slot;
+			if (run > numSamples - done) {
+				run = numSamples - done;
+			}
+			const int16_t* __restrict__ src = &rxRing[slot * kRxChannels];
+			StereoSample* __restrict__ dst = &buffer[done];
+			for (uint32_t i = 0; i < run; i++) {
+				if constexpr (kReturnTrace) {
+					const uint32_t at = done + i;
+					if (at < stemWindowSamples) {
+						rxTraceIndex[at] = (int16_t)(((r + at) & kReturnTraceMask) * (uint32_t)kReturnTraceScale);
+						rxTraceValue[at] = src[0];
+					}
+				}
+				dst[i].l += returnToMixScaleFast(src[0]);
+				dst[i].r += returnToMixScaleFast(src[kRxChannels > 1 ? 1 : 0]);
+				src += kRxChannels;
+			}
+			done += run;
+		}
+		addCost(costReturnMix, start);
+		return;
+	}
+
 	for (uint32_t i = 0; i < numSamples; i++) {
 		if (streaming) {
 			returnFade += kReturnFadeStep;
