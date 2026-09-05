@@ -99,19 +99,8 @@ constexpr bool kAudioStamps = false;
 /// Off for anything a listener judges - it costs two channels of real routing. On for the latency and unity-gain
 /// measurements, which is the only reason it exists. Routing the finished mix as a *feature* is stage D, and is a
 /// different decision from this one.
-constexpr bool kMixOnChannels78 = true;
+constexpr bool kMixOnChannels78 = false;
 
-/// DIAGNOSTIC. Take the return one frame per output sample, in the output stage, instead of a window at a time
-/// inside the render.
-///
-/// The measured fault is a jump of exactly one render window, once per render window, which points at the
-/// relationship between rendering and output rather than at USB. The engine renders more than it outputs and
-/// discards the rest; every attempt to reconcile the return with that has failed. Here the ring advances by one
-/// frame per sample that actually leaves the machine, so the mismatch cannot exist.
-///
-/// The cost is that the return no longer passes through the song's master chain, which is the whole point of
-/// where B3 put it - so this answers a question rather than shipping.
-constexpr bool kReturnAtOutputStage = true;
 static_assert(!kAudioStamps || kDiagnostics, "The stamps are part of the instruments and need them compiled in");
 
 /// Must match the AudioStreaming interface's number in r_usb_pmidi_descriptor.c.
@@ -868,15 +857,6 @@ constexpr int32_t kReturnFadeFull = 1 << 16;
 constexpr int32_t kReturnFadeStep = kReturnFadeFull / 128;
 int32_t returnFade = 0;
 
-/// DIAGNOSTIC. Which ring frame fed each sample of the render window, so the recording says exactly what the
-/// reader consumed and in what order.
-///
-/// Every counter reports the return delivering every frame while it audibly glitches once per render window, so
-/// the counters are measuring the wrong thing. A repeat, a skip and a reordering are three different faults and
-/// sound alike; stamped, they are three different pictures. Same trick the outgoing stream uses.
-int16_t returnStamp[kStemWindowSamples];
-uint32_t returnStampCount = 0;
-
 void recomputeReturnMultiplier() {
 	if (stemTrimMultiplier <= 0 || !returnEnabled || returnLevelSetting == 0) {
 		returnMultiplierQ16 = 0;
@@ -981,11 +961,6 @@ void mixReturnInto(StereoSample* buffer, uint32_t numSamples) {
 		if (i >= available) {
 			continue;
 		}
-		if constexpr (kMixOnChannels78) {
-			if (i < kStemWindowSamples) {
-				returnStamp[i] = (int16_t)((r + i) & 0x7FFFu);
-			}
-		}
 		const int16_t* const frame = &rxRing[((r + i) & kRxRingMask) * kRxChannels];
 		const int32_t left = returnToMixScale(frame[0]);
 		const int32_t right = returnToMixScale(frame[kRxChannels > 1 ? 1 : 0]);
@@ -998,10 +973,6 @@ void mixReturnInto(StereoSample* buffer, uint32_t numSamples) {
 			buffer[i].r += (int32_t)(((int64_t)right * returnFade) >> 16);
 		}
 	}
-	if constexpr (kMixOnChannels78) {
-		returnStampCount = available < kStemWindowSamples ? available : kStemWindowSamples;
-	}
-
 	// Deliberately does not advance the read pointer. The engine renders more samples than it outputs - it sizes
 	// a render from the codec's free space and then doubles it to get ahead - and discards whatever did not fit,
 	// re-rendering it next time. Advancing here consumed the discarded part too, about a tenth of the return,
@@ -3008,36 +2979,7 @@ void USBAudioStream::removeTrackFromMix(int32_t* mixNow, uint32_t numSamples) {
 	addCost(costStemSnapshot, start);
 }
 
-bool USBAudioStream::takeReturnFrame(int32_t* left, int32_t* right) {
-	*left = 0;
-	*right = 0;
-	if (!returnActive || !returnEnabled) {
-		return false;
-	}
-	const uint32_t held = rxWriteFrame - rxReadFrame;
-	if (!rxPrimed) {
-		if (held >= kRxLeadFrames) {
-			rxPrimed = true;
-		}
-		return false;
-	}
-	if (held == 0) {
-		rxPrimed = false;
-		statRxRePrimes++;
-		return false;
-	}
-	const int16_t* const frame = &rxRing[(rxReadFrame & kRxRingMask) * kRxChannels];
-	*left = returnToMixScale(frame[0]);
-	*right = returnToMixScale(frame[kRxChannels > 1 ? 1 : 0]);
-	rxReadFrame++;
-	statRxDrained++;
-	return true;
-}
-
 void USBAudioStream::mixReturn(StereoSample* buffer, uint32_t numSamples) {
-	if constexpr (kReturnAtOutputStage) {
-		return;
-	}
 	if (buffer == nullptr || numSamples == 0) {
 		return;
 	}
@@ -3110,9 +3052,7 @@ void USBAudioStream::costOutputLoop(uint32_t start) {
 
 void USBAudioStream::feedMix(const StereoSample* mix, uint32_t numSamples, uint32_t renderOffset) {
 	// The return is consumed here, against the samples that actually reached the codec.
-	if constexpr (!kReturnAtOutputStage) {
-		advanceReturnBy(numSamples);
-	}
+	advanceReturnBy(numSamples);
 
 	// Taken before the early return, not after: what an installed-but-idle build costs is one of the things being
 	// separated, and a timer that starts after the guard can never see it.
@@ -3163,12 +3103,6 @@ void USBAudioStream::feedMix(const StereoSample* mix, uint32_t numSamples, uint3
 					frame[c] = 0;
 				}
 			}
-		}
-		if constexpr (kMixOnChannels78) {
-			// The ring position that fed this output sample. Channel 5 should step by exactly one per sample;
-			// anything else is the fault, named.
-			const uint32_t stemIndex = renderOffset + i;
-			frame[4] = stemIndex < returnStampCount ? returnStamp[stemIndex] : (int16_t)-1;
 		}
 		if constexpr (kMixOnChannels78) {
 			// After the stem walk above, so these two win: the channels carry the mix rather than a stem. The

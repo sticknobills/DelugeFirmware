@@ -112,10 +112,6 @@ public:
 	/// separate instrument. Costs nothing when no host is sending.
 	static void mixReturn(StereoSample* buffer, uint32_t numSamples);
 
-	/// DIAGNOSTIC. One frame of the return, per sample that actually leaves the machine. Returns false and zeroes
-	/// its outputs when there is nothing to give.
-	static bool takeReturnFrame(int32_t* left, int32_t* right);
-
 	/// Level applied to the returning audio, 0-50, 1.2 dB a step, and whether it is summed in at all.
 	///
 	/// The default is unity against the outgoing trim's own inverse, so a device that returns what it was given
