@@ -433,6 +433,23 @@ uint8_t numRoutines = 0;
 /// Hundredths of a render rather than a float, so the correction is integer arithmetic on the audio path.
 uint32_t rendersPerCallX100 = 100;
 
+/// Renders the emergency cull condition must hold for before it kills anything.
+///
+/// One is what upstream did, and it means a single render crossing the line costs two or more voices instantly.
+constexpr int32_t kHardCullRunRequired = 2;
+
+/// How many consecutive renders the emergency cull condition has held for.
+///
+/// Measured 2026-09-07 on the dense reference song, firmware d1b5edd2: every render whose figure crossed the
+/// emergency line produced exactly one hard cull - 241 seconds out of 241, the two counts identical every
+/// second - while the codec never once ran short, widest stall 108 samples against the 128 that would be a real
+/// failure. So the crossings were not rescuing anything. Opening the USB stream adds 0.7 of them a second, and
+/// that is the whole of its 1.7-voice cost; the other 1.8 a second are there with no cable attached.
+///
+/// Reset from setDireness() on every render that does not reach cullVoices(), so a run counts consecutive
+/// renders and not consecutive crossings separated by any amount of calm.
+int32_t hardCullRunLength = 0;
+
 // not in header (private to audio engine)
 /// determines how many voices to cull based on num audio samples, current voices and numSamplesLimit
 void cullVoices(size_t numSamples, int32_t numAudio, int32_t numVoice) {
@@ -447,6 +464,16 @@ void cullVoices(size_t numSamples, int32_t numAudio, int32_t numVoice) {
 	// DIAGNOSTIC. Which branch this call takes, recorded at the point each condition is evaluated rather than
 	// inferred afterwards from the cull totals - several branches feed those totals and a change of branch is
 	// invisible in them.
+	// Track the run before any branch, so it counts renders rather than culls and a crossing that is refused
+	// still extends the run that lets the next one through.
+	if (num_samples_over_limit >= 32) {
+		hardCullRunLength++;
+	}
+	else {
+		hardCullRunLength = 0;
+	}
+	const bool hardCullSustained = (hardCullRunLength >= kHardCullRunRequired);
+
 	const bool diagGated = (numAudio + numVoice > MIN_VOICES);
 	bool diagHard = false;
 	bool diagSoftEligible = false;
@@ -455,9 +482,14 @@ void cullVoices(size_t numSamples, int32_t numAudio, int32_t numVoice) {
 
 	if (numAudio + numVoice > MIN_VOICES) {
 
-		// If it's real dire, do a proper immediate cull
+		// If it's real dire, do a proper immediate cull - but only once the condition has actually persisted.
+		// A single render past this line is an outlier in a running average, not a machine that is failing, and
+		// it was costing two or more voices on its own. `diagHard` still counts every crossing, so the gap
+		// between it and the cull counters is what this refused.
 		if (num_samples_over_limit >= 32) {
 			diagHard = true;
+		}
+		if (num_samples_over_limit >= 32 && hardCullSustained) {
 
 			int32_t num_to_cull = (num_samples_over_limit >> 4);
 			// leave at least 7 - below this point culling won't save us
@@ -494,7 +526,7 @@ void cullVoices(size_t numSamples, int32_t numAudio, int32_t numVoice) {
 
 		// Or if it's just a little bit dire, do a soft cull with fade-out, but only cull for sure if numSamples
 		// is increasing
-		else if (num_samples_over_limit >= 0) {
+		else if (num_samples_over_limit >= 0 && num_samples_over_limit < 32) {
 			diagSoftEligible = true;
 			if (last_num_samples_over > 0 && num_samples_over_limit >= last_num_samples_over) {
 				diagSoftCulled = true;
@@ -573,8 +605,14 @@ inline void setDireness(size_t numSamples) { // Consider direness and culling - 
 			}
 		}
 	}
+	// This render never reached cullVoices(), so the emergency condition did not hold on it. Reset here rather
+	// than inside cullVoices(), which would let two crossings a minute apart count as consecutive.
+	else {
+		hardCullRunLength = 0;
+	}
+
 	// otherwise lower it (with some hysteresis to avoid jittering
-	else if (numSamples < direnessThreshold - 3) {
+	if (numSamples < direnessThreshold - 3) {
 
 		if ((int32_t)(audioSampleTimer - timeDirenessChanged) >= (kSampleRate >> 3)) { // Only if it's been long enough
 			timeDirenessChanged = audioSampleTimer;
