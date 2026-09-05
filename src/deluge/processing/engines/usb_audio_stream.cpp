@@ -299,10 +299,17 @@ constexpr uint32_t kRxRingMask = kRxRingFrames - 1u;
 /// time, so a cushion of exactly one window has no margin at all by construction, and every scrap of engine
 /// jitter empties it. The outgoing ring learned this and holds two windows; this one was written at one anyway.
 ///
-/// 1024 frames, 23 ms. Measured on hardware: playing the dense song knocks the cushion from 512 down to about
-/// 80 and it stays there, so the engine takes the return in bursts of roughly 450 frames, and any cushion
-/// smaller than that burst sits permanently on the floor. Latency, and B3.5 trades it once the burst is
-/// understood rather than merely covered.
+/// 2048 frames, 46 ms, and chosen from a measurement rather than tried.
+///
+/// The cushion has to exceed the engine's worst stall, because the reader is the engine and it takes the whole
+/// stall's worth back in one burst when it catches up. Measured on the dense reference song with the swing
+/// instrumented: the cushion travels from ~1150 down to ~240, so the burst is about 770 frames - 17 ms of the
+/// audio task running late under load. At a 1024 target the bottom of that swing lands on the floor and the
+/// cushion rebuilds twice a second, which is the muting that replaced the grit.
+///
+/// 2048 puts the bottom near 1280, clear of the floor. hmin and hmax on the report say whether that holds on
+/// other material, and they are what a smaller figure would have to be argued from. It is real latency and
+/// B3.5 is where it gets traded down - most likely by attacking the 17 ms stall rather than the cushion.
 ///
 /// The earlier note, kept because its reasoning still holds: the reader still needs 128 at a time, so this leaves three
 /// windows of slack for the engine's bursts and the host's own 512-frame buffering. It is latency, and B3.5 is where
@@ -311,7 +318,7 @@ constexpr uint32_t kRxRingMask = kRxRingFrames - 1u;
 /// The device is adaptive here and cannot ask the host to change rate - no feedback endpoint is possible at Full
 /// Speed with both isochronous pipes carrying audio - so this buffer is the only thing absorbing the mismatch.
 /// B4 measures the drift before anything tries to correct it.
-constexpr uint32_t kRxLeadFrames = 1024u;
+constexpr uint32_t kRxLeadFrames = 2048u;
 
 /// Below this the cushion is not dipping, it is gone, and the reader stops rather than limping.
 ///
