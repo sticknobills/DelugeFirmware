@@ -37,6 +37,7 @@ extern "C" {
 #include "RZA1/system/iodefines/usb20_iodefine.h"
 #include "RZA1/usb/r_usb_basic/r_usb_basic_if.h"
 #include "RZA1/usb/r_usb_basic/src/hw/inc/r_usb_bitdefine.h"
+#include "RZA1/usb/r_usb_basic/src/hw/inc/r_usb_reg_access.h"
 #include "definitions.h"
 #include "deluge/drivers/usb/usb_setup_trace.h"
 #include "deluge/drivers/usb/userdef/r_usb_paudio_config.h"
@@ -498,6 +499,77 @@ void ingestReturnPacket(const uint8_t* data, uint32_t bytes) {
 }
 
 void armReturnTransfer();
+void drainReturnDma();
+bool startReturnDma();
+
+/// CHCTRL bits, named as the vendor's r_usb_dmac.h names them. Shared by both directions' DMA, so they sit
+/// above the first of the two rather than beside either.
+constexpr uint32_t kDmaChctrlClearEnd = 0x00000020u;    ///< CLREND
+constexpr uint32_t kDmaChctrlClearTc = 0x00000040u;     ///< CLRTC
+constexpr uint32_t kDmaChctrlSwReset = 0x00000008u;     ///< SWRST
+constexpr uint32_t kDmaChctrlSetEnable = 0x00000001u;   ///< SETEN
+constexpr uint32_t kDmaChctrlClearEnable = 0x00000002u; ///< CLREN
+
+/// Whether the return is collected by the DMA controller rather than by the completion interrupt.
+///
+/// The fault this exists for, measured 2026-09-06: the driver NAKs an isochronous OUT pipe the instant a packet
+/// lands (usb_pstd_data_end) and it stays shut until an interrupt re-arms it. The audio engine masks every
+/// interrupt for the whole of each track's render - stock code, ENTER_CRITICAL_SECTION in Song::renderAudio - so
+/// under a dense song the pipe is shut for 1-3 host frames at a time and every packet arriving in that window is
+/// discarded by the hardware with nothing counted anywhere. Measured 1000 packets/s idle against ~940 loaded,
+/// with the gap histogram showing the deaf stretches routinely past two frames.
+///
+/// Two buffer planes is the ceiling: DBLB is confirmed set on this pipe at runtime, and CNTMD - the mode that
+/// would let one plane hold several packets - is valid only for bulk transfer on this part (hardware manual
+/// p1519). So no buffer setting can close this and the packets have to be collected without the CPU.
+///
+/// DCLRM is what makes that possible, and the manual says so outright (p1563): with it set, the module clears the
+/// buffer plane itself once the data has been read out, which "makes it possible to carry out DMA transfers
+/// without involving software", in the reading direction only - which is this one. The pipe then never fills, so
+/// a deaf CPU costs latency rather than audio.
+///
+/// One constant, so the whole change reverts to the interrupt path by flipping it.
+constexpr bool kReturnDma = true;
+
+/// Channel 1. Channels 2, 3, 4, 6, 7 and 10-14 are spoken for in cpu_specific.h and sd_cfg.h, and 0 is this
+/// stream's transmit half. 1 also shares DMARS0 with it, which setDMARS already handles by shifting for odd
+/// channels.
+constexpr uint32_t kRxDmaChannel = 1u;
+
+/// The request line the USB peripheral raises for D1FIFO on USB0, from the vendor driver's own table
+/// (r_usb_dma.c:1374). D0FIFO is 0x83 and taken by the transmit half; D1FIFO is a second, independent port.
+constexpr uint32_t kRxDmaRequest = 0x0087u;
+
+/// 4096 frames, 16 KB, 93 ms. Not a cushion - the return has its own - but how long the DMA can run before it
+/// laps itself, and therefore how far behind the drain may fall before audio is overwritten. The engine's worst
+/// measured stall is 17 ms.
+constexpr uint32_t kRxDmaFrames = 4096u;
+constexpr uint32_t kRxDmaBytes = kRxDmaFrames * kRxFrameBytes;
+alignas(CACHE_LINE_SIZE) uint8_t rxDmaBuffer[kRxDmaBytes];
+
+/// LVL: the USB request is a level rather than an edge, same as every other peripheral here.
+constexpr uint32_t kRxDmaLevel = (1u << 6);
+
+/// A descriptor whose last word is its own address, so the controller reloads it and runs forever. Copied in
+/// shape from ssiDmaRxLinkDescriptor rather than assembled from the register documentation: that one has been
+/// carrying this machine's audio input since long before this branch, and the config word below differs from it
+/// only in the channel number. Source fixed on the FIFO, destination walking the buffer, 32 bits each side -
+/// which is exactly one stereo frame of the return, so a transfer can never straddle one.
+const uint32_t rxDmaLinkDescriptor[] __attribute__((aligned(CACHE_LINE_SIZE))) = {
+    0b1101,                                                                 // Header
+    (uint32_t)&USB200.D1FIFO.UINT32,                                        // Source address
+    (uint32_t)rxDmaBuffer,                                                  // Destination address
+    sizeof(rxDmaBuffer),                                                    // Transaction size
+    0b10000001000100100010001000100000 | kRxDmaLevel | (kRxDmaChannel & 7), // Config
+    0,                                                                      // Interval
+    0,                                                                      // Extension
+    (uint32_t)rxDmaLinkDescriptor                                           // Next link: this one again
+};
+
+bool rxDmaRunning = false;
+uint32_t rxDmaReadOffset = 0; ///< how far the drain has got through the buffer above, in bytes
+uint32_t statRxDmaLaps = 0;   ///< times the controller overtook the drain - audio genuinely lost
+uint32_t statRxDmaBytes = 0;  ///< bytes drained, so the rate can be checked against 176,400/s
 
 constexpr uint16_t kFrameNumberMask = 0x07FFu; ///< FRMNUM b10-0; b15 is OVRN and b14 CRCE.
 /// Defined with the transmit instruments further down; declared here because the receive completion is the first
@@ -563,6 +635,128 @@ void armReturnTransfer() {
 	}
 }
 
+/// Hands the return pipe to the DMA controller and stops servicing it from the interrupt.
+///
+/// Order matters and is the vendor driver's: the port must be pointed at the pipe and confirmed to have taken
+/// before the request line goes up, or the controller is asked to move data from whichever pipe the port happened
+/// to be looking at. D1FIFO rather than D0FIFO because the transmit half owns that one, and the two ports are
+/// independent - which is what lets both directions run without either borrowing the other's.
+bool startReturnDma() {
+	if (rxDmaRunning) {
+		return true;
+	}
+	usb_regadr_t reg = usb_hstd_get_usb_ip_adr(USB_CFG_USE_USBIP);
+
+	// The completion interrupt is what this replaces. Left enabled it would keep ending transfers and NAKing the
+	// pipe underneath the controller, which is the exact behaviour being removed.
+	hw_usb_clear_brdyenb(USB_NULL, USB_CFG_PAUDIO_ISO_OUT);
+
+	// A pipe may be assigned to one FIFO port at a time, so it has to be stopped before it is moved. NAK first,
+	// wait for the current transaction to finish, then reassign - the order the manual gives for changing a
+	// pipe's port, and the order the vendor driver follows.
+	hw_usb_set_pid_nonzero_pipe_rohan(USB_CFG_PAUDIO_ISO_OUT, USB_PID_NAK);
+	{
+		volatile uint16_t* const pipectr = &reg->PIPE1CTR + (USB_CFG_PAUDIO_ISO_OUT - 1);
+		uint32_t settle = 0;
+		while ((*pipectr & USB_PBUSY) != 0u) {
+			if (++settle > 10000u) {
+				break;
+			}
+		}
+	}
+
+	const uint16_t want = (uint16_t)(USB_CFG_PAUDIO_ISO_OUT | USB_MBW_32);
+	uint16_t seen;
+	uint32_t guard = 0;
+	do {
+		reg->D1FIFOSEL = want;
+		seen = reg->D1FIFOSEL;
+		// Bounded, because a port that never takes must not hang the audio task - the machine has been frozen once
+		// already by a loop whose length came from elsewhere.
+		if (++guard > 10000u) {
+			return false;
+		}
+	} while ((seen & USB_CURPIPE) != USB_CFG_PAUDIO_ISO_OUT);
+
+	// DCLRM is the whole reason this works: the module clears each buffer plane itself once the controller has
+	// read it, so the pipe never fills and needs no software to empty it (hardware manual p1563, reading
+	// direction only). DREQE then lets the pipe ask the controller for the move.
+	reg->D1FIFOSEL = (uint16_t)(want | USB_DCLRM | USB_DREQE);
+
+	rxDmaReadOffset = 0;
+	initDMAWithLinkDescriptor((int32_t)kRxDmaChannel, rxDmaLinkDescriptor, kRxDmaRequest);
+	dmaChannelStart(kRxDmaChannel);
+
+	// Last, so the pipe only starts accepting once there is something waiting to collect from it.
+	hw_usb_set_pid_nonzero_pipe_rohan(USB_CFG_PAUDIO_ISO_OUT, USB_PID_BUF);
+	rxDmaRunning = true;
+	return true;
+}
+
+/// Moves whatever the controller has landed since last time into the ring.
+///
+/// Read through the uncached mirror, the same way the audio input buffer is read, so there is no cache to
+/// maintain and no window in which the CPU sees stale audio - a fault this domain has already paid for once.
+///
+/// Not deadline-bound, which is the point of the whole change: the controller keeps collecting whether or not
+/// this runs, so being late costs latency inside the buffer rather than audio off the wire.
+void drainReturnDma() {
+	if (!rxDmaRunning) {
+		return;
+	}
+	// Where the controller is writing now. Aligned down to a whole frame, so a partly-written one is left for
+	// next time rather than read torn.
+	const uint32_t base = (uint32_t)rxDmaBuffer;
+	const uint32_t current = DMACn(kRxDmaChannel).CRDA_n;
+	uint32_t writeOffset = (current - base) % kRxDmaBytes;
+	writeOffset -= writeOffset % kRxFrameBytes;
+
+	uint32_t available = (writeOffset - rxDmaReadOffset) % kRxDmaBytes;
+	if (available == 0u) {
+		return;
+	}
+	// The controller has come all the way round and is overwriting audio that was never read. Real loss, and the
+	// only kind this design can still suffer - so it is counted rather than absorbed silently.
+	if (available > kRxDmaBytes - kRxMaxPacketBytes) {
+		statRxDmaLaps++;
+	}
+
+	const uint8_t* const uncached = (const uint8_t*)(base + UNCACHED_MIRROR_OFFSET);
+	uint32_t offset = rxDmaReadOffset;
+	uint32_t w = rxWriteFrame;
+	const uint32_t held = w - rxReadFrame;
+	uint32_t room = held >= kRxRingFrames ? 0u : kRxRingFrames - held;
+	uint32_t frames = available / kRxFrameBytes;
+	if (frames > room) {
+		statRxOverrun += frames - room;
+		frames = room;
+	}
+	for (uint32_t f = 0; f < frames; f++) {
+		const int16_t* const src = (const int16_t*)(uncached + offset);
+		int16_t* const dst = &rxRing[(w & kRxRingMask) * kRxChannels];
+		for (uint32_t c = 0; c < kRxChannels; c++) {
+			dst[c] = src[c];
+		}
+		if constexpr (kDiagnostics) {
+			trackReturnPeak(src, 1);
+		}
+		offset += kRxFrameBytes;
+		if (offset >= kRxDmaBytes) {
+			offset = 0;
+		}
+		w++;
+	}
+	rxWriteFrame = w;
+	// Advanced past everything the controller produced, including anything dropped for want of ring room, so the
+	// two never drift apart.
+	rxDmaReadOffset = writeOffset;
+	statRxDmaBytes += available;
+	// Frames only. There are no completions to count in this mode, and a packet figure divided out of a frame
+	// count would be fixed by the arithmetic rather than measured - the same circularity that had an earlier tool
+	// reporting ~980 packets/s for every build including one delivering half. pkt stays zero here and means it.
+	statRxFrames += available / kRxFrameBytes;
+}
+
 /// Follows the host in and out of the return interface. Mirrors the outgoing half rather than sharing it: the
 /// host selects the two interfaces independently, and a DAW recording stems without sending anything back is an
 /// ordinary way to use this.
@@ -577,10 +771,33 @@ void serviceReturn() {
 		rxTransferInFlight = false;
 		rxPrimed = false;
 		rxReadFrame = rxWriteFrame;
+		if constexpr (kReturnDma) {
+			if (rxDmaRunning) {
+				DMACn(kRxDmaChannel).CHCTRL_n = kDmaChctrlClearEnable;
+				usb_hstd_get_usb_ip_adr(USB_CFG_USE_USBIP)->D1FIFOSEL = USB_MBW_32;
+				rxDmaRunning = false;
+			}
+		}
 		return;
 	}
 
 	returnActive = true;
+
+	if constexpr (kReturnDma) {
+		// The first arm is the driver's, because it is what configures the pipe - PIPECFG, the buffer allocation
+		// and the double buffering all come from its table. Everything after it is the controller's.
+		if (!rxDmaRunning) {
+			DISABLE_ALL_INTERRUPTS();
+			if (!rxTransferInFlight) {
+				armReturnTransfer();
+			}
+			ENABLE_ALL_INTERRUPTS();
+			startReturnDma();
+		}
+		drainReturnDma();
+		return;
+	}
+
 	// The test belongs inside the critical section, not outside it. The completion interrupt arms its own next
 	// transfer a thousand times a second; landing between a test out here and the mask below let this arm a
 	// second receive over a live one, re-pointing the driver's data pointer and length mid-transfer. Packet
@@ -2279,10 +2496,11 @@ void reportStats() {
 	// unanswered, and whether it has the second buffer plane that is supposed to cover it.
 	//
 	// Own line and own buffer. "AUN" plus five gap buckets at 11 is 59, plus cfg, buf and dblb at 5+4 each is 27,
-	// and the shadow copy 9: 99 worst case. 160 is ample and leaves room to grow.
+	// the shadow copy 9, and dma, dmab and laps at 5+15+16: 135 worst case, plus the terminator. 192 leaves
+	// room for two more; counted rather than claimed, because this line grew once already.
 	{
 		readReturnPipeConfig();
-		char cfgLine[160];
+		char cfgLine[192];
 		p = cfgLine;
 		emit("AUN gap");
 		for (uint32_t i = 0; i < 5; i++) {
@@ -2299,6 +2517,14 @@ void reportStats() {
 		// The driver's own record of the same register, so a disagreement is visible rather than silent.
 		emit(" shdw");
 		emitDec(pipeCfgs[USB_CFG_PAUDIO_ISO_OUT]);
+		// The controller's own progress. Bytes it advanced its destination pointer by, which it only does when it
+		// actually moved data, and the times it came all the way round onto audio the drain had not taken yet.
+		emit(" dma");
+		emitDec(rxDmaRunning ? 1u : 0u);
+		emit(" dmab");
+		emitDec(statRxDmaBytes);
+		emit(" laps");
+		emitDec(statRxDmaLaps);
 		*p = '\0';
 		Debug::sysexDebugPrint(*Debug::midiDebugCable, cfgLine, true);
 	}
@@ -2476,6 +2702,7 @@ void reportStats() {
 	for (uint32_t i = 0; i < 5; i++) {
 		statRxGap[i] = 0;
 	}
+	statRxDmaBytes = 0;
 	statRxArms = 0;
 	statRxArmErr = 0;
 	usbBrdyReturnCount = 0;
@@ -2500,19 +2727,14 @@ constexpr uint32_t kAudioDmaRequest = 0x00000083u;
 
 /// Values rather than an include: the vendor's r_usb_dmac.h declares a whole driver's worth of types alongside
 /// these and has never been compiled in this fork. Each is named here as it is named there, r_usb_dmac.h:68-131.
-constexpr uint32_t kDmaChcfgAmBusCycle = 0x00000200u;   ///< AM = bus cycle mode
-constexpr uint32_t kDmaChcfgLevel = 0x00000040u;        ///< LVL: the request is a level, not an edge
-constexpr uint32_t kDmaChcfgHighEnable = 0x00000020u;   ///< HIEN: active high
-constexpr uint32_t kDmaChcfgSelCh0 = 0x00000000u;       ///< SEL = channel 0
-constexpr uint32_t kDmaChcfgDest256 = 0x00050000u;      ///< DDS: 256-bit, a 32-byte block per bus cycle
-constexpr uint32_t kDmaChcfgDestFixed = 0x00200000u;    ///< DAD: the FIFO register does not advance
-constexpr uint32_t kDmaChcfgSrc256 = 0x00005000u;       ///< SDS: 256-bit reads from the packet
-constexpr uint32_t kDmaChcfgReqDest = 0x00000008u;      ///< REQD: the requesting module is the destination
-constexpr uint32_t kDmaChctrlClearEnd = 0x00000020u;    ///< CLREND
-constexpr uint32_t kDmaChctrlClearTc = 0x00000040u;     ///< CLRTC
-constexpr uint32_t kDmaChctrlSwReset = 0x00000008u;     ///< SWRST
-constexpr uint32_t kDmaChctrlSetEnable = 0x00000001u;   ///< SETEN
-constexpr uint32_t kDmaChctrlClearEnable = 0x00000002u; ///< CLREN
+constexpr uint32_t kDmaChcfgAmBusCycle = 0x00000200u; ///< AM = bus cycle mode
+constexpr uint32_t kDmaChcfgLevel = 0x00000040u;      ///< LVL: the request is a level, not an edge
+constexpr uint32_t kDmaChcfgHighEnable = 0x00000020u; ///< HIEN: active high
+constexpr uint32_t kDmaChcfgSelCh0 = 0x00000000u;     ///< SEL = channel 0
+constexpr uint32_t kDmaChcfgDest256 = 0x00050000u;    ///< DDS: 256-bit, a 32-byte block per bus cycle
+constexpr uint32_t kDmaChcfgDestFixed = 0x00200000u;  ///< DAD: the FIFO register does not advance
+constexpr uint32_t kDmaChcfgSrc256 = 0x00005000u;     ///< SDS: 256-bit reads from the packet
+constexpr uint32_t kDmaChcfgReqDest = 0x00000008u;    ///< REQD: the requesting module is the destination
 
 /// D0FBCFG's 32-byte continuous access mode, USB_DFACC_32 in the vendor's bit definitions.
 constexpr uint16_t kFifoAccess32Byte = 0x2000u;
