@@ -918,10 +918,6 @@ void mixReturnInto(StereoSample* buffer, uint32_t numSamples) {
 
 	const bool streaming = returnActive && returnEnabled && rxPrimed;
 	const uint32_t available = streaming ? (held < numSamples ? held : numSamples) : 0u;
-	if (streaming && available < numSamples) {
-		statRxUnderrun++;
-		statRxShortFrames += numSamples - available;
-	}
 
 	// The fade follows whether the host is streaming at all, not whether this window happened to be full. A
 	// shortfall is a few missing frames, not a departure.
@@ -961,9 +957,31 @@ void mixReturnInto(StereoSample* buffer, uint32_t numSamples) {
 			buffer[i].r += (int32_t)(((int64_t)right * returnFade) >> 16);
 		}
 	}
-	rxReadFrame = r + available;
-	statRxDrained += available;
+	// Deliberately does not advance the read pointer. The engine renders more samples than it outputs - it sizes
+	// a render from the codec's free space and then doubles it to get ahead - and discards whatever did not fit,
+	// re-rendering it next time. Advancing here consumed the discarded part too, about a tenth of the return,
+	// continuously, which drained a cushion of any size and is why no size ever held. The pointer moves in
+	// advanceReturn(), by what actually left the machine.
 	addCost(costReturnMix, start);
+}
+
+/// Advances the return by the number of samples that actually reached the codec.
+///
+/// Called from the same place the outgoing stream is fed, which has been using this figure correctly all along.
+/// A render window that was rendered and not output is re-rendered next time, so re-reading those frames is the
+/// correct behaviour rather than a compromise.
+void advanceReturnBy(uint32_t numSamplesOutputted) {
+	if (!returnActive || !rxPrimed) {
+		return;
+	}
+	const uint32_t held = rxWriteFrame - rxReadFrame;
+	const uint32_t take = numSamplesOutputted < held ? numSamplesOutputted : held;
+	if (take < numSamplesOutputted) {
+		statRxUnderrun++;
+		statRxShortFrames += numSamplesOutputted - take;
+	}
+	rxReadFrame += take;
+	statRxDrained += take;
 }
 
 /// Branch counters. "Nothing was sent" cannot distinguish the task never running, the task
@@ -3017,6 +3035,9 @@ void USBAudioStream::costOutputLoop(uint32_t start) {
 }
 
 void USBAudioStream::feedMix(const StereoSample* mix, uint32_t numSamples, uint32_t renderOffset) {
+	// The return is consumed here, against the samples that actually reached the codec.
+	advanceReturnBy(numSamples);
+
 	// Taken before the early return, not after: what an installed-but-idle build costs is one of the things being
 	// separated, and a timer that starts after the guard can never see it.
 	const uint32_t feedStart = costStart();
