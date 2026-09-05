@@ -656,9 +656,10 @@ uint16_t readRxDmaStatus() {
 }
 
 bool rxDmaRunning = false;
-uint32_t rxDmaReadOffset = 0; ///< how far the drain has got through the buffer above, in bytes
-uint32_t statRxDmaLaps = 0;   ///< times the controller overtook the drain - audio genuinely lost
-uint32_t statRxDmaBytes = 0;  ///< bytes drained, so the rate can be checked against 176,400/s
+uint32_t rxDmaReadOffset = 0;     ///< how far the drain has got through the buffer above, in bytes
+uint32_t statRxBrdyReasserts = 0; ///< times the pipe's ready interrupt had to be switched off again
+uint32_t statRxDmaLaps = 0;       ///< times the controller overtook the drain - audio genuinely lost
+uint32_t statRxDmaBytes = 0;      ///< bytes drained, so the rate can be checked against 176,400/s
 
 constexpr uint16_t kFrameNumberMask = 0x07FFu; ///< FRMNUM b10-0; b15 is OVRN and b14 CRCE.
 /// Defined with the transmit instruments further down; declared here because the receive completion is the first
@@ -694,14 +695,29 @@ void returnTransferComplete(usb_utr_t* ptr, uint16_t /*data1*/, uint16_t /*data2
 	// buffer first closes it.
 	const uint32_t finished = rxPacketSlot;
 	rxPacketSlot ^= 1u;
-	if (returnActive) {
+	// Not once the controller owns the pipe. Arming goes through the driver's receive path, which switches the
+	// pipe's ready interrupt back on as its last act - the very interrupt the handover switched off so that the
+	// processor would stop touching a pipe the controller is draining. Measured on hardware 2026-09-05: at the
+	// instant a host claims the MIDI interface, BRDYENB goes 0x0010 to 0x0014 and never returns, and from then on
+	// both the handler and the controller service the same pipe. That is one disturbance per packet, packets
+	// whole but placed two packets out, alternating - which is exactly what the returned audio does. One stale
+	// completion is enough, because arming re-enables the interrupt that delivers the next one.
+	if (returnActive && !rxDmaRunning) {
 		armReturnTransfer();
 	}
 	ingestReturnPacket(rxPackets[finished], received);
 }
 
 /// Points the driver at the next landing area and asks it to fill it.
+///
+/// Refuses while the controller owns the pipe. Arming is the driver's receive path, and that path ends by
+/// enabling the pipe's ready interrupt - so an arm after the handover quietly gives the pipe a second consumer.
+/// Guarded here as well as at the one call site that could reach it, because this is the function that does the
+/// damage and a future call site would have no way of knowing.
 void armReturnTransfer() {
+	if (rxDmaRunning) {
+		return;
+	}
 	if (!rxTransferInitialised) {
 		rxTransfer.complete = returnTransferComplete;
 		rxTransfer.p_setup = nullptr;
@@ -875,6 +891,16 @@ void drainReturnDma() {
 		w++;
 	}
 	rxWriteFrame = w;
+	if constexpr (kReturnDma) {
+		// The interrupt the handover switched off, held off. Not a watchdog: it clears one mask bit that this
+		// code owns and nothing resubmits, so it cannot do what the 2026-08-22 watchdog did. It is here because
+		// the guards above cover the paths that are known, and the cost of an unknown one is a build that is
+		// unusable the moment a host opens a MIDI port.
+		if ((usb_hstd_get_usb_ip_adr(USB_CFG_USE_USBIP)->BRDYENB & (1u << USB_CFG_PAUDIO_ISO_OUT)) != 0u) {
+			hw_usb_clear_brdyenb(USB_NULL, USB_CFG_PAUDIO_ISO_OUT);
+			statRxBrdyReasserts++;
+		}
+	}
 	// Advanced past everything the controller produced, including anything dropped for want of ring room, so the
 	// two never drift apart.
 	rxDmaReadOffset = writeOffset;
