@@ -651,6 +651,13 @@ bool startReturnDma() {
 	}
 	usb_regadr_t reg = usb_hstd_get_usb_ip_adr(USB_CFG_USE_USBIP);
 
+	// The whole handover under one mask. The driver steers the shared port from its own interrupts a thousand
+	// times a second, so every step below - parking that port, moving the pipe to D1FIFO, stopping and restarting
+	// the pipe - is a step that can land in the middle of one of them. Unmasked, this worked on one flash and
+	// killed USB MIDI on the next from an edit that only inlined some arithmetic, which is a race announcing
+	// itself. Every wait inside is bounded and short, so the mask is measured in microseconds.
+	DISABLE_ALL_INTERRUPTS();
+
 	// The completion interrupt is what this replaces. Left enabled it would keep ending transfers and NAKing the
 	// pipe underneath the controller, which is the exact behaviour being removed.
 	hw_usb_clear_brdyenb(USB_NULL, USB_CFG_PAUDIO_ISO_OUT);
@@ -663,7 +670,7 @@ bool startReturnDma() {
 		volatile uint16_t* const pipectr = &reg->PIPE1CTR + (USB_CFG_PAUDIO_ISO_OUT - 1);
 		uint32_t settle = 0;
 		while ((*pipectr & USB_PBUSY) != 0u) {
-			if (++settle > 10000u) {
+			if (++settle > 2000u) {
 				break;
 			}
 		}
@@ -685,7 +692,7 @@ bool startReturnDma() {
 		hw_usb_rmw_fifosel(USB_NULL, USB_CUSE, 0u, USB_CURPIPE);
 		uint32_t parked = 0;
 		while ((reg->CFIFOSEL & USB_CURPIPE) != 0u) {
-			if (++parked > 10000u) {
+			if (++parked > 2000u) {
 				break;
 			}
 		}
@@ -699,7 +706,8 @@ bool startReturnDma() {
 		seen = reg->D1FIFOSEL;
 		// Bounded, because a port that never takes must not hang the audio task - the machine has been frozen once
 		// already by a loop whose length came from elsewhere.
-		if (++guard > 10000u) {
+		if (++guard > 2000u) {
+			ENABLE_ALL_INTERRUPTS();
 			return false;
 		}
 	} while ((seen & USB_CURPIPE) != USB_CFG_PAUDIO_ISO_OUT);
@@ -716,6 +724,7 @@ bool startReturnDma() {
 	// Last, so the pipe only starts accepting once there is something waiting to collect from it.
 	hw_usb_set_pid_nonzero_pipe_rohan(USB_CFG_PAUDIO_ISO_OUT, USB_PID_BUF);
 	rxDmaRunning = true;
+	ENABLE_ALL_INTERRUPTS();
 	return true;
 }
 
