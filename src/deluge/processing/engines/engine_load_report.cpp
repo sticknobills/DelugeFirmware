@@ -86,6 +86,25 @@ uint32_t statGapMax = 0;
 bool gapCounterEnabled = false;
 uint32_t lastEntryCycles = 0;
 
+/// The gap the current entry measured, handed from recordRoutineEntry() to recordBufferBacklog() so the two
+/// halves of the starve reading come from the same entry. Not a statistic; cleared by neither.
+uint32_t entryGapSamples = 0;
+bool entryGapValid = false;
+
+/// The engine's masked backlog reading, at its worst in the interval. Honest only while no lap has happened,
+/// which is exactly when it is not needed - reported so the two readings can be compared rather than trusted.
+uint32_t statBacklogMax = 0;
+
+/// Entries where the clock says the codec consumed a whole buffer or more since the last one. The mask cannot
+/// express this, so these are the starves no reading derived from the backlog can see.
+uint32_t statLaps = 0;
+uint32_t statLapSamples = 0;
+
+/// Widest disagreement between the clock and the mask on an entry the clock says did not lap. With no lap the
+/// two measure the same quantity, so this is the instrument's own error - if it grows to the size of the effect,
+/// nothing else on this line about starving is worth reading.
+uint32_t statBacklogDisagreeMax = 0;
+
 void clearInterval() {
 	statRenders = 0;
 	statDspSum = 0;
@@ -113,6 +132,10 @@ void clearInterval() {
 	statStarves = 0;
 	statStarveSamples = 0;
 	statGapMax = 0;
+	statBacklogMax = 0;
+	statLaps = 0;
+	statLapSamples = 0;
+	statBacklogDisagreeMax = 0;
 }
 
 } // namespace
@@ -160,6 +183,7 @@ void EngineLoadReport::recordRoutineEntry() {
 		Debug::init();
 		gapCounterEnabled = true;
 		lastEntryCycles = Debug::readCycleCounter();
+		entryGapValid = false;
 		return;
 	}
 	const uint32_t nowCycles = Debug::readCycleCounter();
@@ -167,6 +191,8 @@ void EngineLoadReport::recordRoutineEntry() {
 	// unsigned subtraction is right across the wrap and detecting it is not needed.
 	const uint32_t gapSamples = (uint32_t)(nowCycles - lastEntryCycles) / kCyclesPerSample;
 	lastEntryCycles = nowCycles;
+	entryGapSamples = gapSamples;
+	entryGapValid = true;
 	if (gapSamples > statGapMax) {
 		statGapMax = gapSamples;
 	}
@@ -175,6 +201,30 @@ void EngineLoadReport::recordRoutineEntry() {
 	}
 	statStarves++;
 	statStarveSamples += gapSamples - kStarveGapSamples;
+}
+
+void EngineLoadReport::recordBufferBacklog(uint32_t backlogSamples) {
+	if (backlogSamples > statBacklogMax) {
+		statBacklogMax = backlogSamples;
+	}
+	if (!entryGapValid) {
+		return;
+	}
+	entryGapValid = false;
+	if (entryGapSamples >= kStarveGapSamples) {
+		// The codec consumed at least a whole buffer while the engine was away, so at least this much of what it
+		// played was never written this time round. The masked backlog reads small here, which is the blindness
+		// this counter exists to route around; the excess is a floor on the damage, not an estimate of it.
+		statLaps++;
+		statLapSamples += entryGapSamples - kStarveGapSamples;
+		return;
+	}
+	// No lap, so the clock and the mask are measuring the same distance and any difference is instrument error.
+	const uint32_t disagreement =
+	    (entryGapSamples > backlogSamples) ? (entryGapSamples - backlogSamples) : (backlogSamples - entryGapSamples);
+	if (disagreement > statBacklogDisagreeMax) {
+		statBacklogDisagreeMax = disagreement;
+	}
 }
 
 void EngineLoadReport::recordCull(uint32_t forceReleased, uint32_t terminated, uint32_t killed) {
@@ -221,9 +271,11 @@ void EngineLoadReport::routine() {
 		return;
 	}
 
-	// Worst case: "EL fw:" (6) plus a 24-character version, plus fifteen numeric fields of a five-character tag
-	// and ten digits each (225), plus the terminator - 256. 384 leaves room for two more fields.
-	char line[384];
+	// Worst case, counted at the time of writing rather than asserted: "EL fw:" (6) plus a 24-character version,
+	// plus 22 numeric fields at a five-character tag and ten digits each (330), plus the terminator - 361. 512
+	// leaves room for ten more fields. Re-count when adding one: an earlier version of this line outgrew its
+	// array and smashed the stack once a second.
+	char line[512];
 	char* p = line;
 	auto emit = [&p](const char* t) {
 		while (*t != '\0') {
@@ -295,6 +347,22 @@ void EngineLoadReport::routine() {
 	emitDec(statStarveSamples);
 	emit(" gmx");
 	emitDec(statGapMax);
+	// The engine's own backlog reading at its worst. Masked to the buffer, so it climbs towards 128 as the
+	// machine gets tight and then falls back to a small number once it laps - it reads best exactly when things
+	// are worst, which is why the three fields after it exist.
+	emit(" bmx");
+	emitDec(statBacklogMax);
+	// Laps: entries where the clock says a whole buffer or more was consumed while the engine was away. These
+	// are the starves the masked reading cannot represent at all.
+	emit(" lap");
+	emitDec(statLaps);
+	emit(" laps");
+	emitDec(statLapSamples);
+	// The instrument's own error, and the reason to believe or discard the three fields above: with no lap the
+	// clock and the mask measure the same distance, so this should stay small. If it approaches the buffer, the
+	// clock constant is wrong and nothing here about starving means anything.
+	emit(" mxd");
+	emitDec(statBacklogDisagreeMax);
 	*p = '\0';
 	Debug::sysexDebugPrint(*Debug::midiDebugCable, line, true);
 

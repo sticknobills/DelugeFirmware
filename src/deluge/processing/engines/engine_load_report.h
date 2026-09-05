@@ -72,6 +72,20 @@ public:
 	/// needs nothing but this header.
 	static void recordRoutineEntry();
 
+	/// DIAGNOSTIC. Takes the engine's own reading of how far the codec has run ahead of the write head, before
+	/// the doubling and rounding that turn it into a render window.
+	///
+	/// **The reading is masked to the buffer size and so cannot express the failure it is wanted for.** A codec
+	/// exactly one buffer behind reads as zero - identical to a codec that is fully fed - so the engine cannot
+	/// tell "nothing to do" from "lapped", and every counter derived from it inherits that blindness. This is
+	/// why the ear hears clicking while the starve counter reads zero.
+	///
+	/// The clock read in recordRoutineEntry() is not masked, so it is the honest half. Pairing them gives a lap
+	/// count the mask cannot corrupt, and their disagreement is the cross-check on both: with no lap the two
+	/// measure the same quantity, so a wide disagreement condemns the instrument rather than the engine. Call
+	/// after the backlog is computed and before any early return.
+	static void recordBufferBacklog(uint32_t backlogSamples);
+
 	/// Emits the report and clears the interval's counters. Scheduler entry point.
 	static void routine();
 };

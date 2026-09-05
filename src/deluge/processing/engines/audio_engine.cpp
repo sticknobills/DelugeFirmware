@@ -680,6 +680,10 @@ bool calledFromScheduler = false;
 	size_t numSamples = ((uint32_t)(saddr - i2sTXBufferPos) >> (2 + NUM_MONO_OUTPUT_CHANNELS_MAGNITUDE))
 	                    & (SSI_TX_BUFFER_NUM_SAMPLES - 1);
 
+	// Above the early return, because a lapped codec reads as a backlog of zero and takes that return - so an
+	// instrument placed below it would be blind to exactly the case it is built for.
+	deluge::processing::engines::EngineLoadReport::recordBufferBacklog((uint32_t)numSamples);
+
 	if (numSamples <= (10 * numRoutines)) {
 		if (!numRoutines && calledFromScheduler) {
 			ignoreForStats();
