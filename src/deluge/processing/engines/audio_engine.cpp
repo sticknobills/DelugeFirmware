@@ -444,10 +444,20 @@ void cullVoices(size_t numSamples, int32_t numAudio, int32_t numVoice) {
 	static int32_t last_num_samples_over = 0;
 	int32_t num_samples_over_limit = numSamples - max_num_samples;
 
+	// DIAGNOSTIC. Which branch this call takes, recorded at the point each condition is evaluated rather than
+	// inferred afterwards from the cull totals - several branches feed those totals and a change of branch is
+	// invisible in them.
+	const bool diagGated = (numAudio + numVoice > MIN_VOICES);
+	bool diagHard = false;
+	bool diagSoftEligible = false;
+	bool diagSoftCulled = false;
+	bool diagBelowMin = false;
+
 	if (numAudio + numVoice > MIN_VOICES) {
 
 		// If it's real dire, do a proper immediate cull
 		if (num_samples_over_limit >= 32) {
+			diagHard = true;
 
 			int32_t num_to_cull = (num_samples_over_limit >> 4);
 			// leave at least 7 - below this point culling won't save us
@@ -485,7 +495,9 @@ void cullVoices(size_t numSamples, int32_t numAudio, int32_t numVoice) {
 		// Or if it's just a little bit dire, do a soft cull with fade-out, but only cull for sure if numSamples
 		// is increasing
 		else if (num_samples_over_limit >= 0) {
+			diagSoftEligible = true;
 			if (last_num_samples_over > 0 && num_samples_over_limit >= last_num_samples_over) {
+				diagSoftCulled = true;
 				forceReleaseOneVoice(numSamples);
 				// DIAGNOSTIC
 				deluge::processing::engines::EngineLoadReport::recordCull(1, 0, 0);
@@ -499,6 +511,7 @@ void cullVoices(size_t numSamples, int32_t numAudio, int32_t numVoice) {
 	else {
 		// Cull anyway if things are bad
 		if (num_samples_over_limit >= 40) {
+			diagBelowMin = true;
 			D_PRINTLN("under min voices but culling anyway");
 			terminateOneVoice(numSamples);
 			// DIAGNOSTIC
@@ -507,6 +520,10 @@ void cullVoices(size_t numSamples, int32_t numAudio, int32_t numVoice) {
 		}
 	}
 	last_num_samples_over = num_samples_over_limit;
+
+	// DIAGNOSTIC
+	deluge::processing::engines::EngineLoadReport::recordCullDecision(diagGated, diagHard, diagSoftEligible,
+	                                                                  diagSoftCulled, diagBelowMin);
 
 	// blink LED to alert the user
 	if (culled && FlashStorage::highCPUUsageIndicator) {
@@ -573,7 +590,7 @@ inline void setDireness(size_t numSamples) { // Consider direness and culling - 
 
 	// DIAGNOSTIC. Reported at the end so the direness recorded is this render's, not the previous one's.
 	deluge::processing::engines::EngineLoadReport::recordRender(dspTime, dspTimeRaw, windowSamples, cpuDireness,
-	                                                            rendersPerCallX100);
+	                                                            rendersPerCallX100, (int32_t)numSamples);
 }
 
 void scheduleMidiGateOutISR(uint32_t saddrPosAtStart, int32_t unadjustedNumSamplesBeforeLappingPlayHead,
@@ -1491,8 +1508,12 @@ bool allowedToStartVoice() {
 	auto threshold = cpuDireness > 12 ? 1 : 4;
 	if (voices_started_this_render < threshold) {
 		voices_started_this_render += 1;
+		// DIAGNOSTIC
+		deluge::processing::engines::EngineLoadReport::recordVoiceStart(true);
 		return true;
 	}
+	// DIAGNOSTIC
+	deluge::processing::engines::EngineLoadReport::recordVoiceStart(false);
 	return false;
 }
 

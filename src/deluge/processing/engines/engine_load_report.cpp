@@ -46,6 +46,29 @@ uint32_t statForceReleased = 0;
 uint32_t statTerminated = 0;
 uint32_t statKilled = 0;
 
+/// Histogram of the figure the direness and culling tests are actually made against.
+///
+/// A mean cannot see this: the decision is a threshold crossing, so what matters is how much of the
+/// distribution sits past 50 (direness) and past 80 (the base cull limit), not where its centre is. Measured
+/// 2026-09-07: opening the USB stream lowers the mean by 4% while culling rises, which a mean and a peak
+/// together cannot explain.
+///
+/// Edges chosen from the constants the engine actually tests, not from round numbers: direnessThreshold is 50,
+/// numSamplesLimit is 80, and a hard cull needs 32 past that limit.
+constexpr int32_t kEffBucketEdges[] = {40, 50, 60, 70, 80, 96, 112};
+constexpr size_t kNumEffBuckets = (sizeof(kEffBucketEdges) / sizeof(kEffBucketEdges[0])) + 1;
+uint32_t statEffBuckets[kNumEffBuckets] = {};
+uint64_t statEffSum = 0;
+int32_t statEffMax = 0;
+
+uint32_t statCullGated = 0;
+uint32_t statCullHard = 0;
+uint32_t statCullSoftEligible = 0;
+uint32_t statCullSoftCulled = 0;
+uint32_t statCullBelowMin = 0;
+uint32_t statVoiceStartAllowed = 0;
+uint32_t statVoiceStartDenied = 0;
+
 /// The codec runs at a fixed rate whatever the engine does, so a gap between renders converts to samples the
 /// codec consumed. 400 MHz against 44.1 kHz.
 constexpr uint32_t kCyclesPerSample = 9070u;
@@ -75,6 +98,18 @@ void clearInterval() {
 	statForceReleased = 0;
 	statTerminated = 0;
 	statKilled = 0;
+	for (uint32_t& bucket : statEffBuckets) {
+		bucket = 0;
+	}
+	statEffSum = 0;
+	statEffMax = 0;
+	statCullGated = 0;
+	statCullHard = 0;
+	statCullSoftEligible = 0;
+	statCullSoftCulled = 0;
+	statCullBelowMin = 0;
+	statVoiceStartAllowed = 0;
+	statVoiceStartDenied = 0;
 	statStarves = 0;
 	statStarveSamples = 0;
 	statGapMax = 0;
@@ -83,8 +118,25 @@ void clearInterval() {
 } // namespace
 
 void EngineLoadReport::recordRender(int32_t dspTimeSamples, int32_t dspTimeRaw, size_t windowSamples, int32_t direness,
-                                    uint32_t rendersPerCallX100) {
+                                    uint32_t rendersPerCallX100, int32_t effectiveSamples) {
 	statRenders++;
+	if (effectiveSamples < 0) {
+		effectiveSamples = 0;
+	}
+	statEffSum += (uint32_t)effectiveSamples;
+	if (effectiveSamples > statEffMax) {
+		statEffMax = effectiveSamples;
+	}
+	{
+		size_t bucket = kNumEffBuckets - 1;
+		for (size_t i = 0; i < kNumEffBuckets - 1; i++) {
+			if (effectiveSamples < kEffBucketEdges[i]) {
+				bucket = i;
+				break;
+			}
+		}
+		statEffBuckets[bucket]++;
+	}
 	statDspRawSum += (uint32_t)(dspTimeRaw < 0 ? 0 : dspTimeRaw);
 	statRpcSum += rendersPerCallX100;
 	if (dspTimeSamples < 0) {
@@ -129,6 +181,24 @@ void EngineLoadReport::recordCull(uint32_t forceReleased, uint32_t terminated, u
 	statForceReleased += forceReleased;
 	statTerminated += terminated;
 	statKilled += killed;
+}
+
+void EngineLoadReport::recordCullDecision(bool gated, bool hardCull, bool softEligible, bool softCulled,
+                                          bool belowMinCull) {
+	statCullGated += gated ? 1u : 0u;
+	statCullHard += hardCull ? 1u : 0u;
+	statCullSoftEligible += softEligible ? 1u : 0u;
+	statCullSoftCulled += softCulled ? 1u : 0u;
+	statCullBelowMin += belowMinCull ? 1u : 0u;
+}
+
+void EngineLoadReport::recordVoiceStart(bool allowed) {
+	if (allowed) {
+		statVoiceStartAllowed++;
+	}
+	else {
+		statVoiceStartDenied++;
+	}
 }
 
 void EngineLoadReport::routine() {
@@ -225,6 +295,48 @@ void EngineLoadReport::routine() {
 	emitDec(statStarveSamples);
 	emit(" gmx");
 	emitDec(statGapMax);
+	*p = '\0';
+	Debug::sysexDebugPrint(*Debug::midiDebugCable, line, true);
+
+	// Second line rather than more fields on the first, so every capture taken before 2026-09-07 stays
+	// comparable field-for-field with one taken after it, and neither line goes near the 1024-byte SysEx buffer
+	// that silently truncates.
+	//
+	// Worst case: "EH " (3) plus seventeen fields, each a leading space, a tag of at most 3 characters and ten
+	// digits (17 x 14 = 238), plus the terminator - 242 into 384. Counted here rather than asserted; a comment
+	// claiming a buffer is big enough is what let the previous one reach 243 of 256.
+	p = line;
+	emit("EH");
+	// The figure the direness and culling tests are actually made against, which dsp and dspr are not.
+	emit(" eff");
+	emitDec((renders != 0u) ? (uint32_t)(statEffSum / renders) : 0u);
+	emit(" emx");
+	emitDec((uint32_t)statEffMax);
+	// Its distribution, in the buckets the engine's own thresholds fall in: b0 under 40, then 40, 50, 60, 70,
+	// 80, 96, and b7 at 112 and over. Direness starts at b2, the base cull limit at b5, a hard cull at b7.
+	for (size_t i = 0; i < kNumEffBuckets; i++) {
+		emit(" b");
+		emitDec((uint32_t)i);
+		emit(":");
+		emitDec(statEffBuckets[i]);
+	}
+	// Which way cullVoices() went, so a change of branch is visible rather than only a change of total.
+	emit(" cgt");
+	emitDec(statCullGated);
+	emit(" chd");
+	emitDec(statCullHard);
+	emit(" cse");
+	emitDec(statCullSoftEligible);
+	emit(" csc");
+	emitDec(statCullSoftCulled);
+	emit(" cbm");
+	emitDec(statCullBelowMin);
+	// Voices the song asked for and the engine refused to start. Under maximum direness the limit is one per
+	// render, and a refused voice is indistinguishable from a voice that was never played in any other counter.
+	emit(" vsy");
+	emitDec(statVoiceStartAllowed);
+	emit(" vsn");
+	emitDec(statVoiceStartDenied);
 	*p = '\0';
 	Debug::sysexDebugPrint(*Debug::midiDebugCable, line, true);
 

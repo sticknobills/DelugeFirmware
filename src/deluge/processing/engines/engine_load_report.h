@@ -34,13 +34,31 @@ class EngineLoadReport {
 public:
 	/// Takes one render's cost, at the point the engine has already worked it out for setDireness().
 	///
-	/// `dspTimeSamples` is the scheduler's running average for the audio task expressed in samples, which is
-	/// the figure culling is decided against; `windowSamples` is how many samples that render was asked for.
-	/// `dspTimeSamples` is the corrected figure direness is actually decided from; `dspTimeRaw` is the scheduler's
-	/// own per-call average before that correction, and `rendersPerCallX100` is what separates them. All three are
-	/// reported so the correction can be checked rather than trusted.
+	/// `windowSamples` is how many samples that render was asked for. `dspTimeSamples` is the corrected figure
+	/// direness would be decided from; `dspTimeRaw` is the scheduler's own per-call average before that
+	/// correction, and `rendersPerCallX100` is what separates them. All three are reported so the correction can
+	/// be checked rather than trusted.
+	///
+	/// `effectiveSamples` is the number the direness and culling tests are **actually** made against - the same
+	/// figure after the second render of a call has its predecessor's window subtracted. It is not equal to
+	/// either of the other two on every render, and until 2026-09-07 it was reported nowhere, so every published
+	/// mean described a number no decision was taken on.
 	static void recordRender(int32_t dspTimeSamples, int32_t dspTimeRaw, size_t windowSamples, int32_t direness,
-	                         uint32_t rendersPerCallX100);
+	                         uint32_t rendersPerCallX100, int32_t effectiveSamples);
+
+	/// DIAGNOSTIC. Takes which way cullVoices() went on one render, so the decision is recorded and not only its
+	/// input.
+	///
+	/// Reported as counts per interval on the EH line. `gated` is whether the voice-count gate let the main path
+	/// run at all; the rest are mutually exclusive outcomes within whichever path ran. A build can then be
+	/// compared on which branch moved rather than on a total that several branches feed.
+	static void recordCullDecision(bool gated, bool hardCull, bool softEligible, bool softCulled, bool belowMinCull);
+
+	/// DIAGNOSTIC. Takes one allowedToStartVoice() answer.
+	///
+	/// Under maximum direness the engine admits one voice per render, so a voice the song asked for can be
+	/// refused rather than culled - which no existing counter distinguishes from a voice that never played.
+	static void recordVoiceStart(bool allowed);
 
 	/// Takes voices the engine gave up on because it ran out of time, by the route it used.
 	static void recordCull(uint32_t forceReleased, uint32_t terminated, uint32_t killed);
