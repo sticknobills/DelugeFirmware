@@ -665,6 +665,24 @@ bool startReturnDma() {
 		}
 	}
 
+	// The driver's own receive setup assigns this pipe to the shared CPU port (usb_cstd_chg_curpipe from
+	// usb_pstd_receive_start), and a pipe may not be selected by two ports at once. Leaving it there while
+	// pointing D1FIFO at the same pipe is an illegal state, and what it costs is not the audio - it is every
+	// later use of the shared port, which is USB MIDI. That is exactly what happened: audio ran, the return went
+	// clean, and the Deluge stopped answering on its debug channel entirely.
+	{
+		volatile uint16_t* const cfifosel = &reg->CFIFOSEL;
+		if ((*cfifosel & USB_CURPIPE) == USB_CFG_PAUDIO_ISO_OUT) {
+			*cfifosel = (uint16_t)(*cfifosel & ~USB_CURPIPE);
+			uint32_t parked = 0;
+			while ((*cfifosel & USB_CURPIPE) != 0u) {
+				if (++parked > 10000u) {
+					break;
+				}
+			}
+		}
+	}
+
 	const uint16_t want = (uint16_t)(USB_CFG_PAUDIO_ISO_OUT | USB_MBW_32);
 	uint16_t seen;
 	uint32_t guard = 0;
