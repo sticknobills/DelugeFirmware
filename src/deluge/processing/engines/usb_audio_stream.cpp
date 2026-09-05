@@ -764,7 +764,15 @@ void drainReturnDma() {
 			dst[c] = src[c];
 		}
 		if constexpr (kDiagnostics) {
-			trackReturnPeak(src, 1);
+			// Inline, not a call per frame. The interrupt path measured a whole packet in one call and this measured
+			// one frame in one, so the same instrument became 44x the calls at 44,100 a second - and the dense song
+			// went from holding 12-13 voices to 9, which is the engine shedding work it could no longer afford.
+			for (uint32_t c = 0; c < kRxChannels; c++) {
+				const int32_t v = src[c] < 0 ? -(int32_t)src[c] : (int32_t)src[c];
+				if (v > rxPeak[c]) {
+					rxPeak[c] = v;
+				}
+			}
 		}
 		offset += kRxFrameBytes;
 		if (offset >= kRxDmaBytes) {
