@@ -115,6 +115,22 @@ constexpr bool kMixOnChannels78 = true;
 /// the axis under test, and channel 6 carries the ring's own content beside it for the other half of the split.
 constexpr bool kReturnTrace = true;
 
+/// DIAGNOSTIC. Puts the USB peripheral's own registers on channel 7, as a repeating word stream.
+///
+/// The one instrument this fault has never had. The ring-mod kills USB MIDI in the same instant it starts, so
+/// every counter and every debug line dies with it and anything read afterwards is worthless - which is why four
+/// sessions have theorised from source instead of measuring. The audio channels demonstrably survive: the return
+/// keeps arriving, wrongly ordered but arriving, right through the fault. So the registers go out that way.
+///
+/// Registers rather than counters, because the question is what the *hardware* state becomes at the moment the
+/// host claims the MIDI interface. Source says what should happen; registers say what did, which is how the
+/// transmit stall was found in August.
+///
+/// Takes channel 7 from the mix pair. That costs the round-trip latency reading, which is not what this build is
+/// for.
+constexpr bool kRegisterTrace = true;
+
+static_assert(!kRegisterTrace || kDiagnostics, "The register trace is an instrument and needs them compiled in");
 static_assert(!kAudioStamps || kDiagnostics, "The stamps are part of the instruments and need them compiled in");
 static_assert(!kReturnTrace || !kAudioStamps, "The return trace and the producer stamps want the same channels");
 static_assert(!kReturnTrace || kDiagnostics, "The return trace is an instrument and needs them compiled in");
@@ -260,6 +276,71 @@ constexpr uint32_t kReturnTraceMask = 0x0FFFu;
 constexpr int16_t kReturnTraceIdle = -kReturnTraceScale;
 int16_t rxTraceIndex[kStemWindowSamples];
 int16_t rxTraceValue[kStemWindowSamples];
+
+/// DIAGNOSTIC, kRegisterTrace. The peripheral registers that decide where a return packet lands, sampled
+/// together and shipped out over audio.
+///
+/// Sampled as a set under one interrupt mask, so the eight values describe one instant rather than eight. A port
+/// selector read a microsecond after a pipe control register is a different machine, and this fault is a race.
+constexpr uint32_t kRegTraceWords = 8;
+uint16_t regTrace[kRegTraceWords] = {};
+uint32_t regTraceSeq = 0;
+
+/// One byte per audio sample, shifted up six bits.
+///
+/// The capture path dithers every sample by +/-1, which already cost this project a build when a counter was sent
+/// unscaled and every step read as the next value. Six bits of headroom makes a byte recoverable by rounding to
+/// the nearest 64, and leaves the sync word - the only negative value in the stream - impossible to forge.
+constexpr int16_t kRegTraceSync = -32768;
+constexpr int16_t kRegTraceShift = 6;
+
+/// Sequence, then the eight registers, each as two bytes. Nineteen words at one word a sample repeats about 2300
+/// times a second, so the onset of a fault is located to well under a millisecond.
+constexpr uint32_t kRegTraceFrameWords = 1 + 2 + kRegTraceWords * 2;
+uint32_t regTraceCursor = 0;
+
+/// Reads the eight registers that would have to change for a packet to land in the wrong place.
+///
+/// Through PIPESEL for the two behind it, saved and restored, for the reason the other two readers here do it:
+/// the driver steers that selector from its own interrupts a thousand times a second, and leaving it moved
+/// corrupts the driver's next write rather than this read.
+/// Defined with the DMA constants further down, because that is where the channel number is documented; declared
+/// here because the register sampler is the first thing that needs it.
+uint16_t readRxDmaStatus();
+
+void sampleRegisters() {
+	usb_regadr_t reg = usb_hstd_get_usb_ip_adr(USB_CFG_USE_USBIP);
+	volatile uint16_t* const isoOutCtr = &reg->PIPE1CTR + (USB_CFG_PAUDIO_ISO_OUT - 1);
+	volatile uint16_t* const isoInCtr = &reg->PIPE1CTR + (USB_CFG_PAUDIO_ISO_IN - 1);
+	DISABLE_ALL_INTERRUPTS();
+	const uint16_t savedSel = reg->PIPESEL;
+	reg->PIPESEL = USB_CFG_PAUDIO_ISO_OUT;
+	const uint16_t cfg = reg->PIPECFG;
+	reg->PIPESEL = savedSel;
+	regTrace[0] = reg->CFIFOSEL;     // which pipe the shared CPU port holds - the port the handover has to park
+	regTrace[1] = reg->D0FIFOSEL;    // the transmit half's port
+	regTrace[2] = reg->D1FIFOSEL;    // the return's port: CURPIPE, DCLRM and DREQE all live here
+	regTrace[3] = *isoOutCtr;        // the return pipe: PID, PBUSY, and the buffer-plane bits
+	regTrace[4] = *isoInCtr;         // the transmit pipe, as a control that should never move
+	regTrace[5] = cfg;               // the return pipe's configuration, DBLB included
+	regTrace[6] = reg->BRDYENB;      // whether anything has re-enabled the completion interrupt we cleared
+	regTrace[7] = readRxDmaStatus(); // is the controller still running
+	regTraceSeq++;
+	ENABLE_ALL_INTERRUPTS();
+}
+
+/// The next word of the repeating frame, as a sample.
+int16_t nextRegTraceWord() {
+	const uint32_t at = regTraceCursor;
+	regTraceCursor = (at + 1u) % kRegTraceFrameWords;
+	if (at == 0u) {
+		return kRegTraceSync;
+	}
+	const uint32_t field = at - 1u;
+	const uint32_t value =
+	    (field < 2u) ? (regTraceSeq >> (field * 8u)) : regTrace[(field - 2u) / 2u] >> (((field - 2u) & 1u) * 8u);
+	return (int16_t)((value & 0xFFu) << kRegTraceShift);
+}
 
 /// Which channels have been written this window, so the first clip to name a channel assigns and any after it add.
 ///
@@ -570,6 +651,10 @@ const uint32_t rxDmaLinkDescriptor[] __attribute__((aligned(CACHE_LINE_SIZE))) =
     (uint32_t)rxDmaLinkDescriptor                                           // Next link: this one again
 };
 
+uint16_t readRxDmaStatus() {
+	return (uint16_t)(DMACn(kRxDmaChannel).CHSTAT_n & 0xFFFFu);
+}
+
 bool rxDmaRunning = false;
 uint32_t rxDmaReadOffset = 0; ///< how far the drain has got through the buffer above, in bytes
 uint32_t statRxDmaLaps = 0;   ///< times the controller overtook the drain - audio genuinely lost
@@ -825,6 +910,12 @@ void serviceReturn() {
 	}
 
 	returnActive = true;
+
+	if constexpr (kRegisterTrace) {
+		// Once per service pass rather than per sample: the registers cannot change without the driver or the
+		// host doing something, and the emitted stream simply repeats the last set until it does.
+		sampleRegisters();
+	}
 
 	if constexpr (kReturnDma) {
 		// The first arm is the driver's, because it is what configures the pipe - PIPECFG, the buffer allocation
@@ -3593,11 +3684,18 @@ void USBAudioStream::feedMix(const StereoSample* mix, uint32_t numSamples, uint3
 				frame[5] = 0;
 			}
 		}
+		if constexpr (kRegisterTrace) {
+			// Channel 7, after the stems and the return trace so this wins. One word a sample, so the stream is
+			// continuous and a decoder can find the frame boundary anywhere in a recording.
+			frame[kChannels - 2] = nextRegTraceWord();
+		}
 		if constexpr (kMixOnChannels78) {
 			// After the stem walk above, so these two win: the channels carry the mix rather than a stem. The
 			// same width reduction the mix pair uses, so a level read here is directly comparable with one read
 			// off a stem - which is the whole point of measuring a round trip this way.
-			frame[kChannels - 2] = (int16_t)(mix[i].l >> 16);
+			if constexpr (!kRegisterTrace) {
+				frame[kChannels - 2] = (int16_t)(mix[i].l >> 16);
+			}
 			frame[kChannels - 1] = (int16_t)(mix[i].r >> 16);
 		}
 		if constexpr (kAudioStamps) {
