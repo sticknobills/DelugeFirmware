@@ -1924,55 +1924,74 @@ void PlaybackHandler::inputTick(bool fromTriggerClock, uint32_t time) {
 
 		D_PRINTLN("time since last:  %d", timeLastInputTickTook);
 
-		uint32_t internalTicksPer;
-		uint32_t inputTicksPer;
-		getInternalTicksToInputTicksRatio(&inputTicksPer, &internalTicksPer);
+		// A clock message that arrives less than a quarter of an interval after the previous one is not a tempo,
+		// it is a delivery artefact. A quarter is four times the tempo being followed, appearing in a single
+		// tick, which no host does deliberately - and the filters below read it as exactly that and throw away a
+		// good estimate to chase it.
+		//
+		// Measured 2026-09-06 (afternoon): changing which ports Ableton syncs on makes it burst clock, two
+		// messages landing at the same instant. That gap of zero also divides by zero at
+		// veryCurrentTimePerInternalTickInverse below.
+		//
+		// The tick still counts - the host sent it and the position must not drift - it just does not move the
+		// tempo estimate. Real tempo changes are unaffected: a doubling is half an interval, twice this bound,
+		// and the 1% and 5% branches below exist to follow them.
+		const bool intervalIsPlausible =
+		    (timePerInputTickMovingAverage == 0) || (timeLastInputTickTook >= (timePerInputTickMovingAverage >> 2));
 
-		uint32_t thisTimePerInternalTick = timeLastInputTickTook * inputTicksPer / internalTicksPer;
+		if (intervalIsPlausible) {
 
-		veryCurrentTimePerInternalTickInverse = 2147483647 / ((thisTimePerInternalTick * 3) >> 1);
+			uint32_t internalTicksPer;
+			uint32_t inputTicksPer;
+			getInternalTicksToInputTicksRatio(&inputTicksPer, &internalTicksPer);
 
-		// Lowpass
-		int32_t distanceToGo = thisTimePerInternalTick - lowpassedTimePerInternalTick;
-		lowpassedTimePerInternalTick += (distanceToGo + (1 << 1)) >> 2;
+			uint32_t thisTimePerInternalTick = timeLastInputTickTook * inputTicksPer / internalTicksPer;
 
-		// Slowpass
-		distanceToGo =
-		    thisTimePerInternalTick
-		    - (slowpassedTimePerInternalTick >> slowpassedTimePerInternalTickSlowness); // Ok this looks weird...
-		slowpassedTimePerInternalTick += distanceToGo;
+			veryCurrentTimePerInternalTickInverse = 2147483647 / ((thisTimePerInternalTick * 3) >> 1);
 
-		// Sticky
-		// Or, if new value is just 10% different than lowpassed value, we'll change, too
+			// Lowpass
+			int32_t distanceToGo = thisTimePerInternalTick - lowpassedTimePerInternalTick;
+			lowpassedTimePerInternalTick += (distanceToGo + (1 << 1)) >> 2;
 
-		// 0.1% = 1074815565
-		// 0.2% = 1075889307
-		// 0.5% = 1079110533
-		// 1% = 1084479242
-		// 2% = 1095216660
-		// 5% = 1127428915
-		if ((lowpassedTimePerInternalTick >> 2) > multiply_32x32_rshift32(1127428915, stickyTimePerInternalTick)
-		    || (stickyTimePerInternalTick >> 2) > multiply_32x32_rshift32(1127428915, lowpassedTimePerInternalTick)) {
-			// D_PRINTLN("5% tempo jump");
-			// D_PRINTLN(lowpassedTimePerInternalTick);
-			// DIAGNOSTIC
-			deluge::processing::engines::EngineLoadReport::recordTempoFilterJump(true);
-			slowpassedTimePerInternalTick = lowpassedTimePerInternalTick << slowpassedTimePerInternalTickSlowness;
-			stickyTimePerInternalTick = lowpassedTimePerInternalTick;
+			// Slowpass
+			distanceToGo =
+			    thisTimePerInternalTick
+			    - (slowpassedTimePerInternalTick >> slowpassedTimePerInternalTickSlowness); // Ok this looks weird...
+			slowpassedTimePerInternalTick += distanceToGo;
 
-			stickyCurrentTimePerInternalTickInverse = 2147483647 / ((stickyTimePerInternalTick * 3) >> 1);
-		}
-		else if ((slowpassedTimePerInternalTick >> (slowpassedTimePerInternalTickSlowness + 2))
-		             > multiply_32x32_rshift32(1084479242, stickyTimePerInternalTick)
-		         || (stickyTimePerInternalTick >> 2) > multiply_32x32_rshift32(
-		                1084479242, slowpassedTimePerInternalTick >> slowpassedTimePerInternalTickSlowness)) {
-			// D_PRINTLN("1% tempo jump");
-			// DIAGNOSTIC
-			deluge::processing::engines::EngineLoadReport::recordTempoFilterJump(false);
-			stickyTimePerInternalTick = lowpassedTimePerInternalTick =
-			    slowpassedTimePerInternalTick >> slowpassedTimePerInternalTickSlowness;
+			// Sticky
+			// Or, if new value is just 10% different than lowpassed value, we'll change, too
 
-			stickyCurrentTimePerInternalTickInverse = 2147483647 / ((stickyTimePerInternalTick * 3) >> 1);
+			// 0.1% = 1074815565
+			// 0.2% = 1075889307
+			// 0.5% = 1079110533
+			// 1% = 1084479242
+			// 2% = 1095216660
+			// 5% = 1127428915
+			if ((lowpassedTimePerInternalTick >> 2) > multiply_32x32_rshift32(1127428915, stickyTimePerInternalTick)
+			    || (stickyTimePerInternalTick >> 2)
+			           > multiply_32x32_rshift32(1127428915, lowpassedTimePerInternalTick)) {
+				// D_PRINTLN("5% tempo jump");
+				// D_PRINTLN(lowpassedTimePerInternalTick);
+				// DIAGNOSTIC
+				deluge::processing::engines::EngineLoadReport::recordTempoFilterJump(true);
+				slowpassedTimePerInternalTick = lowpassedTimePerInternalTick << slowpassedTimePerInternalTickSlowness;
+				stickyTimePerInternalTick = lowpassedTimePerInternalTick;
+
+				stickyCurrentTimePerInternalTickInverse = 2147483647 / ((stickyTimePerInternalTick * 3) >> 1);
+			}
+			else if ((slowpassedTimePerInternalTick >> (slowpassedTimePerInternalTickSlowness + 2))
+			             > multiply_32x32_rshift32(1084479242, stickyTimePerInternalTick)
+			         || (stickyTimePerInternalTick >> 2) > multiply_32x32_rshift32(
+			                1084479242, slowpassedTimePerInternalTick >> slowpassedTimePerInternalTickSlowness)) {
+				// D_PRINTLN("1% tempo jump");
+				// DIAGNOSTIC
+				deluge::processing::engines::EngineLoadReport::recordTempoFilterJump(false);
+				stickyTimePerInternalTick = lowpassedTimePerInternalTick =
+				    slowpassedTimePerInternalTick >> slowpassedTimePerInternalTickSlowness;
+
+				stickyCurrentTimePerInternalTickInverse = 2147483647 / ((stickyTimePerInternalTick * 3) >> 1);
+			}
 		}
 	}
 

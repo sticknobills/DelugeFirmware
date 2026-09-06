@@ -521,7 +521,10 @@ static void usb_pstd_get_descriptor1(void)
             /*---- String descriptor ----*/
             case USB_DT_STRING:
 
-                if (idx < 7)
+                /* Eight entries in the MIDI string table (r_usb_pmidi_descriptor.c), and this bound must match
+                 * it. It was 7 against a table of 5, so indices 5 and 6 read past the end of the array - never
+                 * hit, because nothing referenced them until the jacks were named. */
+                if (idx < 8)
                 {
                     p_table = g_usb_pstd_driver.p_stringtbl[idx];
                     len     = (uint16_t)(*(uint8_t*)((uint32_t)p_table + (uint32_t)0));

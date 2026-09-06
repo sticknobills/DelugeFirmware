@@ -233,7 +233,7 @@ uint8_t g_midi_configuration[TOTAL_CONFIG_LENGTH + (TOTAL_CONFIG_LENGTH % 2)] = 
     MIDI_IN_JACK, // bDescriptorSubtype - MIDI_IN_JACK
     0x01,         // bJackType - EMBEDDED
     0x01,         // bJackID - 1
-    0x00,         // iJack (unused)
+    0x05,         // iJack - "MIDI"
 
     // MIDI_OUT 1
     0x09,          // bLength
@@ -244,7 +244,7 @@ uint8_t g_midi_configuration[TOTAL_CONFIG_LENGTH + (TOTAL_CONFIG_LENGTH % 2)] = 
     0x01,          // bNrInputPins (I can't find an explanation for what this means)
     0x01,          // BaSourceID (ditto here but I think it is asking which midi in jack is associated?)
     0x01,          // BaSourcePin (ditto)
-    0x00,          // iJack (unused)
+    0x05,          // iJack - "MIDI"
 
     // MIDI_IN 2
     0x06,         // bLength
@@ -252,7 +252,7 @@ uint8_t g_midi_configuration[TOTAL_CONFIG_LENGTH + (TOTAL_CONFIG_LENGTH % 2)] = 
     0x02,         // bDescriptorSubtype - MIDI_IN_JACK
     0x01,         // bJackType - EMBEDDED
     0x03,         // bJackID
-    0x00,         // iJack (unused)
+    0x06,         // iJack - "MPE"
 
     // MIDI_OUT 2
     0x09,          // bLength
@@ -263,7 +263,7 @@ uint8_t g_midi_configuration[TOTAL_CONFIG_LENGTH + (TOTAL_CONFIG_LENGTH % 2)] = 
     0x01,          // bNrInputPins (I can't find an explanation for what this means)
     0x02,          // BaSourceID (ditto here but I think it is asking which midi in jack is associated?)
     0x01,          // BaSourcePin (ditto)
-    0x00,          // iJack (unused)
+    0x06,          // iJack - "MPE"
 
     // MIDI_IN 3
     0x06,         // bLength
@@ -271,7 +271,7 @@ uint8_t g_midi_configuration[TOTAL_CONFIG_LENGTH + (TOTAL_CONFIG_LENGTH % 2)] = 
     MIDI_IN_JACK, // bDescriptorSubtype - MIDI_IN_JACK
     0x01,         // bJackType - EMBEDDED
     0x05,         // bJackID
-    0x00,         // iJack (unused)
+    0x07,         // iJack - "SysEx"
 
     // MIDI_OUT 3
     0x09,          // bLength
@@ -282,7 +282,7 @@ uint8_t g_midi_configuration[TOTAL_CONFIG_LENGTH + (TOTAL_CONFIG_LENGTH % 2)] = 
     0x01,          // bNrInputPins (I can't find an explanation for what this means)
     0x05,          // BaSourceID (ditto here but I think it is asking which midi in jack is associated?)
     0x01,          // BaSourcePin (ditto)
-    0x00,          // iJack (unused)
+    0x07,          // iJack - "SysEx"
 
     /* MidiStreaming Endpoint Descriptors - USBMidi spec 6.2.1
      * These endpoints are shared across all jacks
@@ -634,7 +634,53 @@ uint8_t g_midi_string4[] = {
     0x00,
 };
 
-uint8_t* g_midi_string_table[] = {g_midi_string0, g_midi_string1, g_midi_string2, g_midi_string3, g_midi_string4};
+/* Jack names. A host has no way to ask what a port is for - USB MIDI numbers its jacks and says nothing about
+ * their purpose - so the only thing that tells a user which port does what is the name attached to the jack.
+ * Left unset here until 2026-09-06, which is why every host showed "Deluge Port 1/2/3" and offered clock on all
+ * three when only the first accepts it. */
+uint8_t g_midi_string5[] = {
+    10,            /*  0:bLength - 2 + 2 per character */
+    USB_DT_STRING, /*  1:bDescriptorType */
+    'M',
+    0x00, /*  2:bString */
+    'I',
+    0x00,
+    'D',
+    0x00,
+    'I',
+    0x00,
+};
+
+uint8_t g_midi_string6[] = {
+    8,             /*  0:bLength */
+    USB_DT_STRING, /*  1:bDescriptorType */
+    'M',
+    0x00, /*  2:bString */
+    'P',
+    0x00,
+    'E',
+    0x00,
+};
+
+uint8_t g_midi_string7[] = {
+    12,            /*  0:bLength */
+    USB_DT_STRING, /*  1:bDescriptorType */
+    'S',
+    0x00, /*  2:bString */
+    'y',
+    0x00,
+    's',
+    0x00,
+    'E',
+    0x00,
+    'x',
+    0x00,
+};
+
+/* Eight entries. usb_pstd_get_descriptor() bounds the index it will serve against this count and the two must
+ * move together - it read past the end of this array for indices 5 and 6 while it held five. */
+uint8_t* g_midi_string_table[] = {g_midi_string0, g_midi_string1, g_midi_string2, g_midi_string3,
+                                  g_midi_string4, g_midi_string5, g_midi_string6, g_midi_string7};
 
 /***********************************************************************************************************************
 Private global variables and functions
