@@ -602,12 +602,30 @@ void usb_pstd_receive_start(uint16_t pipe)
 
 // For nonzero pipe, and CUSE. And obvs just for MIDI, but also hubs.
 // And for both host and peripheral.
+volatile uint32_t usbMidiFifoWrongPipe  = 0;
+volatile uint16_t usbMidiFifoSelSeen    = 0;
+volatile uint16_t usbMidiFifoShadowSeen = 0;
+
 uint16_t usb_read_data_fast_rohan(uint16_t pipe)
 {
 
     /* Changes FIFO port by the pipe. */
     // buffer = usb_cstd_is_set_frdy(USB_NULL, pipe, USB_CUSE, USB_FALSE);
     uint16_t buffer = usb_cstd_is_set_frdy_rohan(pipe);
+
+    /* DIAGNOSTIC. Read after the port has supposedly been moved, so a disagreement here is the move that was
+     * skipped because the shadow already claimed it had happened. MIDI only: this function serves the host side
+     * too, and the fault under investigation is the peripheral's. */
+    if (pipe == USB_CFG_PMIDI_BULK_IN)
+    {
+        const uint16_t selNow = usb_hstd_get_usb_ip_adr(USB_CFG_USE_USBIP)->CFIFOSEL;
+        if ((selNow & USB_CURPIPE) != pipe)
+        {
+            usbMidiFifoWrongPipe++;
+            usbMidiFifoSelSeen    = selNow;
+            usbMidiFifoShadowSeen = fifoSels[USB_CUSE];
+        }
+    }
 
     if (USB_FIFOERROR == buffer)
         return USB_FIFOERROR;

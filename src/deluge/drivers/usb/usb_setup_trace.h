@@ -101,6 +101,18 @@ extern volatile uint32_t usbMidiRxStale;
 extern volatile uint32_t usbMidiRxPackets;
 /// Bytes in them. Zero here with a non-zero packet count is a host sending empty transfers.
 extern volatile uint32_t usbMidiRxBytes;
+
+/* DIAGNOSTIC. Whether the shared CPU FIFO port was actually pointed at the MIDI pipe when a MIDI packet was read
+ * out of it.
+ *
+ * The driver decides whether to move that port by comparing against a software shadow, and updates the shadow
+ * before the register. An interrupt landing between the two leaves the shadow claiming a position the register
+ * does not hold, after which a read is skipped the move it needed and takes its bytes from whichever pipe the
+ * port really holds. usbMidiFifoWrongPipe counts reads where the two disagreed; usbMidiFifoSelSeen and
+ * usbMidiFifoShadowSeen keep the values from the most recent disagreement. */
+extern volatile uint32_t usbMidiFifoWrongPipe;
+extern volatile uint16_t usbMidiFifoSelSeen;
+extern volatile uint16_t usbMidiFifoShadowSeen;
 /// Receives armed by the MIDI engine's poll, which happens once per packet consumed.
 extern volatile uint32_t usbMidiRxArms;
 

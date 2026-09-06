@@ -18,6 +18,7 @@
 #include "processing/engines/engine_load_report.h"
 #include "definitions.h"
 #include "definitions_cxx.hpp"
+#include "drivers/usb/usb_setup_trace.h"
 #include "io/debug/print.h"
 #include "io/midi/sysex.h"
 #include "processing/engines/audio_engine.h"
@@ -143,6 +144,11 @@ size_t statRejectStored = 0;
 uint32_t statInputTickCalls = 0;
 uint32_t statInputTickFromTrigger = 0;
 
+/// Reads where the shared CPU FIFO port was not where the driver believed it was. Latched off a free-running
+/// counter rather than added to, so this file does not have to reset a counter the vendored driver owns.
+uint32_t fifoWrongPipeAtIntervalStart = 0;
+uint32_t statFifoWrongPipe = 0;
+
 uint32_t statSwungTicks = 0;
 uint64_t statSwungLateSum = 0;
 int32_t statSwungLateMax = 0;
@@ -203,6 +209,8 @@ void clearInterval() {
 	statRejectStored = 0;
 	statInputTickCalls = 0;
 	statInputTickFromTrigger = 0;
+	statFifoWrongPipe = 0;
+	fifoWrongPipeAtIntervalStart = usbMidiFifoWrongPipe;
 }
 
 } // namespace
@@ -561,7 +569,7 @@ void EngineLoadReport::routine() {
 	//
 	// Worst case: "CK" (2) plus eighteen fields, each a leading space, a tag of at most 3 characters and ten
 	// digits (18 x 14 = 252), plus three refused events at 22 characters each (66), plus the terminator -
-	// 322 into the 512-byte array above. Counted rather than
+	// 322 plus three port fields at 20 characters (60) - 382 into the 512-byte array above. Counted rather than
 	// asserted; re-count when adding a field.
 	p = line;
 	emit("CK n");
@@ -613,6 +621,18 @@ void EngineLoadReport::routine() {
 	emitDec(statInputTickCalls);
 	emit(" tkt");
 	emitDec(statInputTickFromTrigger);
+	// Reads that took their bytes from whichever pipe the shared port really held, because the driver's shadow
+	// said no move was needed. The two values are that shadow and the register, from the most recent one.
+	emit(" fwp");
+	emitDec((uint32_t)(usbMidiFifoWrongPipe - fifoWrongPipeAtIntervalStart));
+	emit(" fsl");
+	for (int shift = 12; shift >= 0; shift -= 4) {
+		*p++ = "0123456789ABCDEF"[(usbMidiFifoSelSeen >> shift) & 0xF];
+	}
+	emit(" fsh");
+	for (int shift = 12; shift >= 0; shift -= 4) {
+		*p++ = "0123456789ABCDEF"[(usbMidiFifoShadowSeen >> shift) & 0xF];
+	}
 	// The refused events themselves: four bytes, then where they sat and how long their packet was. A clock
 	// message reads 0FF80000 at an offset that is a multiple of four.
 	for (size_t i = 0; i < statRejectStored; i++) {
