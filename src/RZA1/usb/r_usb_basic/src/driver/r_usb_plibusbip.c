@@ -602,6 +602,13 @@ void usb_pstd_receive_start(uint16_t pipe)
 
 // For nonzero pipe, and CUSE. And obvs just for MIDI, but also hubs.
 // And for both host and peripheral.
+volatile uint32_t usbMidiSkippedArm      = 0;
+volatile uint32_t usbMidiZeroEvents      = 0;
+volatile uint16_t usbMidiZeroDataCnt     = 0;
+volatile uint16_t usbMidiZeroWriteOffset = 0;
+volatile uint16_t usbMidiZeroDtln        = 0;
+volatile uint16_t usbMidiZeroLoopReads   = 0;
+
 volatile uint32_t usbMidiFifoWrongPipe  = 0;
 volatile uint16_t usbMidiFifoSelSeen    = 0;
 volatile uint16_t usbMidiFifoShadowSeen = 0;
@@ -625,6 +632,7 @@ uint16_t usb_read_data_fast_rohan(uint16_t pipe)
             usbMidiFifoSelSeen    = selNow;
             usbMidiFifoShadowSeen = fifoSels[USB_CUSE];
         }
+        usbMidiZeroDtln = (uint16_t)(buffer & USB_DTLN);
     }
 
     if (USB_FIFOERROR == buffer)
@@ -990,9 +998,15 @@ void usb_pstd_brdy_pipe_process_rohan_midi(uint16_t bitsts)
     // How many bytes the armed 64-byte transfer actually received.
     int32_t total = 64 - g_usb_data_cnt[pipe];
 
+    /* DIAGNOSTIC. The bookkeeping this length was worked out from, and where the copy actually landed. */
+    const uint16_t diagDataCnt  = (uint16_t)g_usb_data_cnt[pipe];
+    const uint16_t diagWriteOff = (uint16_t)(g_p_usb_data[pipe] - connectedUSBMIDIDevices[0][0].receiveData);
+    uint16_t diagLoopReads      = 0;
+
     // Handle edge case where a packet was arriving when we set the NAK back
     while (total + 64 <= (int32_t)sizeof(connectedUSBMIDIDevices[0][0].receiveData))
     {
+        diagLoopReads++;
         // pretend there's at least 64 more available. The code in read_data_fast notes that
         // reading in this case is still ok and this handles the edge case of a transmission finishing while the
         // copy is occuring. That's happening in DMA so a critical section wouldn't help
@@ -1012,6 +1026,18 @@ void usb_pstd_brdy_pipe_process_rohan_midi(uint16_t bitsts)
     /* Observational, before the count is handed on. */
     usbMidiRxPackets++;
     usbMidiRxBytes += (uint32_t)total;
+
+    /* DIAGNOSTIC. Latched only when the packet's first event is all zeros, which is the refused event the decode
+     * later reports - caught here, where the bookkeeping that produced it is still in scope. */
+    if (total >= 4 && connectedUSBMIDIDevices[0][0].receiveData[0] == 0
+        && connectedUSBMIDIDevices[0][0].receiveData[1] == 0 && connectedUSBMIDIDevices[0][0].receiveData[2] == 0
+        && connectedUSBMIDIDevices[0][0].receiveData[3] == 0)
+    {
+        usbMidiZeroEvents++;
+        usbMidiZeroDataCnt     = diagDataCnt;
+        usbMidiZeroWriteOffset = diagWriteOff;
+        usbMidiZeroLoopReads   = diagLoopReads;
+    }
 
     connectedUSBMIDIDevices[0][0].numBytesReceived = total;
 

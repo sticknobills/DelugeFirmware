@@ -147,6 +147,8 @@ uint32_t statInputTickFromTrigger = 0;
 /// Reads where the shared CPU FIFO port was not where the driver believed it was. Latched off a free-running
 /// counter rather than added to, so this file does not have to reset a counter the vendored driver owns.
 uint32_t fifoWrongPipeAtIntervalStart = 0;
+uint32_t skippedArmAtIntervalStart = 0;
+uint32_t zeroEventsAtIntervalStart = 0;
 uint32_t statFifoWrongPipe = 0;
 
 uint32_t statSwungTicks = 0;
@@ -211,6 +213,8 @@ void clearInterval() {
 	statInputTickFromTrigger = 0;
 	statFifoWrongPipe = 0;
 	fifoWrongPipeAtIntervalStart = usbMidiFifoWrongPipe;
+	skippedArmAtIntervalStart = usbMidiSkippedArm;
+	zeroEventsAtIntervalStart = usbMidiZeroEvents;
 }
 
 } // namespace
@@ -569,7 +573,8 @@ void EngineLoadReport::routine() {
 	//
 	// Worst case: "CK" (2) plus eighteen fields, each a leading space, a tag of at most 3 characters and ten
 	// digits (18 x 14 = 252), plus three refused events at 22 characters each (66), plus the terminator -
-	// 322 plus three port fields at 20 characters (60) - 382 into the 512-byte array above. Counted rather than
+	// 322 plus three port fields at 20 characters (60) and six receive-path fields at 16 (96) - 478 into
+	// the 512-byte array above. Counted rather than
 	// asserted; re-count when adding a field.
 	p = line;
 	emit("CK n");
@@ -625,6 +630,20 @@ void EngineLoadReport::routine() {
 	// said no move was needed. The two values are that shadow and the register, from the most recent one.
 	emit(" fwp");
 	emitDec((uint32_t)(usbMidiFifoWrongPipe - fifoWrongPipeAtIntervalStart));
+	// Re-arms the receive path skipped, and packets whose first event was already all zeros when the interrupt
+	// handed them over - with the bookkeeping that packet's length was derived from.
+	emit(" arm-");
+	emitDec((uint32_t)(usbMidiSkippedArm - skippedArmAtIntervalStart));
+	emit(" z");
+	emitDec((uint32_t)(usbMidiZeroEvents - zeroEventsAtIntervalStart));
+	emit(" zcnt");
+	emitDec(usbMidiZeroDataCnt);
+	emit(" zoff");
+	emitDec(usbMidiZeroWriteOffset);
+	emit(" zdtln");
+	emitDec(usbMidiZeroDtln);
+	emit(" zlp");
+	emitDec(usbMidiZeroLoopReads);
 	emit(" fsl");
 	for (int shift = 12; shift >= 0; shift -= 4) {
 		*p++ = "0123456789ABCDEF"[(usbMidiFifoSelSeen >> shift) & 0xF];

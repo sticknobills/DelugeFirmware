@@ -110,6 +110,21 @@ extern volatile uint32_t usbMidiRxBytes;
  * does not hold, after which a read is skipped the move it needed and takes its bytes from whichever pipe the
  * port really holds. usbMidiFifoWrongPipe counts reads where the two disagreed; usbMidiFifoSelSeen and
  * usbMidiFifoShadowSeen keep the values from the most recent disagreement. */
+/* DIAGNOSTIC. The receive path's own bookkeeping at the moment a MIDI packet is handed to the decode.
+ *
+ * The refused events are four zero bytes at the start of a packet the handler says is four bytes long, and the
+ * shared port is provably where the driver believes it is - so what is in question is now the count and the
+ * pointer the handler works the length out from. It reports a length by subtracting a remaining-bytes counter
+ * from the full transfer size, and both that counter and the write pointer survive from the previous packet
+ * whenever the re-arm was skipped. usbMidiSkippedArm counts those skips; the rest latch the bookkeeping from the
+ * last packet whose first event was all zeros. */
+extern volatile uint32_t usbMidiSkippedArm;
+extern volatile uint32_t usbMidiZeroEvents;
+extern volatile uint16_t usbMidiZeroDataCnt;
+extern volatile uint16_t usbMidiZeroWriteOffset;
+extern volatile uint16_t usbMidiZeroDtln;
+extern volatile uint16_t usbMidiZeroLoopReads;
+
 extern volatile uint32_t usbMidiFifoWrongPipe;
 extern volatile uint16_t usbMidiFifoSelSeen;
 extern volatile uint16_t usbMidiFifoShadowSeen;

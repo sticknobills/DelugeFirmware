@@ -928,6 +928,9 @@ void MidiEngine::checkIncomingUsbMidi() {
 				}
 
 				if (usbLockNow) {
+					// DIAGNOSTIC. A skipped re-arm leaves the driver's remaining-bytes counter and write pointer
+					// holding the previous packet's values, which is what the next packet's length is derived from.
+					usbMidiSkippedArm = usbMidiSkippedArm + 1u;
 					continue;
 				}
 
