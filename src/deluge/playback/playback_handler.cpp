@@ -1746,6 +1746,8 @@ void PlaybackHandler::stopMessageReceived() {
 }
 
 void PlaybackHandler::clockMessageReceived(uint32_t time) {
+	// DIAGNOSTIC. Before the two conditions below, which are settings rather than delivery.
+	deluge::processing::engines::EngineLoadReport::recordClockMessage();
 	if (ignoringMidiClockInput || !midiInClockEnabled) {
 		return;
 	}
@@ -1831,6 +1833,8 @@ void PlaybackHandler::scheduleSwungTickFromExternalClock() {
 }
 
 void PlaybackHandler::inputTick(bool fromTriggerClock, uint32_t time) {
+	// DIAGNOSTIC. Above the skip below, so the count is entries rather than entries that got somewhere.
+	deluge::processing::engines::EngineLoadReport::recordInputTickCall(fromTriggerClock);
 
 	if (numInputTicksToSkip > 0) {
 		numInputTicksToSkip--;

@@ -32,6 +32,7 @@
 #include "model/song/song.h"
 #include "playback/mode/playback_mode.h"
 #include "processing/engines/audio_engine.h"
+#include "processing/engines/engine_load_report.h"
 #include "storage/smsysex.h"
 #include "timers_interrupts/timers_interrupts.h"
 #include "version.h"
@@ -886,6 +887,10 @@ void MidiEngine::checkIncomingUsbMidi() {
 					// Receive all the stuff from this device
 					for (; readPos < stopAt; readPos += 4) {
 
+						// DIAGNOSTIC. Every four-byte event the pipe handed over, before any of the decode's
+						// own exits below can discard it.
+						deluge::processing::engines::EngineLoadReport::recordMidiDecode(1, 0, 0);
+
 						uint8_t statusType = readPos[0] & 0x0F;
 						uint8_t cable = (readPos[0] & 0xF0) >> 4;
 						uint8_t channel = readPos[1] & 0x0F;
@@ -896,6 +901,8 @@ void MidiEngine::checkIncomingUsbMidi() {
 								statusType = 0x0F;
 							}
 							else { // Invalid, or sysex, or something
+								// DIAGNOSTIC
+								deluge::processing::engines::EngineLoadReport::recordMidiDecode(0, 0, 1);
 								checkIncomingUsbSysex(readPos, ip, d, cable);
 								continue;
 							}
@@ -903,6 +910,8 @@ void MidiEngine::checkIncomingUsbMidi() {
 						if (data1 & 0x80 || data2 & 0x80) {
 							// This shouldn't be possible for non-sysex messages, indicates an error in
 							// transmission so just ignore the rest of the frame
+							// DIAGNOSTIC
+							deluge::processing::engines::EngineLoadReport::recordMidiDecode(0, 1, 0);
 							break;
 						}
 						// select appropriate device based on the cable number

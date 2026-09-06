@@ -124,6 +124,16 @@ bool haveLastInterval = false;
 uint32_t statTempoJump5 = 0;
 uint32_t statTempoJump1 = 0;
 
+/// Where arriving MIDI is lost between the pipe and the tempo maths. A clean stream aborts nothing and routes
+/// nothing to SysEx, so both are zero unless the receive buffer is holding something other than what the host
+/// sent.
+uint32_t statMidiEvents = 0;
+uint32_t statMidiHighBitAborts = 0;
+uint32_t statMidiToSysex = 0;
+uint32_t statClockMessages = 0;
+uint32_t statInputTickCalls = 0;
+uint32_t statInputTickFromTrigger = 0;
+
 uint32_t statSwungTicks = 0;
 uint64_t statSwungLateSum = 0;
 int32_t statSwungLateMax = 0;
@@ -177,6 +187,12 @@ void clearInterval() {
 	statSwungTicks = 0;
 	statSwungLateSum = 0;
 	statSwungLateMax = 0;
+	statMidiEvents = 0;
+	statMidiHighBitAborts = 0;
+	statMidiToSysex = 0;
+	statClockMessages = 0;
+	statInputTickCalls = 0;
+	statInputTickFromTrigger = 0;
 }
 
 } // namespace
@@ -330,6 +346,23 @@ void EngineLoadReport::recordTempoFilterJump(bool fivePercent) {
 	}
 	else {
 		statTempoJump1++;
+	}
+}
+
+void EngineLoadReport::recordMidiDecode(uint32_t events, uint32_t highBitAborts, uint32_t toSysex) {
+	statMidiEvents += events;
+	statMidiHighBitAborts += highBitAborts;
+	statMidiToSysex += toSysex;
+}
+
+void EngineLoadReport::recordClockMessage() {
+	statClockMessages++;
+}
+
+void EngineLoadReport::recordInputTickCall(bool fromTriggerClock) {
+	statInputTickCalls++;
+	if (fromTriggerClock) {
+		statInputTickFromTrigger++;
 	}
 }
 
@@ -504,8 +537,9 @@ void EngineLoadReport::routine() {
 	// DIAGNOSTIC. External clock following, on its own line: it describes the sequencer rather than the audio
 	// engine, and the two lines above are compared field-for-field against captures that predate it.
 	//
-	// Worst case: "CK" (2) plus twelve fields, each a leading space, a tag of at most 3 characters and ten
-	// digits (12 x 14 = 168), plus the terminator - 171 into 256. Counted rather than asserted.
+	// Worst case: "CK" (2) plus eighteen fields, each a leading space, a tag of at most 3 characters and ten
+	// digits (18 x 14 = 252), plus the terminator - 255 into the 512-byte array above. Counted rather than
+	// asserted; re-count when adding a field.
 	p = line;
 	emit("CK n");
 	emitDec(statClocks);
@@ -540,6 +574,22 @@ void EngineLoadReport::routine() {
 	emitDec((statSwungTicks != 0u) ? (uint32_t)(statSwungLateSum / statSwungTicks) : 0u);
 	emit(" swx");
 	emitDec((uint32_t)statSwungLateMax);
+	// The decode, between the pipe that delivered the message and the tempo maths that did not see it. hib and
+	// sx are the two ways an event is discarded there, and both are zero on an uncorrupted stream.
+	emit(" ev");
+	emitDec(statMidiEvents);
+	emit(" hib");
+	emitDec(statMidiHighBitAborts);
+	emit(" sx");
+	emitDec(statMidiToSysex);
+	emit(" clk");
+	emitDec(statClockMessages);
+	// Every entry into the input tick and how many came from the trigger-clock socket, so the filter resets
+	// above are divided by the right number rather than by the MIDI count.
+	emit(" tk");
+	emitDec(statInputTickCalls);
+	emit(" tkt");
+	emitDec(statInputTickFromTrigger);
 	*p = '\0';
 	Debug::sysexDebugPrint(*Debug::midiDebugCable, line, true);
 

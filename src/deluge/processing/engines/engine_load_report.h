@@ -105,6 +105,23 @@ public:
 	/// does.
 	static void recordTempoFilterJump(bool fivePercent);
 
+	/// DIAGNOSTIC. Takes one outcome from decoding a packet of arriving USB MIDI.
+	///
+	/// The pipe delivers every clock message a DAW sends and the tempo maths sees fewer of them, so the loss is
+	/// between the two and the decode is the only thing in between. Each call records which of the decode's own
+	/// exits an event took: a whole event parsed, a frame abandoned because a data byte had its high bit set,
+	/// or an event handed to the SysEx path because its status nibble was not a channel message. The last two
+	/// are the shapes a corrupted receive buffer takes; both read as zero on a clean stream.
+	static void recordMidiDecode(uint32_t events, uint32_t highBitAborts, uint32_t toSysex);
+
+	/// DIAGNOSTIC. Takes one clock message reaching the tempo maths, and one call into the input tick by source.
+	///
+	/// Counted separately from the arrival statistics because those exclude the trigger-clock input, and the
+	/// filter resets do not - a difference between the two counts is otherwise attributed to whichever source
+	/// the reader had in mind.
+	static void recordClockMessage();
+	static void recordInputTickCall(bool fromTriggerClock);
+
 	/// DIAGNOSTIC. Takes how late a scheduled swung tick was actioned, in samples.
 	///
 	/// Ticks are actioned at render-window boundaries, so some lateness is structural and a window wide. What
