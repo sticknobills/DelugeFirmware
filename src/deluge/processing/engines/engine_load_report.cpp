@@ -100,6 +100,34 @@ uint32_t statBacklogMax = 0;
 uint32_t statLaps = 0;
 uint32_t statLapSamples = 0;
 
+/// External MIDI clock, as the tempo maths sees it.
+///
+/// The Deluge reads the incoming tempo off the spacing between clock messages, so evenness of arrival is the
+/// property that matters and message count says nothing about it. One clock is 919 samples at 120 BPM.
+uint32_t statClocks = 0;
+uint64_t statClockIntervalSum = 0;
+uint32_t statClockIntervalMin = 0xFFFFFFFFu;
+uint32_t statClockIntervalMax = 0;
+/// Change in spacing from one clock to the next. Needs no expected value, so it reads the same whatever the
+/// tempo is and does not have to be told what the DAW was set to.
+uint64_t statClockJitterSum = 0;
+uint32_t statClockJitterMax = 0;
+uint64_t statClockStaleSum = 0;
+uint32_t statClockStaleMax = 0;
+/// Carried across intervals rather than cleared: the spacing between the last clock of one interval and the
+/// first of the next is a real spacing, and dropping it would hide a stall that lands on the boundary.
+uint32_t lastClockArrival = 0;
+uint32_t lastClockInterval = 0;
+bool haveLastClock = false;
+bool haveLastInterval = false;
+
+uint32_t statTempoJump5 = 0;
+uint32_t statTempoJump1 = 0;
+
+uint32_t statSwungTicks = 0;
+uint64_t statSwungLateSum = 0;
+int32_t statSwungLateMax = 0;
+
 /// Widest disagreement between the clock and the mask on an entry the clock says did not lap. With no lap the
 /// two measure the same quantity, so this is the instrument's own error - if it grows to the size of the effect,
 /// nothing else on this line about starving is worth reading.
@@ -136,6 +164,19 @@ void clearInterval() {
 	statLaps = 0;
 	statLapSamples = 0;
 	statBacklogDisagreeMax = 0;
+	statClocks = 0;
+	statClockIntervalSum = 0;
+	statClockIntervalMin = 0xFFFFFFFFu;
+	statClockIntervalMax = 0;
+	statClockJitterSum = 0;
+	statClockJitterMax = 0;
+	statClockStaleSum = 0;
+	statClockStaleMax = 0;
+	statTempoJump5 = 0;
+	statTempoJump1 = 0;
+	statSwungTicks = 0;
+	statSwungLateSum = 0;
+	statSwungLateMax = 0;
 }
 
 } // namespace
@@ -248,6 +289,58 @@ void EngineLoadReport::recordVoiceStart(bool allowed) {
 	}
 	else {
 		statVoiceStartDenied++;
+	}
+}
+
+void EngineLoadReport::recordInputTick(uint32_t arrivalTime, uint32_t stalenessSamples) {
+	statClocks++;
+	statClockStaleSum += stalenessSamples;
+	if (stalenessSamples > statClockStaleMax) {
+		statClockStaleMax = stalenessSamples;
+	}
+	if (!haveLastClock) {
+		lastClockArrival = arrivalTime;
+		haveLastClock = true;
+		return;
+	}
+	const uint32_t interval = (uint32_t)(arrivalTime - lastClockArrival);
+	lastClockArrival = arrivalTime;
+	statClockIntervalSum += interval;
+	if (interval < statClockIntervalMin) {
+		statClockIntervalMin = interval;
+	}
+	if (interval > statClockIntervalMax) {
+		statClockIntervalMax = interval;
+	}
+	if (haveLastInterval) {
+		const uint32_t change =
+		    (interval > lastClockInterval) ? (interval - lastClockInterval) : (lastClockInterval - interval);
+		statClockJitterSum += change;
+		if (change > statClockJitterMax) {
+			statClockJitterMax = change;
+		}
+	}
+	lastClockInterval = interval;
+	haveLastInterval = true;
+}
+
+void EngineLoadReport::recordTempoFilterJump(bool fivePercent) {
+	if (fivePercent) {
+		statTempoJump5++;
+	}
+	else {
+		statTempoJump1++;
+	}
+}
+
+void EngineLoadReport::recordSwungTick(int32_t latenessSamples) {
+	statSwungTicks++;
+	if (latenessSamples < 0) {
+		latenessSamples = 0;
+	}
+	statSwungLateSum += (uint32_t)latenessSamples;
+	if (latenessSamples > statSwungLateMax) {
+		statSwungLateMax = latenessSamples;
 	}
 }
 
@@ -405,6 +498,48 @@ void EngineLoadReport::routine() {
 	emitDec(statVoiceStartAllowed);
 	emit(" vsn");
 	emitDec(statVoiceStartDenied);
+	*p = '\0';
+	Debug::sysexDebugPrint(*Debug::midiDebugCable, line, true);
+
+	// DIAGNOSTIC. External clock following, on its own line: it describes the sequencer rather than the audio
+	// engine, and the two lines above are compared field-for-field against captures that predate it.
+	//
+	// Worst case: "CK" (2) plus twelve fields, each a leading space, a tag of at most 3 characters and ten
+	// digits (12 x 14 = 168), plus the terminator - 171 into 256. Counted rather than asserted.
+	p = line;
+	emit("CK n");
+	emitDec(statClocks);
+	// Spacing between arriving clocks. One clock is 919 samples at 120 BPM, and the spread between imn and imx
+	// is the whole fault when a machine cannot hold an external tempo.
+	emit(" iv");
+	emitDec((statClocks > 1u) ? (uint32_t)(statClockIntervalSum / (statClocks - 1u)) : 0u);
+	emit(" imn");
+	emitDec((statClockIntervalMin == 0xFFFFFFFFu) ? 0u : statClockIntervalMin);
+	emit(" imx");
+	emitDec(statClockIntervalMax);
+	// How much the spacing moved from one clock to the next, which needs no expected tempo to be meaningful.
+	emit(" jav");
+	emitDec((statClocks > 2u) ? (uint32_t)(statClockJitterSum / (statClocks - 2u)) : 0u);
+	emit(" jmx");
+	emitDec(statClockJitterMax);
+	// How far back the arrival stamp was placed from the moment of processing. Wraps at one codec buffer, so a
+	// reading approaching 128 says the stamp itself can no longer be trusted.
+	emit(" lat");
+	emitDec((statClocks != 0u) ? (uint32_t)(statClockStaleSum / statClocks) : 0u);
+	emit(" lmx");
+	emitDec(statClockStaleMax);
+	// Resets of the tempo-following filter. These are what a listener hears as the tempo lurching.
+	emit(" j5");
+	emitDec(statTempoJump5);
+	emit(" j1");
+	emitDec(statTempoJump1);
+	// Scheduled sequencer ticks, and how late they were actioned. A render window's worth is structural.
+	emit(" sw");
+	emitDec(statSwungTicks);
+	emit(" swa");
+	emitDec((statSwungTicks != 0u) ? (uint32_t)(statSwungLateSum / statSwungTicks) : 0u);
+	emit(" swx");
+	emitDec((uint32_t)statSwungLateMax);
 	*p = '\0';
 	Debug::sysexDebugPrint(*Debug::midiDebugCable, line, true);
 

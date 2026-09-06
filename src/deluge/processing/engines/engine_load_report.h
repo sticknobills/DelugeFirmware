@@ -86,6 +86,32 @@ public:
 	/// after the backlog is computed and before any early return.
 	static void recordBufferBacklog(uint32_t backlogSamples);
 
+	/// DIAGNOSTIC. Takes one incoming MIDI clock message, at the point the engine has worked out when it
+	/// arrived.
+	///
+	/// The Deluge derives the external tempo from the spacing between these, so the spacing is the whole
+	/// question: a clock stream that arrives evenly and one that arrives in clumps produce the same message
+	/// count and completely different playback. `arrivalTime` is the stamp the tempo maths is actually done on;
+	/// `stalenessSamples` is how far back that stamp was placed from the moment of processing, which is the part
+	/// a busy machine can distort. Both in samples, so they compare directly against the 919 samples one clock
+	/// takes at 120 BPM.
+	static void recordInputTick(uint32_t arrivalTime, uint32_t stalenessSamples);
+
+	/// DIAGNOSTIC. Takes one reset of the tempo-following filter.
+	///
+	/// The filter holds a smoothed tempo and abandons it outright when a new reading differs by more than 1% or
+	/// 5%. Those resets are what a listener hears as the tempo lurching, and no existing counter records them -
+	/// a stream that trips them repeatedly is indistinguishable, in every other figure, from one that never
+	/// does.
+	static void recordTempoFilterJump(bool fivePercent);
+
+	/// DIAGNOSTIC. Takes how late a scheduled swung tick was actioned, in samples.
+	///
+	/// Ticks are actioned at render-window boundaries, so some lateness is structural and a window wide. What
+	/// this separates is that floor from a machine that is missing its tick deadlines outright. Call at the
+	/// dispatch site, before the tick is actioned, since actioning it clears the schedule.
+	static void recordSwungTick(int32_t latenessSamples);
+
 	/// Emits the report and clears the interval's counters. Scheduler entry point.
 	static void routine();
 };

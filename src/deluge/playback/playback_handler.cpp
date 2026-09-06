@@ -65,6 +65,7 @@
 #include "processing/audio_output.h"
 #include "processing/engines/audio_engine.h"
 #include "processing/engines/cv_engine.h"
+#include "processing/engines/engine_load_report.h"
 #include "processing/metronome/metronome.h"
 #include "processing/sound/sound_drum.h"
 #include "processing/sound/sound_instrument.h"
@@ -1866,6 +1867,12 @@ void PlaybackHandler::inputTick(bool fromTriggerClock, uint32_t time) {
 
 	uint32_t timeThisInputTick = AudioEngine::audioSampleTimer + timeTilInputTick;
 
+	// DIAGNOSTIC. Only the MIDI path: the trigger-clock input is timestamped in its own interrupt and has none
+	// of the delivery this measures, so mixing them would average two different quantities.
+	if (!fromTriggerClock) {
+		deluge::processing::engines::EngineLoadReport::recordInputTick(timeThisInputTick, timeTilInputTick);
+	}
+
 	// If we're doing tempo magnitude matching, do all that
 	if (tempoMagnitudeMatchingActiveNow) {
 		if (lastInputTickReceived == -1) {
@@ -1944,6 +1951,8 @@ void PlaybackHandler::inputTick(bool fromTriggerClock, uint32_t time) {
 		    || (stickyTimePerInternalTick >> 2) > multiply_32x32_rshift32(1127428915, lowpassedTimePerInternalTick)) {
 			// D_PRINTLN("5% tempo jump");
 			// D_PRINTLN(lowpassedTimePerInternalTick);
+			// DIAGNOSTIC
+			deluge::processing::engines::EngineLoadReport::recordTempoFilterJump(true);
 			slowpassedTimePerInternalTick = lowpassedTimePerInternalTick << slowpassedTimePerInternalTickSlowness;
 			stickyTimePerInternalTick = lowpassedTimePerInternalTick;
 
@@ -1954,6 +1963,8 @@ void PlaybackHandler::inputTick(bool fromTriggerClock, uint32_t time) {
 		         || (stickyTimePerInternalTick >> 2) > multiply_32x32_rshift32(
 		                1084479242, slowpassedTimePerInternalTick >> slowpassedTimePerInternalTickSlowness)) {
 			// D_PRINTLN("1% tempo jump");
+			// DIAGNOSTIC
+			deluge::processing::engines::EngineLoadReport::recordTempoFilterJump(false);
 			stickyTimePerInternalTick = lowpassedTimePerInternalTick =
 			    slowpassedTimePerInternalTick >> slowpassedTimePerInternalTickSlowness;
 

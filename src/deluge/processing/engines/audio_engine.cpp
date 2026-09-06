@@ -837,6 +837,10 @@ startAgain:
 				playbackHandler.actionTimerTick();
 			}
 			else if (nextTickType == TICK_TYPE_SWUNG) {
+				// DIAGNOSTIC. Read here rather than inside the action, which clears the schedule it is measured
+				// against.
+				deluge::processing::engines::EngineLoadReport::recordSwungTick(
+				    (int32_t)(audioSampleTimer - playbackHandler.scheduledSwungTickTime));
 				playbackHandler.actionSwungTick();
 				playbackHandler.scheduleSwungTick(); // If that swung tick action just did a song swap, this will have
 				                                     // already been called, but fortunately this doesn't break anything
