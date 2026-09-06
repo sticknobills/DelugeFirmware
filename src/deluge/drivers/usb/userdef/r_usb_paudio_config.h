@@ -108,7 +108,7 @@
 // local: a frame reserves ~1350 bytes for all timed traffic in both directions, the outgoing
 // endpoint declares 736, and six channels of return declare 540 - 1302 with per-packet overhead.
 // Eight channels would declare 720 and put the pair over.
-#define USB_CFG_PAUDIO_RX_CHANNELS (4u)
+#define USB_CFG_PAUDIO_RX_CHANNELS (1u)
 
 // The largest packet the return endpoint may carry, in audio frames.
 //
