@@ -29,6 +29,15 @@ enum class RecordingMode {
 
 constexpr int32_t kNumInputTicksForMovingAverage = 24;
 
+/// How many consecutive impossibly-short clock intervals it takes before the tempo maths believes them.
+///
+/// A host bursting clock - Ableton does it when its sync ports change, and the Deluge itself does it to place a
+/// "continue" precisely - delivers four or five bunched messages and then stops. A real tempo change never
+/// stops. Eight is comfortably past a burst and 170 ms at 120 BPM, which is what a genuine doubling costs to
+/// be followed. Measured 2026-09-06: believing the second one instead took a transition from zero filter
+/// resets to nine, because a burst is several short intervals rather than one.
+constexpr uint8_t kNumShortInputIntervalsToBelieve = 8;
+
 #define PLAYBACK_CLOCK_INTERNAL_ACTIVE 1
 #define PLAYBACK_CLOCK_EXTERNAL_ACTIVE 2
 #define PLAYBACK_SWITCHED_ON 4
@@ -132,11 +141,11 @@ public:
 	bool swungTickScheduled;
 	uint32_t scheduledSwungTickTime;
 
-	/// Whether the previous input tick's interval was too short to be a tempo.
+	/// How many input tick intervals in a row have been too short to be a tempo.
 	///
-	/// A burst of clock from a host lasts one tick and a real tempo change does not, so a short interval is
-	/// disbelieved once and believed if a second follows. See inputTick().
-	bool lastInputIntervalWasShort;
+	/// A host's clock burst is several short intervals in a row and then stops; a real tempo change never
+	/// stops. Counting them separates the two where testing the previous one alone does not. See inputTick().
+	uint8_t numShortInputIntervals;
 	// Now, swung ticks are only "actioned" in the following circumstances:
 	// - A note starts or ends
 	// - Automation event
