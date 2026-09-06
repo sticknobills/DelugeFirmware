@@ -743,10 +743,15 @@ bool returnReclaimAllowed = false;
 
 /// Keeps the flag the vendor handler reads in step with both of the things that decide it.
 void refreshReturnPipeGuard();
-/// Invalidate a D-cache range so the CPU reads what the controller wrote rather than a stale line.
-/// Clean-and-invalidates the partial lines at each end, which is safe here because nothing but the controller
-/// ever writes this buffer, so the CPU can hold no dirty line in it.
-extern "C" void v7_dma_inv_range(uint32_t start, uint32_t end);
+/// Invalidate a range in *every* cache between the CPU and memory, so a read sees what the controller wrote.
+///
+/// Not `v7_dma_inv_range`, which was the first attempt and was wrong: it invalidates only to the point of
+/// coherency, which on this part does not reach the outer cache. Measured 2026-09-06 (night): 45% of frames
+/// read back stale, while the peak level was identical in both arms - a stale line holds the previous piece of
+/// the same tone, so level could never have caught it, and the listener heard rhythmic distortion long before
+/// any counter admitted anything. This function already existed in the tree and does the whole job: inner
+/// flush, outer clean-invalidate, inner invalidate.
+extern "C" void invalidate_range_all_caches(uintptr_t start, uintptr_t end);
 
 /// DIAGNOSTIC A/B, flipped once per report so the two arms are interleaved rather than flashed apart.
 ///
@@ -1073,13 +1078,13 @@ void drainReturnDmaBody() {
 		const uint32_t from = rxDmaReadOffset;
 		const uint32_t to = rxDmaReadOffset + available;
 		if (to <= kRxDmaBytes) {
-			v7_dma_inv_range(base + from, base + to);
+			invalidate_range_all_caches(base + from, base + to);
 		}
 		else {
 			// The region wraps the end of the landing buffer, so it is two ranges rather than one.
 			statDrainWrapped++;
-			v7_dma_inv_range(base + from, base + kRxDmaBytes);
-			v7_dma_inv_range(base, base + (to - kRxDmaBytes));
+			invalidate_range_all_caches(base + from, base + kRxDmaBytes);
+			invalidate_range_all_caches(base, base + (to - kRxDmaBytes));
 		}
 		source = (const uint8_t*)base;
 	}
