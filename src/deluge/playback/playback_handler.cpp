@@ -116,6 +116,7 @@ PlaybackHandler::PlaybackHandler() {
 	timeLastMIDIStartOrContinueMessageSent = 0;
 	currentVisualCountForCountIn = 0;
 	skipAnalogClocks = 0;
+	lastInputIntervalWasShort = false;
 	skipMidiClocks = 0;
 }
 
@@ -1603,6 +1604,9 @@ void PlaybackHandler::setupPlaybackUsingExternalClock(bool switchingFromInternal
 	// and when hearing these, well, this looks like infinite tempo.
 
 	numInputTickTimesCounted = 0;
+	// Cleared with the rest of the input-tick state: the first interval of a new sync has nothing to be short
+	// against, and a flag left set from the previous one would let a single burst through.
+	lastInputIntervalWasShort = false;
 
 	stickyCurrentTimePerInternalTickInverse = veryCurrentTimePerInternalTickInverse =
 	    currentSong->divideByTimePerTimerTick; // Sets defaults
@@ -1924,20 +1928,33 @@ void PlaybackHandler::inputTick(bool fromTriggerClock, uint32_t time) {
 
 		D_PRINTLN("time since last:  %d", timeLastInputTickTook);
 
-		// A clock message that arrives less than a quarter of an interval after the previous one is not a tempo,
-		// it is a delivery artefact. A quarter is four times the tempo being followed, appearing in a single
-		// tick, which no host does deliberately - and the filters below read it as exactly that and throw away a
-		// good estimate to chase it.
+		// A clock message arriving in less than half the interval being followed is a delivery artefact, not a
+		// tempo. Measured 2026-09-06 (afternoon): changing which ports Ableton syncs on makes it burst clock,
+		// two messages landing at the same instant and several more bunched behind them. Fed to the filters
+		// below, that reads as the tempo suddenly doubling or worse, and a good estimate is thrown away to
+		// chase it. A gap of zero also divides by zero at veryCurrentTimePerInternalTickInverse.
 		//
-		// Measured 2026-09-06 (afternoon): changing which ports Ableton syncs on makes it burst clock, two
-		// messages landing at the same instant. That gap of zero also divides by zero at
-		// veryCurrentTimePerInternalTickInverse below.
+		// The same phenomenon is described a few hundred lines above, in setupPlaybackUsingExternalClock(): a
+		// host emitting several clocks at once for a finer start position, which that comment says "looks like
+		// infinite tempo". It is handled there for the start of playback and was unhandled everywhere else.
 		//
-		// The tick still counts - the host sent it and the position must not drift - it just does not move the
-		// tempo estimate. Real tempo changes are unaffected: a doubling is half an interval, twice this bound,
-		// and the 1% and 5% branches below exist to follow them.
-		const bool intervalIsPlausible =
-		    (timePerInputTickMovingAverage == 0) || (timeLastInputTickTook >= (timePerInputTickMovingAverage >> 2));
+		// Half an interval is exactly what a genuine doubling of tempo looks like, so the bound alone would
+		// refuse real tempo changes. What separates the two is persistence: a burst is over in one tick and a
+		// tempo change is not. So a short interval is disbelieved once and believed the moment a second one
+		// follows it, which costs a real tempo change one tick - 21 ms at 120 BPM - and costs a burst its
+		// entire effect.
+		//
+		// The tick itself always counts, whether or not it moves the estimate: the host sent it, and the
+		// position must not drift.
+		//
+		// Deliberately one-sided. An interval that is too *long* is left alone, because a dropped clock message
+		// produces exactly that - and a bound there would have silently hidden the pipe-buffer fault found the
+		// same afternoon rather than letting it be heard. Robustness that conceals a defect is worse than the
+		// lurch it prevents.
+		const bool intervalIsShort =
+		    (timePerInputTickMovingAverage != 0) && (timeLastInputTickTook < (timePerInputTickMovingAverage >> 1));
+		const bool intervalIsPlausible = !intervalIsShort || lastInputIntervalWasShort;
+		lastInputIntervalWasShort = intervalIsShort;
 
 		if (intervalIsPlausible) {
 

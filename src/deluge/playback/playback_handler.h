@@ -131,6 +131,12 @@ public:
 	// Swung ticks
 	bool swungTickScheduled;
 	uint32_t scheduledSwungTickTime;
+
+	/// Whether the previous input tick's interval was too short to be a tempo.
+	///
+	/// A burst of clock from a host lasts one tick and a real tempo change does not, so a short interval is
+	/// disbelieved once and believed if a second follows. See inputTick().
+	bool lastInputIntervalWasShort;
 	// Now, swung ticks are only "actioned" in the following circumstances:
 	// - A note starts or ends
 	// - Automation event
