@@ -743,6 +743,23 @@ bool returnReclaimAllowed = false;
 
 /// Keeps the flag the vendor handler reads in step with both of the things that decide it.
 void refreshReturnPipeGuard();
+/// Invalidate a D-cache range so the CPU reads what the controller wrote rather than a stale line.
+/// Clean-and-invalidates the partial lines at each end, which is safe here because nothing but the controller
+/// ever writes this buffer, so the CPU can hold no dirty line in it.
+extern "C" void v7_dma_inv_range(uint32_t start, uint32_t end);
+
+/// DIAGNOSTIC A/B, flipped once per report so the two arms are interleaved rather than flashed apart.
+///
+/// The drain reads the controller's landing buffer through the uncached mirror, which is a bus transaction per
+/// access. Measured 2026-09-06 (night): 155.8 cycles per channel per frame to move two bytes - about 78 cycles a
+/// byte, for something this machine should do in roughly one. If that read is the whole of the per-channel cost,
+/// invalidating the range and reading it cached collapses it and a wide return becomes affordable. If the number
+/// does not move, the cost is somewhere else entirely and every plan resting on a wide return needs rethinking.
+///
+/// Interleaved rather than built as two binaries because a difference of a few percent across two flashes is not
+/// a result in this domain - identical firmware has read 939 and 720 on consecutive nights.
+bool drainCached = false;
+
 uint32_t rxDmaReadOffset = 0;     ///< how far the drain has got through the buffer above, in bytes
 uint32_t statRxHandoverRedos = 0; ///< times the pipe was found disturbed and the handover was rebuilt
 
@@ -1036,7 +1053,25 @@ void drainReturnDmaBody() {
 		statRxDmaLaps++;
 	}
 
-	const uint8_t* const uncached = (const uint8_t*)(base + UNCACHED_MIRROR_OFFSET);
+	// The whole point of the experiment: the same copy, reading the same bytes, once through the uncached mirror
+	// and once out of the cache after invalidating what the controller has written.
+	const uint8_t* source;
+	if (drainCached) {
+		const uint32_t from = rxDmaReadOffset;
+		const uint32_t to = rxDmaReadOffset + available;
+		if (to <= kRxDmaBytes) {
+			v7_dma_inv_range(base + from, base + to);
+		}
+		else {
+			// The region wraps the end of the landing buffer, so it is two ranges rather than one.
+			v7_dma_inv_range(base + from, base + kRxDmaBytes);
+			v7_dma_inv_range(base, base + (to - kRxDmaBytes));
+		}
+		source = (const uint8_t*)base;
+	}
+	else {
+		source = (const uint8_t*)(base + UNCACHED_MIRROR_OFFSET);
+	}
 	uint32_t offset = rxDmaReadOffset;
 	uint32_t w = rxWriteFrame;
 	const uint32_t held = w - rxReadFrame;
@@ -1055,7 +1090,7 @@ void drainReturnDmaBody() {
 		// already cost a quarter of this machine's polyphony once, on 2026-09-05, by moving from per-packet to
 		// per-frame without anyone reviewing code that had not been edited.
 		if (frames > 0) {
-			const int16_t* const src = (const int16_t*)(uncached + offset);
+			const int16_t* const src = (const int16_t*)(source + offset);
 			for (uint32_t c = 0; c < kRxChannels; c++) {
 				const int32_t v = src[c] < 0 ? -(int32_t)src[c] : (int32_t)src[c];
 				if (v > rxPeak[c]) {
@@ -1066,7 +1101,7 @@ void drainReturnDmaBody() {
 	}
 
 	for (uint32_t f = 0; f < frames; f++) {
-		const int16_t* const src = (const int16_t*)(uncached + offset);
+		const int16_t* const src = (const int16_t*)(source + offset);
 		int16_t* const dst = &rxRing[(w & kRxRingMask) * kRxChannels];
 		for (uint32_t c = 0; c < kRxChannels; c++) {
 			dst[c] = src[c];
@@ -2793,6 +2828,9 @@ void reportStats() {
 		// settled. Read this, not the filename, before attributing any number below to a channel count.
 		emit(" ch");
 		emitDec(kRxChannels);
+		// Which arm this interval was: 0 read through the uncached mirror, 1 invalidated and read cached.
+		emit(" dc");
+		emitDec(drainCached ? 1u : 0u);
 		emit(" brdy");
 		emitDec(usbBrdyReturnCount);
 		emit(" arm");
@@ -3196,6 +3234,10 @@ void reportStats() {
 	for (uint32_t c = 0; c < kRxChannels; c++) {
 		rxPeak[c] = 0;
 	}
+
+	// Flip the drain's read path for the next interval. Interleaved, so song density and anything else that
+	// breathes over a minute lands on both arms equally instead of on whichever was flashed second.
+	drainCached = !drainCached;
 
 	// usbBempBitsSeen is deliberately not cleared: which pipes are live at all is the question, not how often.
 }
