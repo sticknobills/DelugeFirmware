@@ -72,9 +72,26 @@
 // buffers are allocated in 64-byte units, so 1024 is the smallest that fits.
 #define USB_CFG_PAUDIO_BUF_BYTES (1024u)
 
-// First 64-byte buffer block. MIDI holds blocks 8-15 and 72-79; double buffering doubles the
-// allocation, so 1024 bytes occupies 16-47, clear of both.
-#define USB_CFG_PAUDIO_BUF_START (16u)
+// First 64-byte buffer block.
+//
+// Block 24, not 16, since 2026-09-06, and the arithmetic is the whole reason. USB_BUF_SIZE(x) encodes
+// x/64 blocks and double buffering doubles what a pipe consumes, so:
+//
+//   MIDI in    512 bytes at block 8  -> 8 blocks doubled  -> blocks 8-23
+//   this pipe  1024 bytes at block 16 -> 16 blocks doubled -> blocks 16-47
+//
+// which put MIDI's second buffer plane wholly inside this pipe's first. MIDI only advances to its second
+// plane when a packet arrives before the previous one has been read, which is why an occasional message was
+// destroyed rather than every other one: a DAW's clock at 120 BPM lost three to six messages a second, the
+// Deluge read the resulting double-length gaps as the tempo halving, and following an external clock while a
+// host captured audio was unusable. Measured 2026-09-06: three to six packets a second arriving as four zero
+// bytes, zero with the stream closed.
+//
+// The overlap was written down here as an apparent one and steered clear of rather than resolved. It was
+// real. Nothing had ever measured MIDI arriving while audio streamed.
+//
+// 24 gives this pipe blocks 24-55, clear of MIDI at 8-23 and 72-87, with the return moved to 56-63 below.
+#define USB_CFG_PAUDIO_BUF_START (24u)
 
 /* ---- The return, host to device ---- */
 
@@ -93,13 +110,16 @@
 // Rounded up to the 64-byte unit pipe buffers are allocated in.
 #define USB_CFG_PAUDIO_RX_BUF_BYTES (256u)
 
-// Blocks 48-55 once double-buffered. Re-derived at the moment of use rather than taken from a note:
-// the live allocation is MIDI at 8 and 72 (512 bytes each) and the outgoing audio pipe at 16 (1024
-// bytes), so 48-71 is unclaimed under every reading of how double buffering consumes blocks. That
-// caveat is deliberate - the existing map has an apparent overlap between MIDI's IN pipe and the
-// outgoing audio pipe if double buffering doubles the block count, and it has run for weeks without
-// trouble. Unresolved, recorded, and steered well clear of rather than relied upon.
-#define USB_CFG_PAUDIO_RX_BUF_START (48u)
+// Blocks 56-63 once double-buffered: 256 bytes is 4 blocks, doubled is 8.
+//
+// Moved up from 48 with the outgoing pipe's move above, which now reaches block 55. The full map, all four
+// pipes with double buffering counted rather than assumed:
+//
+//   MIDI in    8-23    audio out  24-55    return  56-63    MIDI out  72-87
+//
+// 64-71 is spare. Anything added here counts its own doubling and checks it against this list - the one
+// place this was left as "apparent" cost a day's work and shipped a fault.
+#define USB_CFG_PAUDIO_RX_BUF_START (56u)
 
 // Called from the peripheral interrupt handler's frame branch, 1000 times a second, to write the
 // next audio packet off the host's own clock. Declared here because that handler already includes
