@@ -760,6 +760,19 @@ extern "C" void v7_dma_inv_range(uint32_t start, uint32_t end);
 /// a result in this domain - identical firmware has read 939 and 720 on consecutive nights.
 bool drainCached = false;
 
+/// DIAGNOSTIC. Whether the cached read ever returns something different from the truth.
+///
+/// The measurement that says the copy is 85% of this direction's cost is worthless if the cheap read is cheap
+/// because it is wrong. So a sample of frames is read *both* ways and compared: the uncached mirror cannot be
+/// stale, so any disagreement is the invalidate failing. Checked on the first and last frame of each drain, which
+/// is where a partial cache line at either end of the invalidated range would show.
+///
+/// The wrap is counted separately because it is the case the invalidate splits into two ranges, and a range
+/// boundary is exactly where this kind of fix goes wrong.
+uint32_t statCacheChecked = 0;  ///< frames read both ways and compared
+uint32_t statCacheMismatch = 0; ///< of those, frames where the cached read disagreed
+uint32_t statDrainWrapped = 0;  ///< drains whose region crossed the end of the landing buffer
+
 uint32_t rxDmaReadOffset = 0;     ///< how far the drain has got through the buffer above, in bytes
 uint32_t statRxHandoverRedos = 0; ///< times the pipe was found disturbed and the handover was rebuilt
 
@@ -1064,6 +1077,7 @@ void drainReturnDmaBody() {
 		}
 		else {
 			// The region wraps the end of the landing buffer, so it is two ranges rather than one.
+			statDrainWrapped++;
 			v7_dma_inv_range(base + from, base + kRxDmaBytes);
 			v7_dma_inv_range(base, base + (to - kRxDmaBytes));
 		}
@@ -1103,6 +1117,20 @@ void drainReturnDmaBody() {
 	for (uint32_t f = 0; f < frames; f++) {
 		const int16_t* const src = (const int16_t*)(source + offset);
 		int16_t* const dst = &rxRing[(w & kRxRingMask) * kRxChannels];
+		if constexpr (kDiagnostics) {
+			// First and last frame only: the ends of the invalidated range, which is where a partial cache line
+			// would leave stale data. The mirror cannot be stale, so it is the reference.
+			if (drainCached && (f == 0 || f + 1 == frames)) {
+				const int16_t* const truth = (const int16_t*)((const uint8_t*)(base + UNCACHED_MIRROR_OFFSET) + offset);
+				statCacheChecked++;
+				for (uint32_t c = 0; c < kRxChannels; c++) {
+					if (src[c] != truth[c]) {
+						statCacheMismatch++;
+						break;
+					}
+				}
+			}
+		}
 		for (uint32_t c = 0; c < kRxChannels; c++) {
 			dst[c] = src[c];
 		}
@@ -2808,11 +2836,12 @@ void reportStats() {
 	// 2026-08-22.
 	//
 	// The return is no longer fixed at two channels and pk grows by 11 a channel, so six channels was 403 + 44 =
-	// 447 - which the old 448 buffer met exactly, with the terminator and nothing else to spare. With ch added
-	// the worst case is 460. 512 restores a real margin: three more fields at six channels, or four more channels
-	// at the fields as listed.
+	// 447 - which the old 448 buffer met exactly, with the terminator and nothing else to spare. ch, dc, chk, mm
+	// and wrp add 13+4+14+13+14 = 58, so six channels is now 518 worst case. 640 leaves room for eight more
+	// fields. Counted against the emits below, not carried forward from the previous comment - that drift is what
+	// put 392 claimed bytes into a 384-byte buffer in August.
 	{
-		char rxLine[512];
+		char rxLine[640];
 		p = rxLine;
 		emit("AUI alt");
 		emitDec(g_usb_pstd_alt_num[kReturnInterfaceNumber]);
@@ -2831,6 +2860,14 @@ void reportStats() {
 		// Which arm this interval was: 0 read through the uncached mirror, 1 invalidated and read cached.
 		emit(" dc");
 		emitDec(drainCached ? 1u : 0u);
+		// Frames compared against the uncached truth, disagreements among them, and drains whose invalidated
+		// region wrapped the buffer's end. mm must be zero; wrp being non-zero is what makes chk mean anything.
+		emit(" chk");
+		emitDec(statCacheChecked);
+		emit(" mm");
+		emitDec(statCacheMismatch);
+		emit(" wrp");
+		emitDec(statDrainWrapped);
 		emit(" brdy");
 		emitDec(usbBrdyReturnCount);
 		emit(" arm");
