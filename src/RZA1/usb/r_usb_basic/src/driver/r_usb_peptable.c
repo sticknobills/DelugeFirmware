@@ -146,8 +146,8 @@ uint16_t g_usb_pstd_eptbl[] = {
     USB_NULL,                                                                                        /* PIPEPERI */
     USB_NULL,                                                                                        /* reserve */
 
-    /* The return. Buffer blocks 48 onward, clear of MIDI at 8 and 72 and of the outgoing pipe at
-     * 16 - see r_usb_paudio_config.h for why that allocation is derived rather than remembered. */
+    /* The return. Buffer blocks 88 onward, clear of MIDI at 8 and 72 and of the outgoing pipe at
+     * 24 - see r_usb_paudio_config.h for why that allocation is derived rather than remembered. */
     USB_CFG_PAUDIO_ISO_OUT, /* Pipe No. */
     /* TYPE    / BFRE        / DBLB         / CNTMD         / SHTNAK             / DIR      / EPNUM */
     USB_NULL | USB_BFREOFF | USB_CFG_DBLB | USB_CFG_CNTMD | USB_CFG_SHTNAKOFF | USB_NULL | USB_NULL, /* PIPECFG */

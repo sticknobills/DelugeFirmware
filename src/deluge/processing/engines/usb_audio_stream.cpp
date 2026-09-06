@@ -113,7 +113,10 @@ constexpr bool kMixOnChannels78 = true;
 /// by render-window position, so it could only report what had been put in it. This carries a *ring* index out
 /// through the stem path - written at render, read at output, across the drain, onto the wire - so it is read on
 /// the axis under test, and channel 6 carries the ring's own content beside it for the other half of the split.
-constexpr bool kReturnTrace = true;
+/// Off since 2026-09-07. It writes two arrays inside the return's own mix loop, once per output sample, and that
+/// loop is the thing being priced - an instrument inside the measurement is part of the measurement. It also
+/// holds channels 5 and 6, which the round-trip latency reading needs free.
+constexpr bool kReturnTrace = false;
 
 /// DIAGNOSTIC. Puts the USB peripheral's own registers on channel 7, as a repeating word stream.
 ///
@@ -128,7 +131,10 @@ constexpr bool kReturnTrace = true;
 ///
 /// Takes channel 7 from the mix pair. That costs the round-trip latency reading, which is not what this build is
 /// for.
-constexpr bool kRegisterTrace = true;
+/// Off since 2026-09-07. The fault it was built for was fixed on 2026-09-05 (night), it samples eight peripheral
+/// registers on every service pass - which is why the receive path read 7.4% against 6.6% on the build without it -
+/// and it holds channel 7, which the finished mix needs for the round-trip latency reading.
+constexpr bool kRegisterTrace = false;
 
 static_assert(!kRegisterTrace || kDiagnostics, "The register trace is an instrument and needs them compiled in");
 static_assert(!kAudioStamps || kDiagnostics, "The stamps are part of the instruments and need them compiled in");
@@ -387,6 +393,56 @@ bool streamActive = false;
  * gets right. Priced in B6, revisited then.
  */
 
+/// A timed path: cycles spent inside it and how many times it was entered, so a share of the processor is
+/// attributed rather than inferred, and a path that is expensive per event is told apart from one that is merely
+/// frequent.
+///
+/// Defined here rather than beside the objects it measures because the return's receive half is written above
+/// them and has to be timed too.
+struct PathCost {
+	uint32_t cycles;
+	uint32_t calls;
+};
+
+/// Cycle count at the last report, so every figure is divided by a clock rather than by an assumed second.
+/// The report fires every 1000 task passes and the task rate breathes, which has manufactured a phantom result
+/// here before.
+uint32_t costIntervalStart = 0;
+bool costCounterEnabled = false;
+
+/// Unsigned throughout, so the counter's 10.7 s wrap needs no detecting: the difference is right across it as
+/// long as the span itself is shorter than that, which every span here is by four orders of magnitude.
+[[gnu::always_inline]] inline void addCost(PathCost& c, uint32_t start) {
+	if constexpr (kDiagnostics) {
+		c.cycles += Debug::readCycleCounter() - start;
+		c.calls++;
+	}
+}
+
+/// The cycle counter read that opens a timed span. Reads nothing when the instruments are compiled out, so a
+/// shipping build makes no PMU access on the write timer's path at all.
+///
+/// Not to be used for anything but timing: parkAudioDmaPort's deadline is a real one and reads the counter
+/// directly, which is also why Debug::init() below stays unconditional.
+[[gnu::always_inline]] inline uint32_t costStart() {
+	if constexpr (kDiagnostics) {
+		return Debug::readCycleCounter();
+	}
+	return 0u;
+}
+
+/// The return's receive half: walking what the controller collected out of its landing buffer and into the ring.
+///
+/// Never had an instrument. Every figure for this direction - 6.6%, 7.4%, the 7.1% in the build note - was a
+/// difference between two engine-load readings taken with the return open and closed, which is a comparison of a
+/// machine against itself in two states rather than a measurement of a path. It also could not separate the
+/// receive half from the mix half except by a second A/B, and the engine sheds voices as it loads, so the
+/// denominator moves under both.
+///
+/// Timed directly it is one reading per arm, and paired with the frame count on the same line it gives cycles per
+/// returned frame - which is the quantity the per-channel question is actually about.
+PathCost costReturnDrain = {};
+
 /// Must match the second AudioStreaming interface's number in r_usb_pmidi_descriptor.c.
 constexpr uint16_t kReturnInterfaceNumber = 3;
 
@@ -396,7 +452,31 @@ constexpr uint32_t kRxMaxPacketBytes = USB_CFG_PAUDIO_RX_PACKET_BYTES;
 constexpr uint32_t kRxMaxFrames = kRxMaxPacketBytes / kRxFrameBytes;
 
 static_assert(kRxMaxPacketBytes <= USB_CFG_PAUDIO_RX_BUF_BYTES, "A return packet must fit the pipe buffer");
-static_assert(kRxMaxFrames > kSampleRate / 1000, "A host may send a 45-frame packet and it must fit");
+static_assert(kRxMaxFrames >= (kSampleRate + 999u) / 1000u, "A host may send a 45-frame packet and it must fit");
+
+/// The arithmetic that decides whether a build enumerates at all, checked by the compiler rather than done on
+/// paper once and trusted across four builds.
+///
+/// A Full Speed frame reserves ~1350 bytes for all periodic traffic in both directions combined, and the host
+/// reserves against what an endpoint *declares*. That is the fault that stopped both directions opening together
+/// on 2026-09-05 and crashed Ableton five times before it was found, and the widening below walks straight back
+/// into it if nobody counts. 13 bytes of per-packet overhead each, which is the figure the 2026-09-05 measurement
+/// was reconciled against.
+constexpr uint32_t kPeriodicBudgetBytes = 1350u;
+constexpr uint32_t kPacketOverheadBytes = 13u;
+constexpr uint32_t kDeclaredOut = USB_CFG_PAUDIO_MAX_FRAMES * kChannels * kSubframeBytes + kPacketOverheadBytes;
+constexpr uint32_t kDeclaredIn = kRxMaxPacketBytes + kPacketOverheadBytes;
+static_assert(kDeclaredOut + kDeclaredIn <= kPeriodicBudgetBytes,
+              "Both directions' declared packets must fit one Full Speed frame's periodic allowance");
+
+/// The pipe's buffer blocks, counted with double buffering rather than assumed - the one place this was left as
+/// "apparent" destroyed 3-6 MIDI messages a second for weeks. The block number is an 8-bit field valid from 4 to
+/// 127 (hardware manual p28-58).
+constexpr uint32_t kRxBufBlocks = (USB_CFG_PAUDIO_RX_BUF_BYTES / 64u) * 2u;
+static_assert(USB_CFG_PAUDIO_RX_BUF_BYTES % 64u == 0u, "A pipe buffer is allocated in whole 64-byte blocks");
+static_assert(USB_CFG_PAUDIO_RX_BUF_START >= 88u, "The return sits above USB MIDI's outgoing pipe at 72-87");
+static_assert(USB_CFG_PAUDIO_RX_BUF_START + kRxBufBlocks - 1u <= 127u,
+              "The return's last block must stay inside the buffer memory");
 
 /// 186 ms of return audio, 32 KB of SDRAM.
 ///
@@ -872,10 +952,21 @@ bool startReturnDma() {
 ///
 /// Not deadline-bound, which is the point of the whole change: the controller keeps collecting whether or not
 /// this runs, so being late costs latency inside the buffer rather than audio off the wire.
+/// Timed as a whole, which is why the work is a function of its own: the drain has four exits and a guard placed
+/// before each of them is the shape that has already produced an inert build here once. One wrapper cannot miss
+/// a path.
+void drainReturnDmaBody();
+
 void drainReturnDma() {
 	if (!rxDmaRunning) {
 		return;
 	}
+	const uint32_t start = costStart();
+	drainReturnDmaBody();
+	addCost(costReturnDrain, start);
+}
+
+void drainReturnDmaBody() {
 
 	// The pipe's two halves and the controller have to agree on whose turn it is, and once anything has
 	// disturbed the pipe they no longer do. Re-doing the handover is the only thing that resynchronises them.
@@ -955,22 +1046,30 @@ void drainReturnDma() {
 		statRxOverrun += frames - room;
 		frames = room;
 	}
-	for (uint32_t f = 0; f < frames; f++) {
-		const int16_t* const src = (const int16_t*)(uncached + offset);
-		int16_t* const dst = &rxRing[(w & kRxRingMask) * kRxChannels];
-		for (uint32_t c = 0; c < kRxChannels; c++) {
-			dst[c] = src[c];
-		}
-		if constexpr (kDiagnostics) {
-			// Inline, not a call per frame. The interrupt path measured a whole packet in one call and this measured
-			// one frame in one, so the same instrument became 44x the calls at 44,100 a second - and the dense song
-			// went from holding 12-13 voices to 9, which is the engine shedding work it could no longer afford.
+	if constexpr (kDiagnostics) {
+		// One frame a call, not every frame. This asks "is each channel carrying audio", and a thousand samples a
+		// second answers that as well as forty-four thousand do.
+		//
+		// It was every frame, and every channel of every frame, which made it the most steeply per-channel thing
+		// in this loop - so at four and six channels it would have been measuring itself. The same instrument
+		// already cost a quarter of this machine's polyphony once, on 2026-09-05, by moving from per-packet to
+		// per-frame without anyone reviewing code that had not been edited.
+		if (frames > 0) {
+			const int16_t* const src = (const int16_t*)(uncached + offset);
 			for (uint32_t c = 0; c < kRxChannels; c++) {
 				const int32_t v = src[c] < 0 ? -(int32_t)src[c] : (int32_t)src[c];
 				if (v > rxPeak[c]) {
 					rxPeak[c] = v;
 				}
 			}
+		}
+	}
+
+	for (uint32_t f = 0; f < frames; f++) {
+		const int16_t* const src = (const int16_t*)(uncached + offset);
+		int16_t* const dst = &rxRing[(w & kRxRingMask) * kRxChannels];
+		for (uint32_t c = 0; c < kRxChannels; c++) {
+			dst[c] = src[c];
 		}
 		offset += kRxFrameBytes;
 		if (offset >= kRxDmaBytes) {
@@ -1259,10 +1358,6 @@ uint32_t statReportCountdown = 0;
 ///
 /// Two of the six are nested inside others and must not be added to them: fifoWrite sits inside timer, and build
 /// and submit both sit inside service.
-struct PathCost {
-	uint32_t cycles;
-	uint32_t calls;
-};
 PathCost costTimer = {};       ///< the whole write-timer interrupt, every branch including the ones that do nothing
 PathCost costFifoWrite = {};   ///< the FIFO copy alone, nested inside costTimer
 PathCost costReturnMix = {};   ///< summing the return into the song's mix, the only cost stage B adds to the render
@@ -1315,33 +1410,6 @@ uint16_t statDmaArmFrame = 0;      ///< host frame number at the arm
 uint32_t statDmaSpanSum = 0;       ///< summed arm-to-commit cycles
 uint32_t statDmaSpanMax = 0;       ///< worst arm-to-commit, cycles
 uint32_t statDmaFrameSpan[3] = {}; ///< committed in the same host frame, one later, two or more later
-
-/// Cycle count at the last report, so every figure above is divided by a clock rather than by an assumed second.
-/// The report fires every 1000 task passes and the task rate breathes, which has manufactured a phantom result
-/// here before.
-uint32_t costIntervalStart = 0;
-bool costCounterEnabled = false;
-
-/// Unsigned throughout, so the counter's 10.7 s wrap needs no detecting: the difference is right across it as
-/// long as the span itself is shorter than that, which every span here is by four orders of magnitude.
-[[gnu::always_inline]] inline void addCost(PathCost& c, uint32_t start) {
-	if constexpr (kDiagnostics) {
-		c.cycles += Debug::readCycleCounter() - start;
-		c.calls++;
-	}
-}
-
-/// The cycle counter read that opens a timed span. Reads nothing when the instruments are compiled out, so a
-/// shipping build makes no PMU access on the write timer's path at all.
-///
-/// Not to be used for anything but timing: parkAudioDmaPort's deadline is a real one and reads the counter
-/// directly, which is also why Debug::init() below stays unconditional.
-[[gnu::always_inline]] inline uint32_t costStart() {
-	if constexpr (kDiagnostics) {
-		return Debug::readCycleCounter();
-	}
-	return 0u;
-}
 
 /// Counters, compiled out with everything else they feed. Declared as ordinary values above rather than wrapped
 /// in a type, so the shipping build differs from the measured one by these calls and nothing else.
@@ -2697,14 +2765,19 @@ void reportStats() {
 	// re-checking. Tags including their leading space, then ten digits for each unsigned counter:
 	//   AUI alt 17 | act 14 | inf 14 | brdy 15 | arm 14 | aerr 15 | err 14 | pkt 14 | frm 14 | mt 13 |
 	//   part 15 | ovr 14 | unr 14 | shf 14 | rp 13 | hmin 15 | hmax 15 | drn 14 | wf 13 | rf 13 | held 15 | pr 4
-	//   sz 3 + 4 buckets at 11 = 47 | pk 3 + kRxChannels at 11 = 25 at two channels | rnd 14 | out 14
-	// Those add to 403, plus the terminator. The previous count said 392 and sat in a 384 buffer, so it had been
-	// wrong in the direction that overflows since it was written - the fields as listed came to 375, and the
-	// "room for two more fields" it claimed was room for half of one. Adding the two below to that buffer would
-	// have smashed the stack once a second, which is the fault that froze this machine on 2026-08-22.
-	// 448 leaves genuine room for three more; widening the return past two channels adds 11 apiece.
+	//   sz 3 + 4 buckets at 11 = 47 | pk 3 + kRxChannels at 11 = 25 at two channels | rnd 14 | out 14 | ch 13
+	// Those add to 403 at two channels, plus the terminator. The previous count said 392 and sat in a 384 buffer,
+	// so it had been wrong in the direction that overflows since it was written - the fields as listed came to
+	// 375, and the "room for two more fields" it claimed was room for half of one. Adding the two below to that
+	// buffer would have smashed the stack once a second, which is the fault that froze this machine on
+	// 2026-08-22.
+	//
+	// The return is no longer fixed at two channels and pk grows by 11 a channel, so six channels was 403 + 44 =
+	// 447 - which the old 448 buffer met exactly, with the terminator and nothing else to spare. With ch added
+	// the worst case is 460. 512 restores a real margin: three more fields at six channels, or four more channels
+	// at the fields as listed.
 	{
-		char rxLine[448];
+		char rxLine[512];
 		p = rxLine;
 		emit("AUI alt");
 		emitDec(g_usb_pstd_alt_num[kReturnInterfaceNumber]);
@@ -2714,6 +2787,12 @@ void reportStats() {
 		emitDec(rxTransferInFlight ? 1u : 0u);
 		// Interrupts the chip raised for this pipe, counted in the driver. A zero here with a live host is the
 		// host not sending; a rising count with frm stuck at zero is the read path rather than the wire.
+		// How many channels this build's return carries, printed because four builds one constant apart are
+		// otherwise indistinguishable on the wire - and a measurement attributed to the wrong one of them is the
+		// exact fault of 2026-09-06 (morning), where three notes described a binary the version string could have
+		// settled. Read this, not the filename, before attributing any number below to a channel count.
+		emit(" ch");
+		emitDec(kRxChannels);
 		emit(" brdy");
 		emitDec(usbBrdyReturnCount);
 		emit(" arm");
@@ -2921,12 +3000,16 @@ void reportStats() {
 	// numbers separated by commas is 6 x 38 = 228. 244 worst case, and the two refusal lines are shorter than
 	// either.
 	{
-		// Twelve fields of <tag>:<permille>,<calls>,<mean>. Worst case a tag is 7 characters, permille 4 digits,
-		// calls and mean 10 each, plus two commas: 33. Twelve of those is 396, and the header "AUX el" with a
-		// ten-digit interval is 16 more: 412. 448 leaves room for one further field, and the next one added
-		// must widen the buffer. Nothing below bounds-checks, and
-		// a debug line that outgrew its buffer froze this machine once already - so this is counted, not claimed.
-		char costLine[448];
+		// Fifteen fields of <tag>:<permille>,<calls>,<mean>. Worst case a tag with its leading space and colon is
+		// 6 characters, permille 4 digits, calls and mean 10 each, plus two commas: 32. Fifteen of those is 480,
+		// and the header "AUX el" with a ten-digit interval is 16 more: 496, plus the terminator.
+		//
+		// The count said twelve while fourteen were being printed, which is the same drift that put 392 claimed
+		// fields into a 384-byte buffer in August. Recounted against the emitCost calls below rather than against
+		// the previous comment: 640 leaves room for four more fields, and the field after that widens the buffer.
+		// Nothing below bounds-checks, and a debug line that outgrew its buffer froze this machine once already -
+		// so this is counted, not claimed.
+		char costLine[640];
 		p = costLine;
 		// A counter that was never enabled reads a constant, and a constant produces a confident zero on every
 		// field below rather than an error. Two reads that come back equal mean the instrument is dead, and it
@@ -2977,6 +3060,9 @@ void reportStats() {
 			emitCost(" clr:", costStemClear);
 			// Never printed until now: stage B's only addition to the render path, and B6 has to price it.
 			emitCost(" rtn:", costReturnMix);
+			// The receive half, beside the mix half. rtn is inside the render and on the deadline; drn is in the
+			// task and deliberately is not, which is why they want reading apart rather than summed.
+			emitCost(" drn:", costReturnDrain);
 			emitCost(" eng:", costEngine);
 			emitCost(" outs:", costOutputs);
 		}
@@ -2985,6 +3071,7 @@ void reportStats() {
 		costIntervalStart = live1;
 		costTimer = PathCost{};
 		costReturnMix = PathCost{};
+		costReturnDrain = PathCost{};
 		costFifoWrite = PathCost{};
 		costService = PathCost{};
 		costBuild = PathCost{};

@@ -95,31 +95,58 @@
 
 /* ---- The return, host to device ---- */
 
-// Two channels: Siphon sums its effect lanes and hands back one stereo pair, and a master return
-// into the song's summing point needs no more. The receive path is written channel-addressable, so
-// widening this is a constant plus a wider pipe buffer - the ceiling is six, above which the two
-// directions no longer fit in a Full Speed frame together.
+// How many channels the return carries. The receive path and the descriptors both derive from this,
+// so it is the only place it is written down.
+//
+// Two is the product shape: a master return into the song's summing point needs one stereo pair.
+// One, four and six exist because the per-channel price of this direction has never been measured -
+// the note asserted the cost was fixed per packet without ever testing it, and whether sixteen
+// channels costs like two or like sixteen decides whether a per-track insert is possible at all.
+// Four builds, four points, rather than a slope drawn through one.
+//
+// Six is the ceiling at Full Speed and it is the periodic-bandwidth budget rather than anything
+// local: a frame reserves ~1350 bytes for all timed traffic in both directions, the outgoing
+// endpoint declares 736, and six channels of return declare 540 - 1302 with per-packet overhead.
+// Eight channels would declare 720 and put the pair over.
 #define USB_CFG_PAUDIO_RX_CHANNELS (2u)
 
-// 2 x 16 bit is 4 bytes per audio frame. 44.1 kHz does not divide into 1 ms frames, so a host may
-// send 44 or 45 frames; 48 frames of headroom costs nothing and cannot be undersized by a host that
-// rounds differently.
-#define USB_CFG_PAUDIO_RX_MAX_FRAMES (48u)
+// The largest packet the return endpoint may carry, in audio frames.
+//
+// 45, not 48, since 2026-09-07, and this is a bandwidth reservation rather than a buffer size - the
+// host reserves against what an endpoint declares, which is the same lesson the outgoing endpoint
+// learned on 2026-09-05. 45 is what a 44.1 kHz host can actually send in a 1 ms frame; the three
+// spare frames were free at two channels and cost 72 bytes of the frame's budget at six, which is
+// the difference between the wide arms enumerating and not.
+//
+// A host that rounds differently and sends 46 has its packet dropped by the hardware. The check on
+// that is the collection rate: the two-channel arm has to reproduce ~44,100 frames a second, and a
+// host doing anything else shows in the packet-size buckets on the return's own report line before
+// it shows anywhere else.
+#define USB_CFG_PAUDIO_RX_MAX_FRAMES (45u)
 #define USB_CFG_PAUDIO_RX_PACKET_BYTES (USB_CFG_PAUDIO_RX_CHANNELS * 2u * USB_CFG_PAUDIO_RX_MAX_FRAMES)
 
-// Rounded up to the 64-byte unit pipe buffers are allocated in.
-#define USB_CFG_PAUDIO_RX_BUF_BYTES (256u)
+// Sized for six channels in every build, not for the channel count this one carries.
+//
+// 6 * 2 * 45 is 540 bytes, rounded up to the 64-byte unit pipe buffers are allocated in. Deliberately
+// the same at one, two, four and six channels so the buffer map is identical across the four builds
+// and the only thing that differs between them is the channel count. A per-arm buffer would move the
+// pipe's block allocation between arms, which is a second variable in a measurement whose whole point
+// is a slope.
+#define USB_CFG_PAUDIO_RX_BUF_BYTES (576u)
 
-// Blocks 56-63 once double-buffered: 256 bytes is 4 blocks, doubled is 8.
+// Blocks 88-105 once double-buffered: 576 bytes is 9 blocks, doubled is 18.
 //
-// Moved up from 48 with the outgoing pipe's move above, which now reaches block 55. The full map, all four
-// pipes with double buffering counted rather than assumed:
+// Moved up from 56 on 2026-09-07, because the six-channel buffer above no longer fits between the
+// outgoing pipe and USB MIDI's outgoing one. The full map, all four pipes with double buffering
+// counted rather than assumed:
 //
-//   MIDI in    8-23    audio out  24-55    return  56-63    MIDI out  72-87
+//   MIDI in    8-23    audio out  24-55    MIDI out  72-87    return  88-105
 //
-// 64-71 is spare. Anything added here counts its own doubling and checks it against this list - the one
-// place this was left as "apparent" cost a day's work and shipped a fault.
-#define USB_CFG_PAUDIO_RX_BUF_START (56u)
+// 56-71 and 106-127 are spare. The block number is an 8-bit field valid from 4 to 127 (hardware
+// manual p28-58), so 105 is comfortably inside it. Anything added here counts its own doubling and
+// checks it against this list - the one place this was left as "apparent" cost a day's work and
+// shipped a fault.
+#define USB_CFG_PAUDIO_RX_BUF_START (88u)
 
 // Called from the peripheral interrupt handler's frame branch, 1000 times a second, to write the
 // next audio packet off the host's own clock. Declared here because that handler already includes

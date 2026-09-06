@@ -126,6 +126,31 @@ Macro definitions
 #define AUDIO_RX_CHANNELS USB_CFG_PAUDIO_RX_CHANNELS
 #define AUDIO_RX_MAX_PACKET_SIZE USB_CFG_PAUDIO_RX_PACKET_BYTES
 
+// Spatial positions for the return's channels, USB audio 1.0 spec 3.7.2.3. Derived from the channel
+// count rather than written once, because the count now varies across builds and a mask naming two
+// channels on a six-channel terminal is a descriptor that contradicts itself.
+//
+//   1  centre                         0x0004
+//   2  front left, front right        0x0003
+//   4  fronts plus surrounds          0x0033
+//   6  5.1                            0x003F
+//
+// The outgoing direction declares 0x0000 - discrete, no positions - and macOS presents its eight
+// channels correctly that way. This direction keeps real positions because it is a playback device to
+// the host, where the position mask is what a host maps its own outputs onto, and because two
+// channels must stay bit-identical to the build this measurement is calibrated against.
+#if USB_CFG_PAUDIO_RX_CHANNELS == 1
+#define AUDIO_RX_CHANNEL_CONFIG 0x0004
+#elif USB_CFG_PAUDIO_RX_CHANNELS == 2
+#define AUDIO_RX_CHANNEL_CONFIG 0x0003
+#elif USB_CFG_PAUDIO_RX_CHANNELS == 4
+#define AUDIO_RX_CHANNEL_CONFIG 0x0033
+#elif USB_CFG_PAUDIO_RX_CHANNELS == 6
+#define AUDIO_RX_CHANNEL_CONFIG 0x003F
+#else
+#error "No channel-position mask defined for this return channel count"
+#endif
+
 // Isochronous, adaptive. The device cannot be asynchronous in this direction: a conforming
 // asynchronous sink signals its rate back with a feedback endpoint, which is itself isochronous,
 // and both isochronous-capable pipes are already carrying audio. Adaptive says the device absorbs
@@ -394,7 +419,8 @@ uint8_t g_midi_configuration[TOTAL_CONFIG_LENGTH + (TOTAL_CONFIG_LENGTH % 2)] = 
     (uint8_t)(AUDIO_TERMINAL_USB_STREAMING / 256), // wTerminalType(H)
     0x00,                                          // bAssocTerminal - none
     AUDIO_RX_CHANNELS,                             // bNrChannels
-    0x03, 0x00,                                    // wChannelConfig - front left and front right
+    (uint8_t)(AUDIO_RX_CHANNEL_CONFIG % 256),      // wChannelConfig(L)
+    (uint8_t)(AUDIO_RX_CHANNEL_CONFIG / 256),      // wChannelConfig(H)
     0x00,                                          // iChannelNames
     0x00,                                          // iTerminal
 
