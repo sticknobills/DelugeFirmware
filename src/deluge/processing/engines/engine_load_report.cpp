@@ -131,6 +131,15 @@ uint32_t statMidiEvents = 0;
 uint32_t statMidiHighBitAborts = 0;
 uint32_t statMidiToSysex = 0;
 uint32_t statClockMessages = 0;
+
+/// The first few refused events themselves, kept whole. A count cannot distinguish a zeroed byte from a
+/// shifted read and both are live explanations.
+constexpr size_t kNumRejectSamples = 3;
+uint8_t statRejectBytes[kNumRejectSamples][4] = {};
+uint16_t statRejectOffset[kNumRejectSamples] = {};
+uint16_t statRejectPacket[kNumRejectSamples] = {};
+size_t statRejectStored = 0;
+
 uint32_t statInputTickCalls = 0;
 uint32_t statInputTickFromTrigger = 0;
 
@@ -191,6 +200,7 @@ void clearInterval() {
 	statMidiHighBitAborts = 0;
 	statMidiToSysex = 0;
 	statClockMessages = 0;
+	statRejectStored = 0;
 	statInputTickCalls = 0;
 	statInputTickFromTrigger = 0;
 }
@@ -353,6 +363,18 @@ void EngineLoadReport::recordMidiDecode(uint32_t events, uint32_t highBitAborts,
 	statMidiEvents += events;
 	statMidiHighBitAborts += highBitAborts;
 	statMidiToSysex += toSysex;
+}
+
+void EngineLoadReport::recordMidiRejectedEvent(const uint8_t* event, uint32_t offsetBytes, uint32_t packetBytes) {
+	if (statRejectStored >= kNumRejectSamples) {
+		return;
+	}
+	for (size_t i = 0; i < 4; i++) {
+		statRejectBytes[statRejectStored][i] = event[i];
+	}
+	statRejectOffset[statRejectStored] = (uint16_t)offsetBytes;
+	statRejectPacket[statRejectStored] = (uint16_t)packetBytes;
+	statRejectStored++;
 }
 
 void EngineLoadReport::recordClockMessage() {
@@ -538,7 +560,8 @@ void EngineLoadReport::routine() {
 	// engine, and the two lines above are compared field-for-field against captures that predate it.
 	//
 	// Worst case: "CK" (2) plus eighteen fields, each a leading space, a tag of at most 3 characters and ten
-	// digits (18 x 14 = 252), plus the terminator - 255 into the 512-byte array above. Counted rather than
+	// digits (18 x 14 = 252), plus three refused events at 22 characters each (66), plus the terminator -
+	// 322 into the 512-byte array above. Counted rather than
 	// asserted; re-count when adding a field.
 	p = line;
 	emit("CK n");
@@ -590,6 +613,21 @@ void EngineLoadReport::routine() {
 	emitDec(statInputTickCalls);
 	emit(" tkt");
 	emitDec(statInputTickFromTrigger);
+	// The refused events themselves: four bytes, then where they sat and how long their packet was. A clock
+	// message reads 0FF80000 at an offset that is a multiple of four.
+	for (size_t i = 0; i < statRejectStored; i++) {
+		emit(" r");
+		emitDec((uint32_t)i);
+		emit(":");
+		for (size_t b = 0; b < 4; b++) {
+			*p++ = "0123456789ABCDEF"[(statRejectBytes[i][b] >> 4) & 0xF];
+			*p++ = "0123456789ABCDEF"[statRejectBytes[i][b] & 0xF];
+		}
+		emit("@");
+		emitDec(statRejectOffset[i]);
+		emit("/");
+		emitDec(statRejectPacket[i]);
+	}
 	*p = '\0';
 	Debug::sysexDebugPrint(*Debug::midiDebugCable, line, true);
 

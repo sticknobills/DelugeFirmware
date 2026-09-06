@@ -114,6 +114,14 @@ public:
 	/// are the shapes a corrupted receive buffer takes; both read as zero on a clean stream.
 	static void recordMidiDecode(uint32_t events, uint32_t highBitAborts, uint32_t toSysex);
 
+	/// DIAGNOSTIC. Takes the actual bytes of an event the decode refused, with where it sat.
+	///
+	/// The counts say five clock messages a second are discarded and cannot say what they turned into. These
+	/// are the four bytes as the decode read them, the offset they sat at within the packet, and how long that
+	/// packet was - which separates a value being overwritten from the buffer being read at the wrong place or
+	/// for the wrong length. First few per interval; the rest are counted and not stored.
+	static void recordMidiRejectedEvent(const uint8_t* event, uint32_t offsetBytes, uint32_t packetBytes);
+
 	/// DIAGNOSTIC. Takes one clock message reaching the tempo maths, and one call into the input tick by source.
 	///
 	/// Counted separately from the arrival statistics because those exclude the trigger-clock input, and the

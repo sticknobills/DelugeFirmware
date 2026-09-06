@@ -903,6 +903,9 @@ void MidiEngine::checkIncomingUsbMidi() {
 							else { // Invalid, or sysex, or something
 								// DIAGNOSTIC
 								deluge::processing::engines::EngineLoadReport::recordMidiDecode(0, 0, 1);
+								deluge::processing::engines::EngineLoadReport::recordMidiRejectedEvent(
+								    readPos, (uint32_t)(readPos - connectedUSBMIDIDevices[ip][d].receiveData),
+								    (uint32_t)bytesReceivedHere);
 								checkIncomingUsbSysex(readPos, ip, d, cable);
 								continue;
 							}
