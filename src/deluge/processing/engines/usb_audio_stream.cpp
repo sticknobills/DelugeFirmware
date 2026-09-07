@@ -527,6 +527,27 @@ constexpr uint32_t kRxLeadFrames = 2048u;
 /// same trade the outgoing ring makes when it resyncs.
 constexpr uint32_t kRxRePrimeFloor = 256u;
 
+/// The cushion's ceiling, and the other half of a guard that only ever had a floor.
+///
+/// The host's clock and the Deluge's differ by about 16 parts per million - ordinary crystal tolerance - and the
+/// endpoint is adaptive, so there is no feedback endpoint at Full Speed to ask the host to slow down. The
+/// difference is roughly one frame a second and it accumulates: measured 2026-09-06 (night) at +0.7 frames/s on
+/// two channels and +0.9 on four, filling the 8192-frame ring in about two hours, after which the reader is
+/// pinned against a ring that is always full and the same trapped fragment is read out over and over. Audible as
+/// a continuous buzz, and only switching the return off stops it.
+///
+/// The floor below has existed since the cushion was designed; nobody built the ceiling, and no capture ever ran
+/// long enough to need it - the headroom from a fresh start is about 61 seconds and every capture was 60.
+///
+/// A frame is dropped rather than the audio resampled. One frame is 23 microseconds, and in steady state exactly
+/// as many are dropped as the clocks differ by - about one a second, which is inaudible. The correction is fast
+/// while the cushion is far above, which only happens once at stream start, and self-limiting after: the cushion
+/// settles just above this line and trims at the drift rate rather than at the correction rate.
+///
+/// 256 above the target, which is clear of both the priming point (target plus one render window) and the top of
+/// the engine's own swing (measured hmax 2242 against this 2304).
+constexpr uint32_t kRxDriftCeiling = kRxLeadFrames + 256u;
+
 PLACE_SDRAM_BSS int16_t rxRing[kRxRingFrames * kRxChannels];
 
 /// Free-running like the outgoing pair, and masked only where they index. rxWriteFrame is advanced by the
@@ -557,6 +578,7 @@ uint32_t statRxOverrun = 0;     ///< frames dropped because the reader had not t
 uint32_t statRxUnderrun = 0;    ///< render windows the ring could not fill completely
 uint32_t statRxShortFrames = 0; ///< frames missing across those windows - what was actually lost
 uint32_t statRxRePrimes = 0;    ///< deliberate rebuilds of the cushion, each one short mute
+uint32_t statRxDriftTrims = 0; ///< frames dropped to hold the cushion under its ceiling - the clock difference, counted
 /// How low and how high the cushion actually swings in an interval. The engine takes the return in bursts and
 /// nothing here knew how big they were, so every cushion size so far has been a guess. Min is what the cushion
 /// has to clear; the pair together is the swing.
@@ -753,17 +775,17 @@ void refreshReturnPipeGuard();
 /// flush, outer clean-invalidate, inner invalidate.
 extern "C" void invalidate_range_all_caches(uintptr_t start, uintptr_t end);
 
-/// DIAGNOSTIC A/B, flipped once per report so the two arms are interleaved rather than flashed apart.
+/// The drain reads the controller's landing buffer out of the cache, invalidating the region first.
 ///
-/// The drain reads the controller's landing buffer through the uncached mirror, which is a bus transaction per
-/// access. Measured 2026-09-06 (night): 155.8 cycles per channel per frame to move two bytes - about 78 cycles a
-/// byte, for something this machine should do in roughly one. If that read is the whole of the per-channel cost,
-/// invalidating the range and reading it cached collapses it and a wide return becomes affordable. If the number
-/// does not move, the cost is somewhere else entirely and every plan resting on a wide return needs rethinking.
+/// It read through the uncached mirror until 2026-09-07, which is a bus transaction per access and cost 152
+/// cycles per channel per frame to move two bytes. Invalidating and reading cached costs 36 - a 4.2x reduction
+/// on the per-channel half, and the fixed part is unchanged at ~44 either way because the bookkeeping is the
+/// same. Measured interleaved on one flash rather than across two, and verified against the mirror as the truth:
+/// 122,000 frames compared, zero disagreements, across a thousand wraps of the buffer's end.
 ///
-/// Interleaved rather than built as two binaries because a difference of a few percent across two flashes is not
-/// a result in this domain - identical firmware has read 939 and 720 on consecutive nights.
-bool drainCached = false;
+/// It matters far past this direction's own cost. At 16 channels the return was 27% of the processor and is now
+/// under 7, which is what takes a wide return - and therefore per-track inserts - from unaffordable to affordable.
+constexpr bool kDrainCached = true;
 
 /// DIAGNOSTIC. Whether the cached read ever returns something different from the truth.
 ///
@@ -1074,7 +1096,7 @@ void drainReturnDmaBody() {
 	// The whole point of the experiment: the same copy, reading the same bytes, once through the uncached mirror
 	// and once out of the cache after invalidating what the controller has written.
 	const uint8_t* source;
-	if (drainCached) {
+	if constexpr (kDrainCached) {
 		const uint32_t from = rxDmaReadOffset;
 		const uint32_t to = rxDmaReadOffset + available;
 		if (to <= kRxDmaBytes) {
@@ -1125,7 +1147,7 @@ void drainReturnDmaBody() {
 		if constexpr (kDiagnostics) {
 			// First and last frame only: the ends of the invalidated range, which is where a partial cache line
 			// would leave stale data. The mirror cannot be stale, so it is the reference.
-			if (drainCached && (f == 0 || f + 1 == frames)) {
+			if (kDrainCached && (f == 0 || f + 1 == frames)) {
 				const int16_t* const truth = (const int16_t*)((const uint8_t*)(base + UNCACHED_MIRROR_OFFSET) + offset);
 				statCacheChecked++;
 				for (uint32_t c = 0; c < kRxChannels; c++) {
@@ -1723,10 +1745,17 @@ void advanceReturnBy(uint32_t numSamplesOutputted) {
 	}
 	bump(statReturnOutputted, numSamplesOutputted);
 	const uint32_t held = rxWriteFrame - rxReadFrame;
-	const uint32_t take = numSamplesOutputted < held ? numSamplesOutputted : held;
+	uint32_t take = numSamplesOutputted < held ? numSamplesOutputted : held;
 	if (take < numSamplesOutputted) {
 		statRxUnderrun++;
 		statRxShortFrames += numSamplesOutputted - take;
+	}
+	// The cushion has drifted above its ceiling, so take one extra frame and let it fall back. See
+	// kRxDriftCeiling: without this the cushion only ever grows, and a session long enough reaches a ring that is
+	// permanently full and buzzes.
+	if (held > kRxDriftCeiling && take < held) {
+		take++;
+		statRxDriftTrims++;
 	}
 	rxReadFrame += take;
 	statRxDrained += take;
@@ -2842,7 +2871,7 @@ void reportStats() {
 	//
 	// The return is no longer fixed at two channels and pk grows by 11 a channel, so six channels was 403 + 44 =
 	// 447 - which the old 448 buffer met exactly, with the terminator and nothing else to spare. ch, dc, chk, mm
-	// and wrp add 13+4+14+13+14 = 58, so six channels is now 518 worst case. 640 leaves room for eight more
+	// and wrp add 13+14+14+13+14 = 68, so six channels is now 528 worst case. 640 leaves room for eight more
 	// fields. Counted against the emits below, not carried forward from the previous comment - that drift is what
 	// put 392 claimed bytes into a 384-byte buffer in August.
 	{
@@ -2862,9 +2891,6 @@ void reportStats() {
 		// settled. Read this, not the filename, before attributing any number below to a channel count.
 		emit(" ch");
 		emitDec(kRxChannels);
-		// Which arm this interval was: 0 read through the uncached mirror, 1 invalidated and read cached.
-		emit(" dc");
-		emitDec(drainCached ? 1u : 0u);
 		// Frames compared against the uncached truth, disagreements among them, and drains whose invalidated
 		// region wrapped the buffer's end. mm must be zero; wrp being non-zero is what makes chk mean anything.
 		emit(" chk");
@@ -2899,6 +2925,10 @@ void reportStats() {
 		emitDec(statRxShortFrames);
 		emit(" rp");
 		emitDec(statRxRePrimes);
+		// Frames dropped to hold the cushion down. In steady state this is the host-to-device clock difference
+		// measured directly, about one a second; a zero here on a long run means the ceiling is never reached.
+		emit(" trm");
+		emitDec(statRxDriftTrims);
 		// The swing the cushion has to survive, which every size so far has been guessed against.
 		emit(" hmin");
 		emitDec(statRxHeldMin == 0xFFFFFFFFu ? 0u : statRxHeldMin);
@@ -3246,6 +3276,7 @@ void reportStats() {
 	statRxUnderrun = 0;
 	statRxShortFrames = 0;
 	statRxRePrimes = 0;
+	statRxDriftTrims = 0;
 	statRxHeldMin = 0xFFFFFFFFu;
 	statRxHeldMax = 0;
 	statRxDrained = 0;
@@ -3276,10 +3307,6 @@ void reportStats() {
 	for (uint32_t c = 0; c < kRxChannels; c++) {
 		rxPeak[c] = 0;
 	}
-
-	// Flip the drain's read path for the next interval. Interleaved, so song density and anything else that
-	// breathes over a minute lands on both arms equally instead of on whichever was flashed second.
-	drainCached = !drainCached;
 
 	// usbBempBitsSeen is deliberately not cleared: which pipes are live at all is the question, not how often.
 }
