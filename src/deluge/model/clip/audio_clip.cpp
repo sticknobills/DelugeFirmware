@@ -138,11 +138,8 @@ void AudioClip::abortRecording() {
 }
 
 bool AudioClip::wantsToBeginLinearRecording(Song* song) {
-	// A USB return pair can be monitored but not yet recorded: the recorder is fed from the I2S receive buffer or
-	// from the finished mix, and the return ring is neither. Offering it would write a silent file.
 	return (Clip::wantsToBeginLinearRecording(song) && (!sampleHolder.audioFile || !shouldCloneForOverdubs())
-	        && ((AudioOutput*)output)->inputChannel > AudioInputChannel::NONE
-	        && !isUsbReturnInput(((AudioOutput*)output)->inputChannel));
+	        && ((AudioOutput*)output)->inputChannel > AudioInputChannel::NONE);
 }
 
 bool AudioClip::isAbandonedOverdub() {
@@ -159,10 +156,14 @@ Error AudioClip::beginLinearRecording(ModelStackWithTimelineCounter* modelStack,
 
 		inputChannel = ((AudioOutput*)output)->inputChannel;
 		outputRecordingFrom = ((AudioOutput*)output)->getOutputRecordingFrom();
-		numChannels =
-		    (inputChannel >= AUDIO_INPUT_CHANNEL_FIRST_INTERNAL_OPTION || inputChannel == AudioInputChannel::STEREO)
-		        ? 2
-		        : 1;
+		// A single USB channel is one channel, the way a single line input is - it sits above the internal
+		// options in the enum but it is one arriving channel, not a stereo source.
+		numChannels = (usbReturnMonoChannelOf(inputChannel) != 0)
+		                  ? 1
+		                  : ((inputChannel >= AUDIO_INPUT_CHANNEL_FIRST_INTERNAL_OPTION
+		                      || inputChannel == AudioInputChannel::STEREO)
+		                         ? 2
+		                         : 1);
 		shouldNormalize =
 		    (inputChannel < AUDIO_INPUT_CHANNEL_FIRST_INTERNAL_OPTION); // if reading from input we need this
 	}

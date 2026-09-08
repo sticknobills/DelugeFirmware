@@ -1717,6 +1717,15 @@ void beginReturnWindow(uint32_t numSamples) {
 	}
 }
 
+/// The batch of frames the last output pass actually took off the ring.
+///
+/// A recorder reads these rather than keeping a pointer of its own. The render re-reads frames it rendered and did
+/// not output, so a second pointer walking at the render's rate would drift; this is the one place that knows what
+/// truly left the machine, which is also exactly what was heard.
+uint32_t returnConsumedFrom = 0;
+uint32_t returnConsumedFrames = 0;
+uint32_t returnConsumedRequested = 0;
+
 /// Takes one pair off the master for this window.
 ///
 /// Claimed whether or not there is anything to read. A host that pauses for a moment must not hand the pair back
@@ -1871,6 +1880,12 @@ void mixReturnInto(StereoSample* buffer, uint32_t numSamples) {
 /// A render window that was rendered and not output is re-rendered next time, so re-reading those frames is the
 /// correct behaviour rather than a compromise.
 void advanceReturnBy(uint32_t numSamplesOutputted) {
+	// What a recorder must take, whether or not any of it arrived. A recording has to stay the same length as the
+	// audio it was made alongside, so frames the return did not have are silence rather than a shorter file.
+	returnConsumedFrom = rxReadFrame;
+	returnConsumedRequested = numSamplesOutputted;
+	returnConsumedFrames = 0;
+
 	if (!returnActive || !rxPrimed) {
 		return;
 	}
@@ -1888,6 +1903,7 @@ void advanceReturnBy(uint32_t numSamplesOutputted) {
 		take++;
 		statRxDriftTrims++;
 	}
+	returnConsumedFrames = take;
 	rxReadFrame += take;
 	statRxDrained += take;
 }
@@ -4121,6 +4137,37 @@ uint32_t USBAudioStream::numReturnPairs() {
 
 uint32_t USBAudioStream::numReturnChannels() {
 	return kRxChannels;
+}
+
+uint32_t USBAudioStream::consumedReturnFrames() {
+	return returnConsumedRequested;
+}
+
+uint32_t USBAudioStream::readConsumedReturn(uint32_t chL, uint32_t chR, StereoSample* dst, uint32_t offset,
+                                            uint32_t maxSamples) {
+	if (dst == nullptr || chL >= kRxChannels || chR >= kRxChannels || offset >= returnConsumedRequested) {
+		return 0;
+	}
+	uint32_t count = returnConsumedRequested - offset;
+	if (count > maxSamples) {
+		count = maxSamples;
+	}
+	for (uint32_t i = 0; i < count; i++) {
+		const uint32_t at = offset + i;
+		// Past what arrived, silence - the frames the return did not have, held open so the recording stays in
+		// time with everything recorded beside it.
+		if (at >= returnConsumedFrames) {
+			dst[i].l = 0;
+			dst[i].r = 0;
+			continue;
+		}
+		const int16_t* const frame = &rxRing[((returnConsumedFrom + at) & kRxRingMask) * kRxChannels];
+		// The track's own scale, not the master's: a recording of a USB input should be the same file a jack at
+		// the same level would have written.
+		dst[i].l = returnToTrackScale(frame[chL]);
+		dst[i].r = returnToTrackScale(frame[chR]);
+	}
+	return count;
 }
 
 bool USBAudioStream::readReturnPair(uint32_t pair, StereoSample* buffer, uint32_t numSamples, int32_t amplitudeStart,

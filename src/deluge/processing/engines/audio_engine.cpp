@@ -1330,6 +1330,29 @@ bool doSomeOutputting() {
 				recorder->feedAudio(outputBufferForResampling.first(numSamplesOutputted));
 			}
 
+			// Recording a USB return channel or pair, taken as a track's input.
+			//
+			// Fed here, beside the other sources and from the batch feedMix() just consumed above, so the file
+			// holds exactly the frames that were audible in the same pass - no pointer of its own to drift and no
+			// latency of its own to compensate for. Taken in pieces because a whole pass would be 2 KB of stack.
+			else if (isUsbReturnInput(recorder->mode)) {
+				const uint32_t monoChannel = usbReturnMonoChannelOf(recorder->mode);
+				const uint32_t chL =
+				    (monoChannel != 0) ? (monoChannel - 1) : ((usbReturnPairOf(recorder->mode) - 1) * 2);
+				const uint32_t chR = (monoChannel != 0) ? chL : (chL + 1);
+				StereoSample chunk[64];
+				const uint32_t owed = deluge::processing::engines::USBAudioStream::consumedReturnFrames();
+				for (uint32_t at = 0; at < owed;) {
+					const uint32_t got = deluge::processing::engines::USBAudioStream::readConsumedReturn(
+					    chL, chR, chunk, at, std::size(chunk));
+					if (got == 0) {
+						break;
+					}
+					recorder->feedAudio({chunk, got});
+					at += got;
+				}
+			}
+
 			// Recording from an input source
 			else if (recorder->mode < AUDIO_INPUT_CHANNEL_FIRST_INTERNAL_OPTION) {
 

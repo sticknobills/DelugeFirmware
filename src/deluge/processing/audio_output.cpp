@@ -420,10 +420,7 @@ Clip* AudioOutput::createNewClipForArrangementRecording(ModelStack* modelStack) 
 }
 
 bool AudioOutput::wantsToBeginArrangementRecording() {
-	// A USB pair can be monitored but not yet recorded: the recorder is fed from the I2S receive buffer or from
-	// the finished mix, and the return ring is neither. Offering it would write a silent file.
-	return (inputChannel > AudioInputChannel::NONE && !isUsbReturnInput(inputChannel)
-	        && Output::wantsToBeginArrangementRecording());
+	return (inputChannel > AudioInputChannel::NONE && Output::wantsToBeginArrangementRecording());
 }
 
 bool AudioOutput::setActiveClip(ModelStackWithTimelineCounter* modelStack, PgmChangeSend maySendMIDIPGMs) {

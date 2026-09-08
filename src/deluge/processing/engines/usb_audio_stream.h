@@ -140,6 +140,20 @@ public:
 	/// How many channels the return carries.
 	static uint32_t numReturnChannels();
 
+	/// How many frames the last output pass took off the return, which is what a recorder owes this pass.
+	///
+	/// The count a recording must consume to stay in time, not the count that arrived - a return that ran dry
+	/// still owes the recording that many frames, as silence.
+	static uint32_t consumedReturnFrames();
+
+	/// Copies part of that batch out, converted to the scale a track input records at.
+	///
+	/// chL and chR are 0-based; naming the same one twice gives mono on both sides. offset walks the batch so the
+	/// caller can take it in pieces rather than standing a whole window on the stack. Returns how many were
+	/// written, zero when the batch is exhausted.
+	static uint32_t readConsumedReturn(uint32_t chL, uint32_t chR, StereoSample* dst, uint32_t offset,
+	                                   uint32_t maxSamples);
+
 	/// Largest magnitude any stem has reached since the last read, at capture scale and therefore before the
 	/// width reduction that would clip it. The instrument the trim is set from.
 	static int32_t readAndClearStemPeak();
