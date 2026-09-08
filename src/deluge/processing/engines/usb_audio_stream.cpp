@@ -1462,7 +1462,8 @@ uint32_t statReportCountdown = 0;
 /// and submit both sit inside service.
 PathCost costTimer = {};       ///< the whole write-timer interrupt, every branch including the ones that do nothing
 PathCost costFifoWrite = {};   ///< the FIFO copy alone, nested inside costTimer
-PathCost costReturnMix = {};   ///< summing the return into the song's mix, the only cost stage B adds to the render
+PathCost costReturnMix = {};   ///< the master's pair summed into the song's mix, at unity through the fast run loop
+PathCost costReturnTrack = {}; ///< a track reading the return as its own input, through the general per-sample loop
 PathCost costService = {};     ///< all of service(), which the audio task is billed for and direness is read from
 PathCost costBuild = {};       ///< buildQueuedPackets, ring memcpy included, nested inside costService
 PathCost costSubmit = {};      ///< the driver's own submit path, nested inside costService
@@ -1853,7 +1854,11 @@ void addReturnChannelsInto(uint32_t chL, uint32_t chR, StereoSample* buffer, uin
 			buffer[i].r += (int32_t)(((int64_t)right * fade) >> 16);
 		}
 	}
-	addCost(costReturnMix, start);
+	// Which counter this lands in is the caller, not the loop: unity is the master summing into the song's mix,
+	// anything else is a track reading the return as its own input. One counter for both could not say which
+	// consumer was live, and a track claiming the pair takes it off the master - so the two never run together
+	// on one pair and the totals were indistinguishable.
+	addCost(unity ? costReturnMix : costReturnTrack, start);
 }
 
 /// Sums the master's pair into the song, unless a track has taken it.
@@ -3114,6 +3119,16 @@ void reportStats() {
 		emitDec(statReturnRendered);
 		emit(" out");
 		emitDec(statReturnOutputted);
+		// Where the return is actually going, so an arm's configuration is read off the machine rather than
+		// remembered: rmp is the pair the master is summing, zero for none, and rcl is the mask of pairs a track
+		// took this window. Nothing else on any line reports either, so a capture could not say which consumer
+		// was live - which is what made two arms of a cost measurement indistinguishable on 2026-09-08. rmp is
+		// what is set; rcl is what actually happened, and a track whose monitoring conditions are not met shows
+		// the first without the second. Adds 19 bytes worst case to a line measured at 226 of 640.
+		emit(" rmp");
+		emitDec(masterReturnPair);
+		emit(" rcl");
+		emitDec(returnPairsClaimed);
 		*p = '\0';
 		Debug::sysexDebugPrint(*Debug::midiDebugCable, rxLine, true);
 	}
@@ -3316,6 +3331,9 @@ void reportStats() {
 			emitCost(" clr:", costStemClear);
 			// Never printed until now: stage B's only addition to the render path, and B6 has to price it.
 			emitCost(" rtn:", costReturnMix);
+			// The track half, beside the master half. Same loop, different caller, and the two never run together
+			// on one pair - so a capture that cannot tell them apart cannot say which consumer it measured.
+			emitCost(" rtk:", costReturnTrack);
 			// The receive half, beside the mix half. rtn is inside the render and on the deadline; drn is in the
 			// task and deliberately is not, which is why they want reading apart rather than summed.
 			emitCost(" drn:", costReturnDrain);
@@ -3327,6 +3345,7 @@ void reportStats() {
 		costIntervalStart = live1;
 		costTimer = PathCost{};
 		costReturnMix = PathCost{};
+		costReturnTrack = PathCost{};
 		costReturnDrain = PathCost{};
 		costFifoWrite = PathCost{};
 		costService = PathCost{};
