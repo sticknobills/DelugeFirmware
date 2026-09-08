@@ -1950,14 +1950,13 @@ PLACE_SDRAM_BSS menu_item::Submenu soundEditorRootMenuKitGlobalFX{
     },
 };
 
-// USB audio, machine-wide. The trim is here rather than on a clip because it describes the gain staging of what
-// is on the other end of the cable, not anything about the song.
-PLACE_SDRAM_BSS usb_audio::Level usbAudioLevelMenu{STRING_FOR_USB_LEVEL, STRING_FOR_USB_LEVEL};
-
-// The return, host to device. Audio arriving on the cable is summed into the song immediately after every track
-// has summed, so it meets the whole song chain exactly as the Deluge's own audio does.
+// USB audio, machine-wide. The return, host to device: audio arriving on the cable is summed into the song
+// immediately after every track has summed, so it meets the whole song chain exactly as the Deluge's own audio
+// does. Machine-wide rather than per-song because both of these describe what is on the other end of the cable.
+//
+// The outgoing trim used to sit here as well. It is a fixed gain now - a user should not be gain-staging their
+// own stems, and having it here made the return's level move when it was touched.
 PLACE_SDRAM_BSS usb_audio::ReturnPair usbAudioReturnMenu{STRING_FOR_USB_RETURN, STRING_FOR_USB_RETURN};
-PLACE_SDRAM_BSS usb_audio::ReclaimToggle usbAudioReclaimMenu{STRING_FOR_USB_RECLAIM, STRING_FOR_USB_RECLAIM};
 PLACE_SDRAM_BSS usb_audio::ReturnLevel usbAudioReturnLevelMenu{STRING_FOR_USB_RETURN_LEVEL,
                                                                STRING_FOR_USB_RETURN_LEVEL};
 
@@ -1965,10 +1964,8 @@ PLACE_SDRAM_BSS Submenu usbAudioSettingsMenu{
     STRING_FOR_USB_ROUTING,
     STRING_FOR_USB_ROUTING,
     {
-        &usbAudioLevelMenu,
         &usbAudioReturnMenu,
         &usbAudioReturnLevelMenu,
-        &usbAudioReclaimMenu,
     },
 };
 

@@ -195,11 +195,14 @@ enum Entries {
 197: screensaverTimeoutMinutes
 198: reserved for the AUX sends stereo-split flag, which lives on a sibling branch - taken here it would
      collide the moment the two features merge
-199: usbAudioTrim + 1, so that a virgin byte of zero reads as "never written" and takes the default
-200: usbAudioReturnLevel + 1, offset for the same reason
+199: retired 2026-09-08. Held the USB output trim, which is a fixed gain now rather than a control.
+200: retired 2026-09-08. Held the USB return level on a ladder whose top was unity; the replacement puts
+     unity at 40 with headroom above, so the same number no longer means the same gain. A new byte rather
+     than a reinterpreted one, because nothing stored says which scheme wrote it.
 201: which returning pair feeds the song's own mix - 0 means never written, 1 none, 2 pair 1-2,
      3 pair 3-4. The 1/2 encoding is what the earlier on/off control wrote, so a unit that saved under that
      firmware comes back to the same behaviour.
+202: usbAudioReturnLevel + 1, so that a virgin byte of zero reads as "never written" and takes the default
 */
 
 uint8_t defaultScale;
@@ -246,7 +249,6 @@ bool highCPUUsageIndicator;
 uint8_t defaultHoldTime;
 ScreensaverMode screensaverMode;
 uint8_t screensaverTimeoutMinutes;
-uint8_t usbAudioTrim;
 uint8_t usbAudioReturnPair;
 uint8_t usbAudioReturnLevel;
 int32_t holdTime;
@@ -367,7 +369,6 @@ void resetSettings() {
 
 	screensaverMode = kDefaultScreensaverMode;
 	screensaverTimeoutMinutes = kDefaultScreensaverTimeoutMinutes;
-	usbAudioTrim = deluge::processing::engines::USBAudioStream::kTrimDefault;
 	usbAudioReturnPair = 1;
 	usbAudioReturnLevel = deluge::processing::engines::USBAudioStream::kReturnLevelDefault;
 
@@ -834,13 +835,7 @@ void readSettings() {
 	// Stored offset by one: the default is not zero, and writeSettings() clears the whole buffer first, so a unit
 	// that has never saved under this firmware is indistinguishable from one that deliberately chose zero unless
 	// the stored value carries its own "written" signal.
-	const uint8_t storedTrim = buffer[199];
-	usbAudioTrim = (storedTrim == 0 || storedTrim > deluge::processing::engines::USBAudioStream::kTrimMax + 1)
-	                   ? (uint8_t)deluge::processing::engines::USBAudioStream::kTrimDefault
-	                   : (uint8_t)(storedTrim - 1);
-	deluge::processing::engines::USBAudioStream::setTrim(usbAudioTrim);
-
-	const uint8_t storedReturnLevel = buffer[200];
+	const uint8_t storedReturnLevel = buffer[202];
 	usbAudioReturnLevel =
 	    (storedReturnLevel == 0 || storedReturnLevel > deluge::processing::engines::USBAudioStream::kReturnLevelMax + 1)
 	        ? (uint8_t)deluge::processing::engines::USBAudioStream::kReturnLevelDefault
@@ -1088,9 +1083,8 @@ void writeSettings() {
 
 	buffer[196] = util::to_underlying(screensaverMode);
 	buffer[197] = screensaverTimeoutMinutes;
-	buffer[199] = (uint8_t)(usbAudioTrim + 1);
-	buffer[200] = (uint8_t)(usbAudioReturnLevel + 1);
 	buffer[201] = (uint8_t)(usbAudioReturnPair + 1);
+	buffer[202] = (uint8_t)(usbAudioReturnLevel + 1);
 
 	R_SFLASH_EraseSector(0x80000 - 0x1000, SPIBSC_CH, SPIBSC_CMNCR_BSZ_SINGLE, 1, SPIBSC_OUTPUT_ADDR_24);
 	R_SFLASH_ByteProgram(0x80000 - 0x1000, buffer.data(), 256, SPIBSC_CH, SPIBSC_CMNCR_BSZ_SINGLE, SPIBSC_1BIT,

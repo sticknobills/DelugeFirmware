@@ -99,49 +99,6 @@ public:
 	}
 };
 
-/// Trim applied to every USB channel, 0-50, 1.2 dB a step.
-///
-/// Per-machine rather than per-song: it describes the gain staging of whatever is on the other end of the cable.
-/// It exists because a track is captured before the master compressor and so runs about three times hotter than
-/// the mix, clipping where the mix does not.
-class Level final : public Integer {
-public:
-	using Integer::Integer;
-
-	[[nodiscard]] int32_t getMinValue() const override { return 0; }
-	[[nodiscard]] int32_t getMaxValue() const override {
-		return (int32_t)deluge::processing::engines::USBAudioStream::kTrimMax;
-	}
-
-	void readCurrentValue() override {
-		this->setValue((int32_t)deluge::processing::engines::USBAudioStream::getTrim());
-	}
-
-	void writeCurrentValue() override {
-		deluge::processing::engines::USBAudioStream::setTrim((uint32_t)this->getValue());
-		FlashStorage::usbAudioTrim = (uint8_t)this->getValue();
-	}
-};
-
-/// Whether audio arriving on the cable is summed into the song at all.
-///
-/// Per-machine rather than per-song, for the same reason the trim is: it describes what is connected, not what is
-/// being played. Off is the state a machine with nothing plugged in should be indistinguishable from.
-/// DIAGNOSTIC A/B for the 2026-09-06 return-pipe fault. On restores the pre-fix behaviour; off is the fix.
-/// Not saved to flash on purpose - it comes back off at every boot, so a session cannot inherit it by accident.
-class ReclaimToggle final : public Toggle {
-public:
-	using Toggle::Toggle;
-
-	void readCurrentValue() override {
-		this->setValue(deluge::processing::engines::USBAudioStream::getReturnReclaimAllowed());
-	}
-
-	void writeCurrentValue() override {
-		deluge::processing::engines::USBAudioStream::setReturnReclaimAllowed(this->getValue());
-	}
-};
-
 /// Which returning pair is summed into the song's own mix: none, 1-2, or 3-4.
 ///
 /// One pair at a time, decided 2026-09-08. The other stays available to a track, and a pair a track has taken is
@@ -165,11 +122,10 @@ public:
 	}
 };
 
-/// Level applied to the returning audio, 0-50, 1.2 dB a step.
+/// Level applied to the returning audio, 0-50, 1.2 dB a step. Zero is silence, 40 is unity, 50 is 12 dB up.
 ///
-/// The default is unity against the outgoing trim's own inverse, so a device that hands back what it was given is
-/// nominally level-transparent. Nominally: the measured unity round trip is its own step, and this is how a rig
-/// disagrees until then.
+/// Per-machine rather than per-song: it describes the gain staging of whatever is on the other end of the cable
+/// rather than anything about what is being played.
 class ReturnLevel final : public Integer {
 public:
 	using Integer::Integer;

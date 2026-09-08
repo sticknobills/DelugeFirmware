@@ -91,19 +91,6 @@ public:
 	static void costEngineRoutine(uint32_t start);
 	static void costOutputLoop(uint32_t start);
 
-	/// Trim applied to every stem on the way to 16 bit, 0-50, 1.2 dB a step.
-	///
-	/// A stem is captured before the master compressor, so it runs about three times hotter than the mix and
-	/// clips where the mix does not. This is the one control that fixes that, and it is per-machine rather than
-	/// per-song because it describes the gain staging of whatever is on the other end of the cable.
-	static constexpr uint32_t kTrimMax = 50;
-	/// Set from measurement, 2026-08-30: at unity the reference song's stems peak 1.8x past full scale, and at 36
-	/// they peaked at 10,498 of 32,767 - a third of the range in use and about 10 dB thrown away. 40 lands them
-	/// near 18,000, which keeps roughly 5 dB for a song hotter than that one.
-	static constexpr uint32_t kTrimDefault = 40;
-	static void setTrim(uint32_t trim);
-	static uint32_t getTrim();
-
 	/// Sums one render window of returning audio into the song's mix.
 	///
 	/// Called immediately after every track has summed and before anything song-level, so the return gets the
@@ -112,13 +99,15 @@ public:
 	/// separate instrument. Costs nothing when no host is sending.
 	static void mixReturn(StereoSample* buffer, uint32_t numSamples);
 
-	/// Level applied to the returning audio, 0-50, 1.2 dB a step, and whether it is summed in at all.
+	/// Level applied to the returning audio, 0-50, 1.2 dB a step. Zero is silence.
 	///
-	/// The default is unity against the outgoing trim's own inverse, so a device that returns what it was given
-	/// is nominally level-transparent. Nominally: the measured unity round trip is B3.5, and this is how a rig
-	/// disagrees until then.
+	/// Unity sits at 40 rather than at the top, so the control can lift a quiet source by up to 12 dB as well as
+	/// hold back a loud one - a control whose maximum is unity can only ever attenuate, which is what it did
+	/// before 2026-09-08. At unity a device that hands back what it was given is nominally level-transparent;
+	/// nominally, because the measured unity round trip is B3.5 and this is how a rig disagrees until then.
 	static constexpr uint32_t kReturnLevelMax = 50;
-	static constexpr uint32_t kReturnLevelDefault = 50;
+	static constexpr uint32_t kReturnLevelUnity = 40;
+	static constexpr uint32_t kReturnLevelDefault = kReturnLevelUnity;
 	static void setReturnLevel(uint32_t level);
 	static uint32_t getReturnLevel();
 
@@ -150,15 +139,6 @@ public:
 
 	/// How many channels the return carries.
 	static uint32_t numReturnChannels();
-
-	/// DIAGNOSTIC A/B, not a user control. On restores the behaviour the 2026-09-06 fix removed: the vendor's
-	/// ready-interrupt handler is allowed to take the return pipe back from the DMA controller, which NAKs it once
-	/// per MIDI packet that arrives. Off is the fixed behaviour and the default on every boot.
-	///
-	/// Exists because comparing the two costs a flash cycle otherwise, and this fault has already spent five of
-	/// them. Deliberately not saved to flash: a diagnostic that survives a reboot is a trap for the next session.
-	static void setReturnReclaimAllowed(bool allowed);
-	static bool getReturnReclaimAllowed();
 
 	/// Largest magnitude any stem has reached since the last read, at capture scale and therefore before the
 	/// width reduction that would clip it. The instrument the trim is set from.

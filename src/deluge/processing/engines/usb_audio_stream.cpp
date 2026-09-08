@@ -354,10 +354,26 @@ int16_t nextRegTraceWord() {
 /// vector registers. Sharing a channel is legal and costs the difference, but only on channels actually shared.
 uint16_t channelsWritten = 0;
 
-/// Trim applied to every stem on the way to 16 bit. Held as a multiplier so the hot path is one multiply and a
-/// shift rather than a table lookup or a branch.
-uint32_t stemTrimSetting = deluge::processing::engines::USBAudioStream::kTrimDefault;
-int32_t stemTrimMultiplier = 1 << 24;
+/// One step of the 1.2 dB ladder the AUX send levels use, as a Q16 factor. 57139/65536 is 0.8719, and its
+/// reciprocal 75167/65536 is the step back up.
+constexpr int64_t kLadderDown = 57139;
+constexpr int64_t kLadderUp = 75167;
+
+/// The fixed conversion from the mix's own scale to the 16 bits on the cable, as a multiplier over 2^24.
+///
+/// Was a user control set to 40 of 50 on this ladder, which is where measurement put it: at unity the reference
+/// song's stems peak 1.8x past full scale, and at 40 they land near 18,000 of 32,767, keeping about 5 dB for a
+/// song hotter than that one. Derived here rather than written as 4258402 so the number stays checkable against
+/// the setting it came from.
+constexpr int32_t computeStemTrimMultiplier(uint32_t steps) {
+	int64_t multiplier = 1 << 24;
+	for (uint32_t step = steps; step < 50u; step++) {
+		multiplier = (multiplier * kLadderDown) >> 16;
+	}
+	return (int32_t)multiplier;
+}
+constexpr int32_t stemTrimMultiplier = computeStemTrimMultiplier(40);
+static_assert(stemTrimMultiplier == 4258402, "the fixed gain must be what a trim of 40 gave");
 
 /// The loudest thing any stem has carried since it was last read, at capture scale.
 ///
@@ -759,10 +775,6 @@ uint16_t readRxDmaStatus() {
 
 bool rxDmaRunning = false;
 
-/// DIAGNOSTIC A/B. When true the vendor handler is allowed to reclaim the return pipe, which is what it did
-/// before 2026-09-06. Off on every boot; see the header.
-bool returnReclaimAllowed = false;
-
 /// Keeps the flag the vendor handler reads in step with both of the things that decide it.
 void refreshReturnPipeGuard();
 /// Invalidate a range in *every* cache between the CPU and memory, so a read sees what the controller wrote.
@@ -908,7 +920,7 @@ void armReturnTransfer() {
 }
 
 void refreshReturnPipeGuard() {
-	usbReturnPipeUnderDma = (rxDmaRunning && !returnReclaimAllowed) ? 1u : 0u;
+	usbReturnPipeUnderDma = rxDmaRunning ? 1u : 0u;
 }
 
 /// Hands the return pipe to the DMA controller and stops servicing it from the interrupt.
@@ -1585,24 +1597,36 @@ constexpr int32_t kReturnFadeFull = 1 << 16;
 constexpr int32_t kReturnFadeStep = kReturnFadeFull / 128;
 int32_t returnFade = 0;
 
+/// The multiplier at which a full-scale arriving sample lands at the mix's own full scale.
+///
+/// The outgoing conversion's exact inverse, which is what makes a device that hands back what it was given
+/// nominally level-transparent. Derived from that conversion rather than measured separately, so the two cannot
+/// drift apart - but it is a constant now rather than a control's inverse, which is what stops the outgoing gain
+/// from moving the incoming one.
+constexpr int32_t kReturnUnityMultiplier =
+    (int32_t)(((uint64_t)1u << (24u + kReturnMultiplierBits)) / (uint64_t)(uint32_t)stemTrimMultiplier);
+
 void recomputeReturnMultiplier() {
 	// Not gated on where the return is going: the multiplier is a pure gain, and a track may be reading a pair
 	// while the master is set to none. Who reads is decided at the read sites.
-	if (stemTrimMultiplier <= 0 || returnLevelSetting == 0) {
+	if (returnLevelSetting == 0) {
 		returnMultiplierQ16 = 0;
 		returnSaturationFree = true;
 		return;
 	}
-	// The trim's own inverse: the outgoing side multiplied by trimMultiplier / 2^24.
-	const uint32_t trimInverse =
-	    (uint32_t)(((uint64_t)1u << (24u + kReturnMultiplierBits)) / (uint32_t)stemTrimMultiplier);
-	// Then the user's level, built on the same 1.2 dB ladder as the trim so the two controls feel alike.
-	int32_t levelMultiplier = 1 << 24;
-	for (uint32_t step = returnLevelSetting; step < deluge::processing::engines::USBAudioStream::kReturnLevelMax;
+	// The same 1.2 dB ladder as everything else here, but unity sits below the top rather than at it, so the
+	// control can lift a quiet source as well as hold back a loud one. A control whose maximum is unity can only
+	// ever attenuate, which is the hole this fills.
+	int64_t multiplier = kReturnUnityMultiplier;
+	for (uint32_t step = returnLevelSetting; step < deluge::processing::engines::USBAudioStream::kReturnLevelUnity;
 	     step++) {
-		levelMultiplier = (int32_t)(((int64_t)levelMultiplier * 57139) >> 16);
+		multiplier = (multiplier * kLadderDown) >> 16;
 	}
-	returnMultiplierQ16 = (int32_t)(((int64_t)trimInverse * levelMultiplier) >> 24);
+	for (uint32_t step = deluge::processing::engines::USBAudioStream::kReturnLevelUnity; step < returnLevelSetting;
+	     step++) {
+		multiplier = (multiplier * kLadderUp) >> 16;
+	}
+	returnMultiplierQ16 = (int32_t)multiplier;
 	returnSaturationFree = returnMultiplierQ16 < kReturnSaturationFreeMax;
 }
 
@@ -2589,11 +2613,10 @@ void reportStemPeak() {
 	const int32_t peak = deluge::processing::engines::USBAudioStream::readAndClearStemPeak();
 	put("SP pk");
 	// The same scale a channel reaches the host on, but deliberately NOT through the saturating conversion: a
-	// figure that pins at 32767 cannot say how far past 32767 it is, which is the only question the trim needs
-	// answered. Anything above 32767 here is what the trim has to bring down.
+	// figure that pins at 32767 cannot say how far past 32767 it is, which is the only question the fixed gain
+	// needs answered. Anything above 32767 here is what that gain has to bring down, and the instrument that says
+	// whether it still does on a song hotter than the one it was set from.
 	putNumber((uint32_t)((peak >> 9) < 0 ? 0 : (peak >> 9)));
-	put(" tr");
-	putNumber(deluge::processing::engines::USBAudioStream::getTrim());
 	line[at] = 0;
 	Debug::sysexDebugPrint(*Debug::midiDebugCable, line, true);
 }
@@ -4129,40 +4152,6 @@ bool USBAudioStream::readReturnChannel(uint32_t channel, StereoSample* buffer, u
 	const uint32_t ch = channel - 1u;
 	addReturnChannelsInto(ch, ch, buffer, numSamples, &amplitudeStart, &amplitudeEnd);
 	return true;
-}
-
-void USBAudioStream::setReturnReclaimAllowed(bool allowed) {
-	returnReclaimAllowed = allowed;
-	refreshReturnPipeGuard();
-}
-
-bool USBAudioStream::getReturnReclaimAllowed() {
-	return returnReclaimAllowed;
-}
-
-void USBAudioStream::setTrim(uint32_t trim) {
-	if (trim > kTrimMax) {
-		trim = kTrimMax;
-	}
-	stemTrimSetting = trim;
-	// 1.2 dB a step, the same ladder the AUX send levels use, so the two features feel like one control when they
-	// merge. Full scale at the top, silence at the bottom.
-	if (trim == 0) {
-		stemTrimMultiplier = 0;
-		return;
-	}
-	int32_t multiplier = 1 << 24;
-	for (uint32_t step = trim; step < kTrimMax; step++) {
-		// 1.2 dB is a factor of 0.871. 57139/65536 to stay in integers.
-		multiplier = (int32_t)(((int64_t)multiplier * 57139) >> 16);
-	}
-	stemTrimMultiplier = multiplier;
-	// The return's conversion is this one's inverse, so the two cannot be set independently.
-	recomputeReturnMultiplier();
-}
-
-uint32_t USBAudioStream::getTrim() {
-	return stemTrimSetting;
 }
 
 int32_t USBAudioStream::readAndClearStemPeak() {

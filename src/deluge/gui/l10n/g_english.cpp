@@ -1019,10 +1019,8 @@ PLACE_SDRAM_DATA Language english{
         {STRING_FOR_USB_PAIR_56, "USB Pair 5-6"},
         {STRING_FOR_USB_PAIR_78, "USB Pair 7-8"},
         {STRING_FOR_USB_MAIN, "Main Mix"},
-        {STRING_FOR_USB_LEVEL, "USB Level"},
         {STRING_FOR_USB_RETURN, "USB Return"},
         {STRING_FOR_USB_RETURN_LEVEL, "Return Level"},
-        {STRING_FOR_USB_RECLAIM, "Diagnostic: allow pipe reclaim"},
         {STRING_FOR_USB_INPUT, "USB"},
     },
 };
