@@ -864,18 +864,40 @@ enum class AudioInputChannel {
 	// Audio arriving over the USB cable. Placed past the internal options rather than beside the line inputs
 	// because everything below AUDIO_INPUT_CHANNEL_FIRST_INTERNAL_OPTION means "read the I2S receive buffer" -
 	// lag compensation, the line-in-plugged check, the recorder's source pointer. None of that applies here.
+	//
+	// Kept in the order the USB submenu lists them, so the menu and the enum cannot drift apart.
+	USB_1,
+	USB_2,
+	USB_3,
+	USB_4,
 	USB_1_2,
 	USB_3_4,
 };
 
 constexpr AudioInputChannel AUDIO_INPUT_CHANNEL_FIRST_INTERNAL_OPTION = AudioInputChannel::MIX;
 
-/// Whether this input is one of the USB return pairs.
+/// Whether this input is one of the USB return channels or pairs.
 constexpr bool isUsbReturnInput(AudioInputChannel channel) {
-	return channel == AudioInputChannel::USB_1_2 || channel == AudioInputChannel::USB_3_4;
+	return channel >= AudioInputChannel::USB_1 && channel <= AudioInputChannel::USB_3_4;
 }
 
-/// Which return pair an input names, 1-based. Zero for anything that is not a USB input.
+/// Which single return channel an input names, 1-based. Zero for a pair, and for anything that is not USB.
+constexpr uint32_t usbReturnMonoChannelOf(AudioInputChannel channel) {
+	switch (channel) {
+	case AudioInputChannel::USB_1:
+		return 1;
+	case AudioInputChannel::USB_2:
+		return 2;
+	case AudioInputChannel::USB_3:
+		return 3;
+	case AudioInputChannel::USB_4:
+		return 4;
+	default:
+		return 0;
+	}
+}
+
+/// Which return pair an input names, 1-based. Zero for a single channel, and for anything that is not USB.
 constexpr uint32_t usbReturnPairOf(AudioInputChannel channel) {
 	switch (channel) {
 	case AudioInputChannel::USB_1_2:

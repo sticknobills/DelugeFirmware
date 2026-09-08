@@ -142,6 +142,15 @@ public:
 	static bool readReturnPair(uint32_t pair, StereoSample* buffer, uint32_t numSamples, int32_t amplitudeStart,
 	                           int32_t amplitudeEnd);
 
+	/// The same, for one arriving channel on its own. channel is 1-based and lands equally on both sides, the way
+	/// a single line input does. It takes its whole pair off the master: the master sums pairs, and leaving it the
+	/// other side would put that channel in the song twice.
+	static bool readReturnChannel(uint32_t channel, StereoSample* buffer, uint32_t numSamples, int32_t amplitudeStart,
+	                              int32_t amplitudeEnd);
+
+	/// How many channels the return carries.
+	static uint32_t numReturnChannels();
+
 	/// DIAGNOSTIC A/B, not a user control. On restores the behaviour the 2026-09-06 fix removed: the vendor's
 	/// ready-interrupt handler is allowed to take the return pipe back from the DMA controller, which NAKs it once
 	/// per MIDI packet that arrives. Off is the fixed behaviour and the default on every boot.

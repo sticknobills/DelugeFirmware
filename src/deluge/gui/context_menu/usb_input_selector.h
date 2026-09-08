@@ -1,5 +1,5 @@
 /*
- * Copyright © 2019-2023 Synthstrom Audible Limited
+ * Copyright © 2026 Synthstrom Audible Limited
  *
  * This file is part of The Synthstrom Audible Deluge Firmware.
  *
@@ -22,26 +22,27 @@
 
 namespace deluge::gui::context_menu {
 
-class AudioInputSelector final : public ContextMenu {
+/// Which arriving USB channel or pair this track takes as its input.
+///
+/// A level below the input selector rather than six more entries in it: the four singles and two pairs would be
+/// most of that list, and the four inputs the machine has on jacks would be buried under the ones it has on one
+/// cable.
+class UsbInputSelector final : public ContextMenu {
 	enum class Value;
 
 public:
-	AudioInputSelector() = default;
-	bool getGreyoutColsAndRows(uint32_t* cols, uint32_t* rows) override;
+	UsbInputSelector() = default;
 	void selectEncoderAction(int8_t offset) override;
 	bool setupAndCheckAvailability() override;
-	bool acceptCurrentOption() override;
 	bool canSeeViewUnderneath() override { return true; }
-	ActionResult padAction(int32_t x, int32_t y, int32_t on) override;
-	void renderOLED(deluge::hid::display::oled_canvas::Canvas& canvas) override;
 	AudioOutput* audioOutput;
 
-	/// Title
-	char const* getTitle() override;
+	/// The channel this menu is entered on when the track has never had a USB input.
+	static AudioInputChannel defaultChannel();
 
-	/// Options
+	char const* getTitle() override;
 	std::span<const char*> getOptions() override;
 };
 
-extern AudioInputSelector audioInputSelector;
+extern UsbInputSelector usbInputSelector;
 } // namespace deluge::gui::context_menu

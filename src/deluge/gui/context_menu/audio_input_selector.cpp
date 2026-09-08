@@ -17,6 +17,7 @@
 
 #include "gui/context_menu/audio_input_selector.h"
 #include "definitions_cxx.hpp"
+#include "gui/context_menu/usb_input_selector.h"
 #include "gui/l10n/l10n.h"
 #include "gui/ui/root_ui.h"
 #include "gui/views/session_view.h"
@@ -36,10 +37,9 @@ enum class AudioInputSelector::Value {
 	MASTER,
 	OUTPUT,
 	TRACK,
-	USB_1_2,
-	USB_3_4,
+	USB,
 };
-constexpr size_t kNumValues = 10;
+constexpr size_t kNumValues = 9;
 
 AudioInputSelector audioInputSelector{};
 
@@ -81,8 +81,7 @@ std::span<const char*> AudioInputSelector::getOptions() {
 	static const char* options[] = {
 	    l10n::get(STRING_FOR_DISABLED),     l10n::get(STRING_FOR_LEFT_INPUT),     l10n::get(STRING_FOR_RIGHT_INPUT),
 	    l10n::get(STRING_FOR_STEREO_INPUT), l10n::get(STRING_FOR_BALANCED_INPUT), l10n::get(STRING_FOR_MIX_PRE_FX),
-	    l10n::get(STRING_FOR_MIX_POST_FX),  l10n::get(STRING_FOR_TRACK),          l10n::get(STRING_FOR_USB_IN_12),
-	    l10n::get(STRING_FOR_USB_IN_34),
+	    l10n::get(STRING_FOR_MIX_POST_FX),  l10n::get(STRING_FOR_TRACK),          l10n::get(STRING_FOR_USB_INPUT),
 	};
 	return {options, kNumValues};
 }
@@ -119,12 +118,13 @@ bool AudioInputSelector::setupAndCheckAvailability() {
 		valueOption = Value::TRACK;
 		break;
 
+	case AudioInputChannel::USB_1:
+	case AudioInputChannel::USB_2:
+	case AudioInputChannel::USB_3:
+	case AudioInputChannel::USB_4:
 	case AudioInputChannel::USB_1_2:
-		valueOption = Value::USB_1_2;
-		break;
-
 	case AudioInputChannel::USB_3_4:
-		valueOption = Value::USB_3_4;
+		valueOption = Value::USB;
 		break;
 
 	default:
@@ -150,7 +150,7 @@ void AudioInputSelector::selectEncoderAction(int8_t offset) {
 	ContextMenu::selectEncoderAction(offset);
 
 	auto valueOption = static_cast<Value>(currentOption);
-	if (display->haveOLED() && valueOption == Value::TRACK) {
+	if (display->haveOLED() && (valueOption == Value::TRACK || valueOption == Value::USB)) {
 		// Keep Track on the first visible row so the selected track name has room below it.
 		scrollPos = currentOption;
 	}
@@ -197,12 +197,12 @@ void AudioInputSelector::selectEncoderAction(int8_t offset) {
 		break;
 	}
 
-	case Value::USB_1_2:
-		audioOutput->inputChannel = AudioInputChannel::USB_1_2;
-		break;
-
-	case Value::USB_3_4:
-		audioOutput->inputChannel = AudioInputChannel::USB_3_4;
+	case Value::USB:
+		// Keep whichever channel the track already had, so scrolling past USB and back does not move it. Only a
+		// track that has never had one picks up the default.
+		if (!isUsbReturnInput(audioOutput->inputChannel)) {
+			audioOutput->inputChannel = UsbInputSelector::defaultChannel();
+		}
 		break;
 
 	default:
@@ -214,6 +214,22 @@ void AudioInputSelector::selectEncoderAction(int8_t offset) {
 	if (display->haveOLED()) {
 		renderUIsForOled();
 	}
+}
+
+/// Pressing SELECT on USB goes a level down rather than closing, which is what the arrow on that row means.
+///
+/// Every other row is its own answer and closing on it is correct - this is the only row that is a door.
+bool AudioInputSelector::acceptCurrentOption() {
+	if (static_cast<Value>(currentOption) != Value::USB) {
+		return false; // Closes, which is what every other row does.
+	}
+	usbInputSelector.audioOutput = audioOutput;
+	if (!usbInputSelector.setupAndCheckAvailability()) {
+		return false;
+	}
+	display->setNextTransitionDirection(1);
+	openUI(&usbInputSelector);
+	return true;
 }
 
 // if they're in session view and press a clip's pad, record from that output
@@ -247,13 +263,22 @@ ActionResult AudioInputSelector::padAction(int32_t x, int32_t y, int32_t on) {
 void AudioInputSelector::renderOLED(deluge::hid::display::oled_canvas::Canvas& canvas) {
 	ContextMenu::renderOLED(canvas);
 
-	if (audioOutput->inputChannel != AudioInputChannel::SPECIFIC_OUTPUT) {
+	if (audioOutput->inputChannel != AudioInputChannel::SPECIFIC_OUTPUT
+	    && !isUsbReturnInput(audioOutput->inputChannel)) {
 		return;
 	}
 
 	// Show the selected target in the context menu footer.
-	Output* recordFrom = getRecordableOutputInSong(audioOutput, audioOutput->getOutputRecordingFrom());
-	char const* trackName = recordFrom ? recordFrom->name.get() : "No track";
+	char const* trackName;
+	if (isUsbReturnInput(audioOutput->inputChannel)) {
+		// Which channel USB currently means, so the row is not a mystery until you open it.
+		trackName = usbInputSelector.getOptions()[static_cast<int32_t>(audioOutput->inputChannel)
+		                                          - static_cast<int32_t>(AudioInputChannel::USB_1)];
+	}
+	else {
+		Output* recordFrom = getRecordableOutputInSong(audioOutput, audioOutput->getOutputRecordingFrom());
+		trackName = recordFrom ? recordFrom->name.get() : "No track";
+	}
 
 	int32_t windowHeight = 40;
 	int32_t windowMinY = (OLED_MAIN_HEIGHT_PIXELS - windowHeight) >> 1;

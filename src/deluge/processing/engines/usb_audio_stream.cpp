@@ -1693,9 +1693,20 @@ void beginReturnWindow(uint32_t numSamples) {
 	}
 }
 
-/// Whether one pair is worth reading at all this window. False costs the caller nothing.
-bool returnPairReadable(uint32_t pair) {
-	return pair >= 1u && pair <= kRxPairs && (returnWindowStreaming || returnWindowFadeStart != 0);
+/// Takes one pair off the master for this window.
+///
+/// Claimed whether or not there is anything to read. A host that pauses for a moment must not hand the pair back
+/// to the master and take it again a window later - that is an audible bounce between two destinations, and the
+/// track asked for it either way.
+void claimReturnPair(uint32_t pair) {
+	if (pair >= 1u && pair <= kRxPairs) {
+		returnPairsClaimed |= 1u << (pair - 1u);
+	}
+}
+
+/// Whether the return is worth reading at all this window. False costs the caller nothing.
+bool returnReadable() {
+	return returnWindowStreaming || returnWindowFadeStart != 0;
 }
 
 /// One arriving sample at the scale a track's own render works in.
@@ -1709,22 +1720,21 @@ bool returnPairReadable(uint32_t pair) {
 	return (int32_t)sample << 16;
 }
 
-/// Adds one returning pair into a buffer.
+/// Adds two returning channels into a buffer, as the left and right of what the caller is building.
 ///
-/// pair is 1-based; its two channels are (pair - 1) * 2 and that plus one. amplitude is on the same scale
-/// AudioOutput uses for a monitored line input, and is applied per sample across the window so a moving fader
-/// does not step. Pass nullptr for it to add at the master's own scale and at unity, which is what the song's
-/// mix wants.
-void addReturnPairInto(uint32_t pair, StereoSample* buffer, uint32_t numSamples, const int32_t* amplitudeStart,
-                       const int32_t* amplitudeEnd) {
-	if (!returnPairReadable(pair)) {
+/// chL and chR are 0-based indices into an arriving frame, and naming the same one twice is how a single channel
+/// arrives as mono - it lands equally on both sides, the way a single line input does. amplitude is on the same
+/// scale AudioOutput uses for a monitored line input, and is applied per sample across the window so a moving
+/// fader does not step. Pass nullptr for it to add at the master's own scale and at unity, which is what the
+/// song's mix wants.
+void addReturnChannelsInto(uint32_t chL, uint32_t chR, StereoSample* buffer, uint32_t numSamples,
+                           const int32_t* amplitudeStart, const int32_t* amplitudeEnd) {
+	if (!returnReadable() || chL >= kRxChannels || chR >= kRxChannels) {
 		return;
 	}
 
 	const uint32_t start = costStart();
 	const uint32_t r = rxReadFrame;
-	const uint32_t chL = (pair - 1u) * 2u;
-	const uint32_t chR = (kRxChannels > chL + 1u) ? (chL + 1u) : chL;
 	const bool unity = (amplitudeStart == nullptr);
 
 	// The steady state, which is every window once a host has settled: a full window present, the fade already
@@ -1827,7 +1837,8 @@ void mixReturnInto(StereoSample* buffer, uint32_t numSamples) {
 	if ((returnPairsClaimed & (1u << (masterReturnPair - 1u))) != 0) {
 		return;
 	}
-	addReturnPairInto(masterReturnPair, buffer, numSamples, nullptr, nullptr);
+	const uint32_t chL = (masterReturnPair - 1u) * 2u;
+	addReturnChannelsInto(chL, chL + 1u, buffer, numSamples, nullptr, nullptr);
 }
 
 /// Advances the return by the number of samples that actually reached the codec.
@@ -4085,19 +4096,38 @@ uint32_t USBAudioStream::numReturnPairs() {
 	return kRxPairs;
 }
 
+uint32_t USBAudioStream::numReturnChannels() {
+	return kRxChannels;
+}
+
 bool USBAudioStream::readReturnPair(uint32_t pair, StereoSample* buffer, uint32_t numSamples, int32_t amplitudeStart,
                                     int32_t amplitudeEnd) {
 	if (buffer == nullptr || numSamples == 0 || pair == 0 || pair > kRxPairs) {
 		return false;
 	}
-	// Claimed whether or not there is anything to read this window. A host that pauses for a moment must not hand
-	// the pair back to the master and take it again a window later - that is an audible bounce between two
-	// destinations, and the track asked for it either way.
-	returnPairsClaimed |= 1u << (pair - 1u);
-	if (!returnPairReadable(pair)) {
+	claimReturnPair(pair);
+	if (!returnReadable()) {
 		return false;
 	}
-	addReturnPairInto(pair, buffer, numSamples, &amplitudeStart, &amplitudeEnd);
+	const uint32_t chL = (pair - 1u) * 2u;
+	addReturnChannelsInto(chL, chL + 1u, buffer, numSamples, &amplitudeStart, &amplitudeEnd);
+	return true;
+}
+
+bool USBAudioStream::readReturnChannel(uint32_t channel, StereoSample* buffer, uint32_t numSamples,
+                                       int32_t amplitudeStart, int32_t amplitudeEnd) {
+	if (buffer == nullptr || numSamples == 0 || channel == 0 || channel > kRxChannels) {
+		return false;
+	}
+	// A single channel takes its whole pair off the master, not half of it. The master sums pairs and there is no
+	// way to hand it one side; leaving it the other would put that channel in the song twice, which is the
+	// doubling the pair rule exists to prevent.
+	claimReturnPair(((channel - 1u) / 2u) + 1u);
+	if (!returnReadable()) {
+		return false;
+	}
+	const uint32_t ch = channel - 1u;
+	addReturnChannelsInto(ch, ch, buffer, numSamples, &amplitudeStart, &amplitudeEnd);
 	return true;
 }
 

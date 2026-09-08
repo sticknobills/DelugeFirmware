@@ -216,8 +216,18 @@ renderEnvelope:
 	if (modeAllowsMonitoring() && modelStack->song->isOutputActiveInArrangement(this)
 	    && isUsbReturnInput(inputChannel)) {
 		rendered = true;
-		deluge::processing::engines::USBAudioStream::readReturnPair(
-		    usbReturnPairOf(inputChannel), output.data(), (uint32_t)output.size(), amplitudeAtStart, amplitudeAtEnd);
+		// A single channel arrives as mono, equally on both sides, the way one line input does; a pair arrives as
+		// left and right.
+		const uint32_t monoChannel = usbReturnMonoChannelOf(inputChannel);
+		if (monoChannel != 0) {
+			deluge::processing::engines::USBAudioStream::readReturnChannel(
+			    monoChannel, output.data(), (uint32_t)output.size(), amplitudeAtStart, amplitudeAtEnd);
+		}
+		else {
+			deluge::processing::engines::USBAudioStream::readReturnPair(usbReturnPairOf(inputChannel), output.data(),
+			                                                            (uint32_t)output.size(), amplitudeAtStart,
+			                                                            amplitudeAtEnd);
+		}
 	}
 
 	// add in the monitored audio if in sampler or looper mode
