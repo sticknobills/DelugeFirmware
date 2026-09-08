@@ -861,9 +861,31 @@ enum class AudioInputChannel {
 	OUTPUT,
 	SPECIFIC_OUTPUT,
 	OFFLINE_OUTPUT, // special output only used with offline stem exporting
+	// Audio arriving over the USB cable. Placed past the internal options rather than beside the line inputs
+	// because everything below AUDIO_INPUT_CHANNEL_FIRST_INTERNAL_OPTION means "read the I2S receive buffer" -
+	// lag compensation, the line-in-plugged check, the recorder's source pointer. None of that applies here.
+	USB_1_2,
+	USB_3_4,
 };
 
 constexpr AudioInputChannel AUDIO_INPUT_CHANNEL_FIRST_INTERNAL_OPTION = AudioInputChannel::MIX;
+
+/// Whether this input is one of the USB return pairs.
+constexpr bool isUsbReturnInput(AudioInputChannel channel) {
+	return channel == AudioInputChannel::USB_1_2 || channel == AudioInputChannel::USB_3_4;
+}
+
+/// Which return pair an input names, 1-based. Zero for anything that is not a USB input.
+constexpr uint32_t usbReturnPairOf(AudioInputChannel channel) {
+	switch (channel) {
+	case AudioInputChannel::USB_1_2:
+		return 1;
+	case AudioInputChannel::USB_3_4:
+		return 2;
+	default:
+		return 0;
+	}
+}
 
 enum class ActionResult {
 	DEALT_WITH,

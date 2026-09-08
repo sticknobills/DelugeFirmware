@@ -18,6 +18,7 @@
 #pragma once
 
 #include "gui/menu_item/integer.h"
+#include "gui/menu_item/selection.h"
 #include "gui/menu_item/submenu.h"
 #include "gui/menu_item/toggle.h"
 #include "model/output.h"
@@ -141,17 +142,26 @@ public:
 	}
 };
 
-class ReturnToggle final : public Toggle {
+/// Which returning pair is summed into the song's own mix: none, 1-2, or 3-4.
+///
+/// One pair at a time, decided 2026-09-08. The other stays available to a track, and a pair a track has taken is
+/// not summed here as well - returning audio is in the song once rather than twice.
+class ReturnPair final : public Selection {
 public:
-	using Toggle::Toggle;
+	using Selection::Selection;
 
 	void readCurrentValue() override {
-		this->setValue(deluge::processing::engines::USBAudioStream::getReturnEnabled());
+		this->setValue((int32_t)deluge::processing::engines::USBAudioStream::getMasterReturnPair());
 	}
 
 	void writeCurrentValue() override {
-		deluge::processing::engines::USBAudioStream::setReturnEnabled(this->getValue());
-		FlashStorage::usbAudioReturnEnabled = this->getValue();
+		deluge::processing::engines::USBAudioStream::setMasterReturnPair((uint32_t)this->getValue());
+		FlashStorage::usbAudioReturnPair = (uint8_t)this->getValue();
+	}
+
+	deluge::vector<std::string_view> getOptions(OptType optType) override {
+		return {l10n::getView(l10n::String::STRING_FOR_OFF), l10n::getView(l10n::String::STRING_FOR_USB_PAIR_12),
+		        l10n::getView(l10n::String::STRING_FOR_USB_PAIR_34)};
 	}
 };
 

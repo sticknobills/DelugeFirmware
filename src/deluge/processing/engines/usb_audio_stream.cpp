@@ -1519,7 +1519,35 @@ uint32_t statDmaFrameSpan[3] = {}; ///< committed in the same host frame, one la
 /// summed in at all. Per-machine: like the trim, it describes the gain staging of what is on the other end of the
 /// cable rather than anything about the song.
 uint32_t returnLevelSetting = deluge::processing::engines::USBAudioStream::kReturnLevelDefault;
-bool returnEnabled = true;
+
+/// The arriving channels, taken two at a time. Everything below addresses the return by pair rather than by
+/// channel, because that is the unit a destination takes: the master, or one track's input.
+constexpr uint32_t kRxPairs = kRxChannels / 2u;
+static_assert(kRxPairs >= 1u, "the return must carry at least one pair");
+
+/// Which pair is summed into the song's own mix, 1-based, or zero for none.
+///
+/// Per-machine like the level and the trim: it describes what is on the other end of the cable rather than
+/// anything about the song. One pair at a time by decision, 2026-09-08 - the other pair stays available to a
+/// track rather than being summed twice.
+uint32_t masterReturnPair = 1;
+
+/// Pairs a track has taken as its own input during this render window, as a bitmask of (1 << (pair - 1)).
+///
+/// A track wins the pair: claiming it on a track takes it off the master, so returning audio is in the song once
+/// rather than twice. Rebuilt every window from the tracks that actually read, so it cannot drift out of step
+/// with the song the way a mask maintained at the point of setting would. A track that is not monitoring does
+/// not read, so it does not claim, and the pair goes back to the master.
+uint32_t returnPairsClaimed = 0;
+
+/// The window's shared reading, taken once before any track renders.
+///
+/// Every reader of the return sees the same frames of the ring and the same fade, so the master and a track
+/// reading the same window cannot disagree about what arrived. The read pointer is not advanced by any of them -
+/// that happens in advanceReturn(), by what actually left the machine.
+bool returnWindowStreaming = false;
+uint32_t returnWindowAvailable = 0;
+int32_t returnWindowFadeStart = 0;
 
 /// The whole conversion from an arriving 16-bit sample back to the mix's own scale, held as one multiplier so the
 /// hot path is a multiply and a shift.
@@ -1558,7 +1586,9 @@ constexpr int32_t kReturnFadeStep = kReturnFadeFull / 128;
 int32_t returnFade = 0;
 
 void recomputeReturnMultiplier() {
-	if (stemTrimMultiplier <= 0 || !returnEnabled || returnLevelSetting == 0) {
+	// Not gated on where the return is going: the multiplier is a pure gain, and a track may be reading a pair
+	// while the master is set to none. Who reads is decided at the read sites.
+	if (stemTrimMultiplier <= 0 || returnLevelSetting == 0) {
 		returnMultiplierQ16 = 0;
 		returnSaturationFree = true;
 		return;
@@ -1598,17 +1628,20 @@ void recomputeReturnMultiplier() {
 	return (int32_t)wide;
 }
 
-/// Sums one render window of returning audio into the mix, and advances the ring by exactly what it took.
+/// Settles what the whole render window will read from the return, once, before any of it is read.
 ///
-/// The ring's only reader, which is what makes the pointer pair safe: the completion interrupt writes and this
-/// reads, one writer each.
+/// The ring's readers - the song's own mix and any track that has taken a pair as its input - all see these
+/// figures, so they cannot disagree about what arrived or about where the fade is. None of them advances the read
+/// pointer; that happens in advanceReturn(), by what actually left the machine.
 ///
 /// Takes what is there rather than insisting on a whole window. The first version demanded the full window and
 /// discarded all of it otherwise - measured on hardware at 15-30 shortfalls a second on the dense reference
 /// song, each throwing away a window that was mostly present. Worse, each was treated as the stream going away
 /// and rolled the fade down and back up; at that rate it is an amplitude wobble around 20 Hz, an accidental
 /// tremolo, and it is the "warbling" that took most of a session to explain.
-void mixReturnInto(StereoSample* buffer, uint32_t numSamples) {
+void beginReturnWindow(uint32_t numSamples) {
+	returnPairsClaimed = 0;
+
 	if (!returnActive) {
 		// Parked on the writer, so the next host does not arrive to a ring that already looks full.
 		rxReadFrame = rxWriteFrame;
@@ -1640,27 +1673,68 @@ void mixReturnInto(StereoSample* buffer, uint32_t numSamples) {
 		statRxRePrimes++;
 	}
 
-	const bool streaming = returnActive && returnEnabled && rxPrimed;
-	if (streaming) {
+	returnWindowStreaming = returnActive && rxPrimed;
+	if (returnWindowStreaming) {
 		bump(statReturnRendered, numSamples);
 	}
-	const uint32_t available = streaming ? (held < numSamples ? held : numSamples) : 0u;
+	returnWindowAvailable = returnWindowStreaming ? (held < numSamples ? held : numSamples) : 0u;
 
 	// The fade follows whether the host is streaming at all, not whether this window happened to be full. A
-	// shortfall is a few missing frames, not a departure.
-	if (!streaming && returnFade == 0) {
+	// shortfall is a few missing frames, not a departure. Advanced once here rather than inside a reader, so a
+	// window with two readers does not run it twice - the readers ramp from returnWindowFadeStart instead.
+	returnWindowFadeStart = returnFade;
+	const int32_t travel = (int32_t)numSamples * kReturnFadeStep;
+	returnFade = returnWindowStreaming ? (returnFade + travel) : (returnFade - travel);
+	if (returnFade > kReturnFadeFull) {
+		returnFade = kReturnFadeFull;
+	}
+	if (returnFade < 0) {
+		returnFade = 0;
+	}
+}
+
+/// Whether one pair is worth reading at all this window. False costs the caller nothing.
+bool returnPairReadable(uint32_t pair) {
+	return pair >= 1u && pair <= kRxPairs && (returnWindowStreaming || returnWindowFadeStart != 0);
+}
+
+/// One arriving sample at the scale a track's own render works in.
+///
+/// Deliberately not the master's conversion. A track input is scaled exactly as a line input is - the arriving
+/// 16 bits left-justified into the int32 the codec hands over, then the caller's amplitude - so a returned pair
+/// and a jack at the same level sound the same and the track's own volume is the control. The master's
+/// conversion instead carries the outgoing trim's inverse, because what it is aiming at is a unity round trip
+/// into the song, and RLVL is the control there.
+[[gnu::always_inline]] inline int32_t returnToTrackScale(int16_t sample) {
+	return (int32_t)sample << 16;
+}
+
+/// Adds one returning pair into a buffer.
+///
+/// pair is 1-based; its two channels are (pair - 1) * 2 and that plus one. amplitude is on the same scale
+/// AudioOutput uses for a monitored line input, and is applied per sample across the window so a moving fader
+/// does not step. Pass nullptr for it to add at the master's own scale and at unity, which is what the song's
+/// mix wants.
+void addReturnPairInto(uint32_t pair, StereoSample* buffer, uint32_t numSamples, const int32_t* amplitudeStart,
+                       const int32_t* amplitudeEnd) {
+	if (!returnPairReadable(pair)) {
 		return;
 	}
 
 	const uint32_t start = costStart();
 	const uint32_t r = rxReadFrame;
+	const uint32_t chL = (pair - 1u) * 2u;
+	const uint32_t chR = (kRxChannels > chL + 1u) ? (chL + 1u) : chL;
+	const bool unity = (amplitudeStart == nullptr);
 
 	// The steady state, which is every window once a host has settled: a full window present, the fade already
-	// up, and a trim at which the conversion cannot overflow. Everything the general loop re-tests per sample is
-	// settled once here instead, and the ring is walked as straight runs so the wrap is tested per run rather
-	// than per frame. This loop runs inside the render, which is the path with the hard deadline - the receive
-	// side costs five times more and is deliberately somewhere that being late is harmless.
-	if (streaming && returnFade >= kReturnFadeFull && available == numSamples && returnSaturationFree) {
+	// up, no amplitude ramp on top, and a trim at which the conversion cannot overflow. Everything the general
+	// loop re-tests per sample is settled once here instead, and the ring is walked as straight runs so the wrap
+	// is tested per run rather than per frame. This loop runs inside the render, which is the path with the hard
+	// deadline - the receive side costs five times more and is deliberately somewhere that being late is
+	// harmless.
+	if (unity && returnWindowStreaming && returnWindowFadeStart >= kReturnFadeFull
+	    && returnWindowAvailable == numSamples && returnSaturationFree) {
 		uint32_t done = 0;
 		while (done < numSamples) {
 			const uint32_t slot = (r + done) & kRxRingMask;
@@ -1675,11 +1749,11 @@ void mixReturnInto(StereoSample* buffer, uint32_t numSamples) {
 					const uint32_t at = done + i;
 					if (at < stemWindowSamples) {
 						rxTraceIndex[at] = (int16_t)(((r + at) & kReturnTraceMask) * (uint32_t)kReturnTraceScale);
-						rxTraceValue[at] = src[0];
+						rxTraceValue[at] = src[chL];
 					}
 				}
-				dst[i].l += returnToMixScaleFast(src[0]);
-				dst[i].r += returnToMixScaleFast(src[kRxChannels > 1 ? 1 : 0]);
+				dst[i].l += returnToMixScaleFast(src[chL]);
+				dst[i].r += returnToMixScaleFast(src[chR]);
 				src += kRxChannels;
 			}
 			done += run;
@@ -1688,22 +1762,24 @@ void mixReturnInto(StereoSample* buffer, uint32_t numSamples) {
 		return;
 	}
 
+	int32_t fade = returnWindowFadeStart;
+	const int32_t fadeStep = returnWindowStreaming ? kReturnFadeStep : -kReturnFadeStep;
+	int32_t amplitude = unity ? 0 : *amplitudeStart;
+	const int32_t amplitudeStep =
+	    unity ? 0 : (int32_t)((int64_t)(*amplitudeEnd - *amplitudeStart) / (int32_t)(numSamples ? numSamples : 1));
+
 	for (uint32_t i = 0; i < numSamples; i++) {
-		if (streaming) {
-			returnFade += kReturnFadeStep;
-			if (returnFade > kReturnFadeFull) {
-				returnFade = kReturnFadeFull;
-			}
+		fade += fadeStep;
+		if (fade > kReturnFadeFull) {
+			fade = kReturnFadeFull;
 		}
-		else {
-			returnFade -= kReturnFadeStep;
-			if (returnFade < 0) {
-				returnFade = 0;
-			}
+		if (fade < 0) {
+			fade = 0;
 		}
+		amplitude += amplitudeStep;
 		// Past what arrived there is nothing to add, and what did arrive is still mixed at full level - so a
 		// shortfall costs the missing frames and nothing else.
-		if (i >= available) {
+		if (i >= returnWindowAvailable) {
 			continue;
 		}
 		const int16_t* const frame = &rxRing[((r + i) & kRxRingMask) * kRxChannels];
@@ -1712,26 +1788,46 @@ void mixReturnInto(StereoSample* buffer, uint32_t numSamples) {
 			// read, so neither can be reconstructed later from anything that would agree with itself.
 			if (i < stemWindowSamples) {
 				rxTraceIndex[i] = (int16_t)(((r + i) & kReturnTraceMask) * (uint32_t)kReturnTraceScale);
-				rxTraceValue[i] = frame[0];
+				rxTraceValue[i] = frame[chL];
 			}
 		}
-		const int32_t left = returnToMixScale(frame[0]);
-		const int32_t right = returnToMixScale(frame[kRxChannels > 1 ? 1 : 0]);
-		if (returnFade >= kReturnFadeFull) {
+		int32_t left;
+		int32_t right;
+		if (unity) {
+			left = returnToMixScale(frame[chL]);
+			right = returnToMixScale(frame[chR]);
+		}
+		else {
+			left = multiply_32x32_rshift32(returnToTrackScale(frame[chL]), amplitude) << 2;
+			right = multiply_32x32_rshift32(returnToTrackScale(frame[chR]), amplitude) << 2;
+		}
+		if (fade >= kReturnFadeFull) {
 			buffer[i].l += left;
 			buffer[i].r += right;
 		}
 		else {
-			buffer[i].l += (int32_t)(((int64_t)left * returnFade) >> 16);
-			buffer[i].r += (int32_t)(((int64_t)right * returnFade) >> 16);
+			buffer[i].l += (int32_t)(((int64_t)left * fade) >> 16);
+			buffer[i].r += (int32_t)(((int64_t)right * fade) >> 16);
 		}
 	}
-	// Deliberately does not advance the read pointer. The engine renders more samples than it outputs - it sizes
-	// a render from the codec's free space and then doubles it to get ahead - and discards whatever did not fit,
-	// re-rendering it next time. Advancing here consumed the discarded part too, about a tenth of the return,
-	// continuously, which drained a cushion of any size and is why no size ever held. The pointer moves in
-	// advanceReturn(), by what actually left the machine.
 	addCost(costReturnMix, start);
+}
+
+/// Sums the master's pair into the song, unless a track has taken it.
+///
+/// Deliberately does not advance the read pointer. The engine renders more samples than it outputs - it sizes a
+/// render from the codec's free space and then doubles it to get ahead - and discards whatever did not fit,
+/// re-rendering it next time. Advancing here consumed the discarded part too, about a tenth of the return,
+/// continuously, which drained a cushion of any size and is why no size ever held. The pointer moves in
+/// advanceReturn(), by what actually left the machine.
+void mixReturnInto(StereoSample* buffer, uint32_t numSamples) {
+	if (masterReturnPair == 0) {
+		return;
+	}
+	if ((returnPairsClaimed & (1u << (masterReturnPair - 1u))) != 0) {
+		return;
+	}
+	addReturnPairInto(masterReturnPair, buffer, numSamples, nullptr, nullptr);
 }
 
 /// Advances the return by the number of samples that actually reached the codec.
@@ -3802,6 +3898,9 @@ bool USBAudioStream::stemsWanted() {
 }
 
 void USBAudioStream::beginRender(uint32_t numSamples) {
+	// Before any track renders, because a track that has taken a return pair reads it during its own render and
+	// the song's mix reads what is left afterwards. Both must see the same window.
+	beginReturnWindow(numSamples);
 	// Set whatever the stream is doing. A clip that has left the main mix has left it whether or not a computer
 	// is listening - gating this on the stream made the Deluge's own outputs change when a cable was plugged in,
 	// which is not a routing decision the user made.
@@ -3974,13 +4073,32 @@ uint32_t USBAudioStream::getReturnLevel() {
 	return returnLevelSetting;
 }
 
-void USBAudioStream::setReturnEnabled(bool enabled) {
-	returnEnabled = enabled;
-	recomputeReturnMultiplier();
+void USBAudioStream::setMasterReturnPair(uint32_t pair) {
+	masterReturnPair = (pair <= kRxPairs) ? pair : 0u;
 }
 
-bool USBAudioStream::getReturnEnabled() {
-	return returnEnabled;
+uint32_t USBAudioStream::getMasterReturnPair() {
+	return masterReturnPair;
+}
+
+uint32_t USBAudioStream::numReturnPairs() {
+	return kRxPairs;
+}
+
+bool USBAudioStream::readReturnPair(uint32_t pair, StereoSample* buffer, uint32_t numSamples, int32_t amplitudeStart,
+                                    int32_t amplitudeEnd) {
+	if (buffer == nullptr || numSamples == 0 || pair == 0 || pair > kRxPairs) {
+		return false;
+	}
+	// Claimed whether or not there is anything to read this window. A host that pauses for a moment must not hand
+	// the pair back to the master and take it again a window later - that is an audible bounce between two
+	// destinations, and the track asked for it either way.
+	returnPairsClaimed |= 1u << (pair - 1u);
+	if (!returnPairReadable(pair)) {
+		return false;
+	}
+	addReturnPairInto(pair, buffer, numSamples, &amplitudeStart, &amplitudeEnd);
+	return true;
 }
 
 void USBAudioStream::setReturnReclaimAllowed(bool allowed) {

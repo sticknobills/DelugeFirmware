@@ -36,8 +36,10 @@ enum class AudioInputSelector::Value {
 	MASTER,
 	OUTPUT,
 	TRACK,
+	USB_1_2,
+	USB_3_4,
 };
-constexpr size_t kNumValues = 8;
+constexpr size_t kNumValues = 10;
 
 AudioInputSelector audioInputSelector{};
 
@@ -79,7 +81,8 @@ std::span<const char*> AudioInputSelector::getOptions() {
 	static const char* options[] = {
 	    l10n::get(STRING_FOR_DISABLED),     l10n::get(STRING_FOR_LEFT_INPUT),     l10n::get(STRING_FOR_RIGHT_INPUT),
 	    l10n::get(STRING_FOR_STEREO_INPUT), l10n::get(STRING_FOR_BALANCED_INPUT), l10n::get(STRING_FOR_MIX_PRE_FX),
-	    l10n::get(STRING_FOR_MIX_POST_FX),  l10n::get(STRING_FOR_TRACK),
+	    l10n::get(STRING_FOR_MIX_POST_FX),  l10n::get(STRING_FOR_TRACK),          l10n::get(STRING_FOR_USB_IN_12),
+	    l10n::get(STRING_FOR_USB_IN_34),
 	};
 	return {options, kNumValues};
 }
@@ -114,6 +117,14 @@ bool AudioInputSelector::setupAndCheckAvailability() {
 
 	case AudioInputChannel::SPECIFIC_OUTPUT:
 		valueOption = Value::TRACK;
+		break;
+
+	case AudioInputChannel::USB_1_2:
+		valueOption = Value::USB_1_2;
+		break;
+
+	case AudioInputChannel::USB_3_4:
+		valueOption = Value::USB_3_4;
 		break;
 
 	default:
@@ -185,6 +196,14 @@ void AudioInputSelector::selectEncoderAction(int8_t offset) {
 		audioOutput->setOutputRecordingFrom(recordFrom);
 		break;
 	}
+
+	case Value::USB_1_2:
+		audioOutput->inputChannel = AudioInputChannel::USB_1_2;
+		break;
+
+	case Value::USB_3_4:
+		audioOutput->inputChannel = AudioInputChannel::USB_3_4;
+		break;
 
 	default:
 		audioOutput->inputChannel = AudioInputChannel::NONE;

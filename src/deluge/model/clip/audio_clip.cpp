@@ -138,8 +138,11 @@ void AudioClip::abortRecording() {
 }
 
 bool AudioClip::wantsToBeginLinearRecording(Song* song) {
+	// A USB return pair can be monitored but not yet recorded: the recorder is fed from the I2S receive buffer or
+	// from the finished mix, and the return ring is neither. Offering it would write a silent file.
 	return (Clip::wantsToBeginLinearRecording(song) && (!sampleHolder.audioFile || !shouldCloneForOverdubs())
-	        && ((AudioOutput*)output)->inputChannel > AudioInputChannel::NONE);
+	        && ((AudioOutput*)output)->inputChannel > AudioInputChannel::NONE
+	        && !isUsbReturnInput(((AudioOutput*)output)->inputChannel));
 }
 
 bool AudioClip::isAbandonedOverdub() {

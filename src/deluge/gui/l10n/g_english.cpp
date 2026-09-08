@@ -1023,6 +1023,8 @@ PLACE_SDRAM_DATA Language english{
         {STRING_FOR_USB_RETURN, "USB Return"},
         {STRING_FOR_USB_RETURN_LEVEL, "Return Level"},
         {STRING_FOR_USB_RECLAIM, "Diagnostic: allow pipe reclaim"},
+        {STRING_FOR_USB_IN_12, "USB In 1-2"},
+        {STRING_FOR_USB_IN_34, "USB In 3-4"},
     },
 };
 } // namespace deluge::l10n::built_in

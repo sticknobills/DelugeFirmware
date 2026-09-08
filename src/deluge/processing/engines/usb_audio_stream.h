@@ -121,8 +121,26 @@ public:
 	static constexpr uint32_t kReturnLevelDefault = 50;
 	static void setReturnLevel(uint32_t level);
 	static uint32_t getReturnLevel();
-	static void setReturnEnabled(bool enabled);
-	static bool getReturnEnabled();
+
+	/// How many stereo pairs the return carries. Two at the four channels the cable fits alongside eight going
+	/// out; the widths either side of that are a broken one and one the host refuses.
+	static uint32_t numReturnPairs();
+
+	/// Which pair is summed into the song's own mix, 1-based, or zero for none.
+	///
+	/// One pair at a time - decided 2026-09-08, so the other stays available to a track rather than arriving in
+	/// the song twice. A pair a track has taken is not summed here for the same reason.
+	static void setMasterReturnPair(uint32_t pair);
+	static uint32_t getMasterReturnPair();
+
+	/// Adds one returning pair into a track's own render, and takes that pair off the master for this window.
+	///
+	/// pair is 1-based. amplitude is the track's volume across the window, on the same scale a monitored line
+	/// input uses, applied per sample so a moving fader does not step. Returns whether anything was added; false
+	/// means nothing is arriving, and the pair is claimed either way so a momentary gap does not bounce the audio
+	/// back to the master and away again.
+	static bool readReturnPair(uint32_t pair, StereoSample* buffer, uint32_t numSamples, int32_t amplitudeStart,
+	                           int32_t amplitudeEnd);
 
 	/// DIAGNOSTIC A/B, not a user control. On restores the behaviour the 2026-09-06 fix removed: the vendor's
 	/// ready-interrupt handler is allowed to take the return pipe back from the DMA controller, which NAKs it once

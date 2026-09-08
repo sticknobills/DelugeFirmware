@@ -1266,6 +1266,12 @@ char const* inputChannelToString(AudioInputChannel inputChannel) {
 	case AudioInputChannel::SPECIFIC_OUTPUT:
 		return "specificTrack";
 
+	case AudioInputChannel::USB_1_2:
+		return "usb12";
+
+	case AudioInputChannel::USB_3_4:
+		return "usb34";
+
 	default: // AudioInputChannel::NONE
 		return "none";
 	}
@@ -1292,6 +1298,12 @@ AudioInputChannel stringToInputChannel(char const* string) {
 	}
 	else if (!strcmp(string, "specificTrack")) {
 		return AudioInputChannel::SPECIFIC_OUTPUT;
+	}
+	else if (!strcmp(string, "usb12")) {
+		return AudioInputChannel::USB_1_2;
+	}
+	else if (!strcmp(string, "usb34")) {
+		return AudioInputChannel::USB_3_4;
 	}
 
 	else {

@@ -88,9 +88,10 @@ extern uint8_t screensaverTimeoutMinutes;
 /// is on the other end of the cable rather than anything about the song.
 extern uint8_t usbAudioTrim;
 
-/// Whether audio arriving over USB is summed into the song, and at what level (0-50). Per-machine for the same
-/// reason the trim is: both describe what is on the other end of the cable rather than anything about the song.
-extern bool usbAudioReturnEnabled;
+/// Which returning USB pair is summed into the song's own mix (0 none, 1 pair 1-2, 2 pair 3-4), and at what level
+/// (0-50). Per-machine for the same reason the trim is: both describe what is on the other end of the cable
+/// rather than anything about the song.
+extern uint8_t usbAudioReturnPair;
 extern uint8_t usbAudioReturnLevel;
 
 extern ThresholdRecordingMode defaultThresholdRecordingMode;

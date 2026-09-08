@@ -29,6 +29,7 @@
 #include "playback/mode/playback_mode.h"
 #include "playback/playback_handler.h"
 #include "processing/engines/audio_engine.h"
+#include "processing/engines/usb_audio_stream.h"
 #include "storage/audio/audio_file.h"
 #include "storage/storage_manager.h"
 #include "util/lookuptables/lookuptables.h"
@@ -208,9 +209,20 @@ renderEnvelope:
 	                                     ? std::span{reinterpret_cast<StereoSample*>(bufferToTransferTo), render.size()}
 	                                     : render;
 
-	// add in the monitored audio if in sampler or looper mode
+	// Audio arriving over the USB cable, taken as this track's input in place of a jack.
+	//
+	// Read here, in the track's own render, so it wears this track's filters, FX, volume, pan and sends exactly as
+	// a line input does - and so claiming a pair on a track takes it off the song's own mix, which happens later.
 	if (modeAllowsMonitoring() && modelStack->song->isOutputActiveInArrangement(this)
-	    && inputChannel != AudioInputChannel::SPECIFIC_OUTPUT) {
+	    && isUsbReturnInput(inputChannel)) {
+		rendered = true;
+		deluge::processing::engines::USBAudioStream::readReturnPair(
+		    usbReturnPairOf(inputChannel), output.data(), (uint32_t)output.size(), amplitudeAtStart, amplitudeAtEnd);
+	}
+
+	// add in the monitored audio if in sampler or looper mode
+	else if (modeAllowsMonitoring() && modelStack->song->isOutputActiveInArrangement(this)
+	         && inputChannel != AudioInputChannel::SPECIFIC_OUTPUT) {
 		rendered = true;
 		int32_t const* __restrict__ input_ptr = (int32_t const*)AudioEngine::i2sRXBufferPos;
 
@@ -398,7 +410,10 @@ Clip* AudioOutput::createNewClipForArrangementRecording(ModelStack* modelStack) 
 }
 
 bool AudioOutput::wantsToBeginArrangementRecording() {
-	return (inputChannel > AudioInputChannel::NONE && Output::wantsToBeginArrangementRecording());
+	// A USB pair can be monitored but not yet recorded: the recorder is fed from the I2S receive buffer or from
+	// the finished mix, and the return ring is neither. Offering it would write a silent file.
+	return (inputChannel > AudioInputChannel::NONE && !isUsbReturnInput(inputChannel)
+	        && Output::wantsToBeginArrangementRecording());
 }
 
 bool AudioOutput::setActiveClip(ModelStackWithTimelineCounter* modelStack, PgmChangeSend maySendMIDIPGMs) {
