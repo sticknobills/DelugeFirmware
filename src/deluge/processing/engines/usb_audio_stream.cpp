@@ -602,6 +602,30 @@ uint32_t statRxHeldMin = 0xFFFFFFFFu;
 uint32_t statRxHeldMax = 0;
 uint32_t statRxDrained = 0; ///< frames handed to the render path
 
+/// DIAGNOSTIC. The cushion's movement split into the two things that cause it, because min and max together say
+/// how far it swung and nothing about which side moved.
+///
+/// The cushion is filled by the drain and emptied by the reader, and the two run at different rates in different
+/// places - the drain in the task, the reader in the render. A fall in the cushion is therefore either the drain
+/// running late or the reader taking a long window, and those want opposite fixes. hmin/hmax cannot tell them
+/// apart; these can.
+///
+/// Also the first measurement of how long audio waits in the landing buffer before the drain moves it into the
+/// ring. That wait is latency and no published figure has ever included it: the round trip has been quoted as the
+/// outgoing lead plus the cushion, and this stage sits between them, uncounted.
+///
+/// All per-interval and all per-pass rather than per-frame. The per-frame version of an instrument on this exact
+/// path cost a quarter of this machine's polyphony on 2026-09-05.
+uint32_t statRxDrainPasses = 0; ///< drain passes that found anything
+uint32_t statRxDrainMax = 0;    ///< most frames taken in one drain - the worst landing-buffer wait, in frames
+uint32_t statRxTakeMax = 0;     ///< most frames taken by the reader in one pass
+uint32_t statRxHeldSum = 0;     ///< running total of the cushion, for a mean the min/max cannot give
+uint32_t statRxHeldCount = 0;
+uint32_t statRxHeldDrop = 0; ///< largest fall in the cushion between consecutive windows - the burst it must clear
+uint32_t statRxHeldRise = 0; ///< largest rise, which is the drain catching up after one
+uint32_t rxHeldPrev = 0;
+bool rxHeldPrevValid = false;
+
 /// DIAGNOSTIC. The accounting identity the cushion fix rests on: samples the return was mixed across, against
 /// samples that reached the codec. Summed over the same interval, so they are directly comparable and neither is
 /// derived from the other.
@@ -1180,6 +1204,14 @@ void drainReturnDmaBody() {
 		w++;
 	}
 	rxWriteFrame = w;
+	if constexpr (kDiagnostics) {
+		// Per pass, not per frame. frames is what had accumulated in the landing buffer since the last drain, so
+		// its maximum is the longest any audio waited there before being moved into the ring.
+		statRxDrainPasses++;
+		if (frames > statRxDrainMax) {
+			statRxDrainMax = frames;
+		}
+	}
 	// Advanced past everything the controller produced, including anything dropped for want of ring room, so the
 	// two never drift apart.
 	rxDmaReadOffset = writeOffset;
@@ -1688,6 +1720,30 @@ void beginReturnWindow(uint32_t numSamples) {
 			if (held > statRxHeldMax) {
 				statRxHeldMax = held;
 			}
+			// The mean, which is what says whether the cushion is sitting where it was primed or has ratcheted
+			// down. Nothing refills it gently, so a fall is kept until a re-prime, and min alone cannot show that
+			// - one bad moment and a permanently lower cushion produce the same min.
+			statRxHeldSum += held;
+			statRxHeldCount++;
+			if (rxHeldPrevValid) {
+				if (held < rxHeldPrev) {
+					const uint32_t drop = rxHeldPrev - held;
+					if (drop > statRxHeldDrop) {
+						statRxHeldDrop = drop;
+					}
+				}
+				else {
+					const uint32_t rise = held - rxHeldPrev;
+					if (rise > statRxHeldRise) {
+						statRxHeldRise = rise;
+					}
+				}
+			}
+			rxHeldPrev = held;
+			rxHeldPrevValid = true;
+		}
+		else {
+			rxHeldPrevValid = false;
 		}
 	}
 
@@ -1911,6 +1967,11 @@ void advanceReturnBy(uint32_t numSamplesOutputted) {
 	returnConsumedFrames = take;
 	rxReadFrame += take;
 	statRxDrained += take;
+	if constexpr (kDiagnostics) {
+		if (take > statRxTakeMax) {
+			statRxTakeMax = take;
+		}
+	}
 }
 
 /// Branch counters. "Nothing was sent" cannot distinguish the task never running, the task
@@ -3085,6 +3146,24 @@ void reportStats() {
 		emitDec(statRxHeldMin == 0xFFFFFFFFu ? 0u : statRxHeldMin);
 		emit(" hmax");
 		emitDec(statRxHeldMax);
+		// The cushion's mean, and the largest single-window fall and rise. hmean against the 2176 the cushion
+		// primes at says whether it has ratcheted down; hdrop is the burst a smaller cushion would have to clear,
+		// measured directly rather than inferred from the swing.
+		emit(" hmean");
+		emitDec(statRxHeldCount ? statRxHeldSum / statRxHeldCount : 0u);
+		emit(" hdrop");
+		emitDec(statRxHeldDrop);
+		emit(" hrise");
+		emitDec(statRxHeldRise);
+		// Drain passes, and the most frames one of them carried. dmax is the longest the audio waited in the
+		// landing buffer before reaching the ring - latency that sits between the two figures the round trip has
+		// always been quoted as.
+		emit(" dps");
+		emitDec(statRxDrainPasses);
+		emit(" dmax");
+		emitDec(statRxDrainMax);
+		emit(" tmax");
+		emitDec(statRxTakeMax);
 		emit(" drn");
 		emitDec(statRxDrained);
 		// The ring's own position. held is the reader's lead in frames, which is the latency B3 inherits.
@@ -3445,6 +3524,13 @@ void reportStats() {
 	statRxHeldMin = 0xFFFFFFFFu;
 	statRxHeldMax = 0;
 	statRxDrained = 0;
+	statRxDrainPasses = 0;
+	statRxDrainMax = 0;
+	statRxTakeMax = 0;
+	statRxHeldSum = 0;
+	statRxHeldCount = 0;
+	statRxHeldDrop = 0;
+	statRxHeldRise = 0;
 	statReturnRendered = 0;
 	statReturnOutputted = 0;
 	for (uint32_t i = 0; i < 5; i++) {
