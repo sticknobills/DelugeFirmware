@@ -3087,7 +3087,16 @@ void reportStats() {
 	// fields. Counted against the emits below, not carried forward from the previous comment - that drift is what
 	// put 392 claimed bytes into a 384-byte buffer in August.
 	{
-		char rxLine[640];
+		// 1024, widened from 640 when the cushion instruments took the line to 45 numbers.
+		//
+		// emit() and emitDec() are unbounded - they write until done and check nothing - so a line that outgrows its
+		// buffer smashes the stack silently. That has already frozen this machine once, from a stats line grown to
+		// ~68 bytes in a 64-byte buffer.
+		//
+		// The arithmetic, so the next field can be checked rather than guessed: 170 characters of tags and
+		// separators, and 45 numbers. At ten digits apiece - which only wf and rf actually reach - that is 620.
+		// Realistic width is about 405. 1024 leaves room for the next instrument without another visit.
+		char rxLine[1024];
 		p = rxLine;
 		emit("AUI alt");
 		emitDec(g_usb_pstd_alt_num[kReturnInterfaceNumber]);
