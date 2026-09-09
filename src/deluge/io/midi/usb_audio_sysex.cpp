@@ -72,6 +72,7 @@ enum Result : uint8_t {
 	kBadChannel = 5,
 	kTrackHasNoAudio = 6,
 	kNoSong = 7,
+	kUnknownRequest = 8,
 };
 
 /// The one host receiving pushes. One slot rather than a list: the pushes describe the state of the instrument,
@@ -506,12 +507,17 @@ void handleRequest(MIDICable& cable, JsonDeserializer& reader) {
 			}
 		}
 		else {
-			subscriber = &cable;
+			// A renewal is not a fresh subscription. Only a host that was not already subscribed gets the state
+			// pushed at it unasked; renewing is how a subscribed host stays subscribed, and treating the two the
+			// same re-announced the whole song on every renewal.
+			if (subscriber != &cable) {
+				subscriber = &cable;
+				// Force the next pass to send the state rather than waiting for it to change.
+				lastMapSignature = 0;
+				lastSongSignature = 0;
+				lastHeldTrack = -2;
+			}
 			subscriptionExpiry = lastHeardFrom + kSubscriptionLease;
-			// Force the next pass to send the state rather than waiting for it to change.
-			lastMapSignature = 0;
-			lastSongSignature = 0;
-			lastHeldTrack = -2;
 		}
 	}
 	else if (!strcmp(verb, "set")) {
@@ -587,7 +593,7 @@ void handleRequest(MIDICable& cable, JsonDeserializer& reader) {
 	else if (strcmp(verb, "info") != 0 && strcmp(verb, "map") != 0 && strcmp(verb, "tracks") != 0) {
 		// An unknown verb still gets an answer, carrying this device's version, so a host built against a later
 		// vocabulary learns what it is talking to instead of timing out.
-		result = kBadWidth;
+		result = kUnknownRequest;
 	}
 
 	JsonSerializer& writer = smSysex::sharedWriter();
