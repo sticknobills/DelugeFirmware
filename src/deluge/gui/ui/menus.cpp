@@ -1965,6 +1965,9 @@ PLACE_SDRAM_BSS usb_audio::ReturnLevel usbAudioReturnLevelMenu{STRING_FOR_USB_RE
 PLACE_SDRAM_BSS usb_audio::ReturnCushion usbAudioReturnCushionMenu{STRING_FOR_USB_RETURN_CUSHION,
                                                                    STRING_FOR_USB_RETURN_CUSHION};
 
+// Read-only: what is driving the channel map over the cable, if anything.
+PLACE_SDRAM_BSS usb_audio::Host usbAudioHostMenu{STRING_FOR_USB_HOST, STRING_FOR_USB_HOST};
+
 PLACE_SDRAM_BSS Submenu usbAudioSettingsMenu{
     STRING_FOR_USB_ROUTING,
     STRING_FOR_USB_ROUTING,
@@ -1972,6 +1975,7 @@ PLACE_SDRAM_BSS Submenu usbAudioSettingsMenu{
         &usbAudioReturnMenu,
         &usbAudioReturnLevelMenu,
         &usbAudioReturnCushionMenu,
+        &usbAudioHostMenu,
     },
 };
 

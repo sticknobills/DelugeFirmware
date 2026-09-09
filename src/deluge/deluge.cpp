@@ -50,6 +50,7 @@
 #include "io/midi/midi_device_manager.h"
 #include "io/midi/midi_engine.h"
 #include "io/midi/midi_follow.h"
+#include "io/midi/usb_audio_sysex.h"
 #include "lib/printf.h" // IWYU pragma: keep this over rides printf with a non allocating version
 #include "memory/general_memory_allocator.h"
 #include "model/clip/instrument_clip.h"
@@ -585,6 +586,11 @@ void registerTasks() {
 	// Check for and handle queued SysEx traffic
 	addRepeatingTask([]() { smSysex::handleNextSysEx(); }, p++, 0.0002, 0.0002, 0.01, "Handle pending SysEx traffic.",
 	                 RESOURCE_SD);
+
+	// Tells a subscribed host what is on the eight USB audio channels, when it changes. Returns immediately when
+	// nothing has subscribed, which is every machine that is not being driven from a computer.
+	addRepeatingTask([]() { deluge::io::midi::usb_audio::routine(); }, p++, 0.02, 0.05, 0.2, "USB audio channel map",
+	                 RESOURCE_NONE);
 
 	// 21-29: Low priority (30 for dyn tasks)
 	p = 21;

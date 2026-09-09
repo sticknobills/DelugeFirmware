@@ -1023,6 +1023,7 @@ PLACE_SDRAM_DATA Language english{
         {STRING_FOR_USB_RETURN_LEVEL, "Return Level"},
         {STRING_FOR_USB_RETURN_CUSHION, "Return Cushion"},
         {STRING_FOR_USB_INPUT, "USB"},
+        {STRING_FOR_USB_HOST, "Host"},
     },
 };
 } // namespace deluge::l10n::built_in

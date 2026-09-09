@@ -11,6 +11,7 @@
 #include "io/midi/midi_device.h"
 #include "io/midi/midi_engine.h"
 #include "io/midi/sysex.h"
+#include "io/midi/usb_audio_sysex.h"
 #include "memory/general_memory_allocator.h"
 #include "processing/engines/audio_engine.h"
 #include "scheduler_api.h"
@@ -111,6 +112,10 @@ FILdata* smSysex::findEmptyFIL() {
 	FILdata* oldest = openFiles + LRUindex;
 	closeFIL(oldest);
 	return oldest;
+}
+
+JsonSerializer& smSysex::sharedWriter() {
+	return jWriter;
 }
 
 void smSysex::startDirect(JsonSerializer& writer) {
@@ -840,6 +845,10 @@ void smSysex::handleNextSysEx() {
 		}
 		else if (!strcmp(tagName, "ping")) {
 			doPing(de.cable, parser);
+			goto done;
+		}
+		else if (!strcmp(tagName, "usbAudio")) {
+			deluge::io::midi::usb_audio::handleRequest(de.cable, parser);
 			goto done;
 		}
 		parser.exitTag();
