@@ -549,9 +549,25 @@ constexpr uint32_t kRxRingMask = kRxRingFrames - 1u;
 /// Comes out before this ships. It is a user-visible menu item on a measurement path.
 constexpr uint32_t kRxLeadOptions[] = {2048u, 1536u, 1024u, 768u, 512u, 384u, 256u};
 constexpr uint32_t kRxLeadOptionCount = sizeof(kRxLeadOptions) / sizeof(kRxLeadOptions[0]);
-static_assert(kRxLeadOptions[0] == 2048u, "the first option is the control and must be the shipped size");
+static_assert(kRxLeadOptions[0] == 2048u, "the first option is the pre-2026-09-09 size and is the sweep's control");
 
-uint32_t rxLeadFrames = kRxLeadOptions[0];
+/// 512 since 2026-09-09, down from 2048, and the reduction is a correction rather than a cut.
+///
+/// 2048 was sized against a 770-frame burst of the audio task running late. That burst was measured before the
+/// drain read its landing buffer cached and does not happen any more: across idle, the dense reference song and
+/// repeated card loads the cushion's low-water mark never fell below 2039 of 2048, and the largest single-window
+/// fall was 129 frames - the reader taking its own window, which does not grow as the cushion shrinks.
+///
+/// Swept 2048 down to 256 against one song in one sitting. Nothing failed at any size, by counter or by ear. 512
+/// is where the line is drawn: it leaves 291 frames of margin above its floor through repeated card loads, more
+/// than two render windows, where 256 leaves 83 - less than one window, which is the same by-construction absence
+/// of margin that made the original 128-frame cushion fail at 84 under-runs a second.
+///
+/// **Takes the device's own half of a round trip from ~57 ms to ~20 ms.** That is most of what stood between an
+/// external processor on this cable and a usable insert.
+///
+/// Untested: a long soak, a second DAW, and other material. Any of those is what would move this back up.
+uint32_t rxLeadFrames = 512u;
 
 /// Below this the cushion is not dipping, it is gone. A quarter of the target, capped where it shipped, so a small
 /// cushion does not sit on a floor sized for a large one.
