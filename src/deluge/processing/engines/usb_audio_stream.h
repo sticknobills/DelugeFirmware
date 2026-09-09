@@ -51,6 +51,12 @@ public:
 	/// halves of a frame come from the same instant. The output stage drains a window across several calls.
 	static void feedMix(const StereoSample* mix, uint32_t numSamples, uint32_t renderOffset);
 
+	/// SCAFFOLD, 2026-09-09. The return cushion's size, so it can be swept from the menu in one sitting rather
+	/// than across four flashes. Option 0 is the shipped 2048 and is the control. Comes out before this ships.
+	static uint32_t getReturnCushionOption();
+	static void setReturnCushionOption(uint32_t option);
+	static uint32_t getReturnCushionFrames();
+
 	/// One mono track per channel, across the whole width of the stream.
 	///
 	/// Mono rather than stereo pairs by default: it keeps every channel independently assignable and the far end

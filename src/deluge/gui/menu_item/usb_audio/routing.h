@@ -145,4 +145,33 @@ public:
 	}
 };
 
+/// SCAFFOLD, 2026-09-09. The return cushion's size in frames, which is almost the whole of this direction's
+/// latency and therefore almost the whole of the Deluge's half of a round trip through an external processor.
+///
+/// Here so the size can be swept against one song in one sitting. Flashing between sizes means a reboot and a
+/// reload per point, and the difference being judged is a few hundred frames of cushion - well inside what a
+/// change of song state would mask.
+///
+/// **2048 is the control**: at that setting the floor and ceiling compute to exactly what this build shipped with.
+/// Smaller settings are the experiment. A change costs one short mute while the cushion rebuilds.
+///
+/// Not saved to flash, deliberately - a machine that has been power-cycled is back on the shipped size, so a
+/// setting left small by accident cannot outlive the session that chose it. Comes out before this ships.
+class ReturnCushion final : public Selection {
+public:
+	using Selection::Selection;
+
+	void readCurrentValue() override {
+		this->setValue((int32_t)deluge::processing::engines::USBAudioStream::getReturnCushionOption());
+	}
+
+	void writeCurrentValue() override {
+		deluge::processing::engines::USBAudioStream::setReturnCushionOption((uint32_t)this->getValue());
+	}
+
+	deluge::vector<std::string_view> getOptions(OptType optType) override {
+		return {"2048", "1536", "1024", "768", "512", "384", "256"};
+	}
+};
+
 } // namespace deluge::gui::menu_item::usb_audio

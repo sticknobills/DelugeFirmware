@@ -533,7 +533,40 @@ constexpr uint32_t kRxRingMask = kRxRingFrames - 1u;
 /// The device is adaptive here and cannot ask the host to change rate - no feedback endpoint is possible at Full
 /// Speed with both isochronous pipes carrying audio - so this buffer is the only thing absorbing the mismatch.
 /// B4 measures the drift before anything tries to correct it.
-constexpr uint32_t kRxLeadFrames = 2048u;
+/// SCAFFOLD, 2026-09-09. The target is a variable and the menu sets it, so the size can be swept in one sitting
+/// against one song rather than across four flashes and four reboots - nothing measured across a reboot is
+/// comparable, and the whole question here is a difference of a few hundred frames.
+///
+/// **2048 is the control and must stay first.** At 2048 the floor and ceiling below compute to 256 and 2304, which
+/// is exactly what this build shipped with, so the top of the sweep is the last state known to work rather than a
+/// near-miss of it.
+///
+/// Measured 2026-09-09 across idle, the dense reference song and repeated card loads: the cushion's low-water mark
+/// never fell below 2120 and the largest single-window fall was 129 frames. The 770-frame burst this was sized
+/// against was measured before the drain read its landing buffer cached, and no longer happens - so the sizing
+/// argument in the comment above is history rather than a live constraint.
+///
+/// Comes out before this ships. It is a user-visible menu item on a measurement path.
+constexpr uint32_t kRxLeadOptions[] = {2048u, 1536u, 1024u, 768u, 512u, 384u, 256u};
+constexpr uint32_t kRxLeadOptionCount = sizeof(kRxLeadOptions) / sizeof(kRxLeadOptions[0]);
+static_assert(kRxLeadOptions[0] == 2048u, "the first option is the control and must be the shipped size");
+
+uint32_t rxLeadFrames = kRxLeadOptions[0];
+
+/// Below this the cushion is not dipping, it is gone. A quarter of the target, capped where it shipped, so a small
+/// cushion does not sit on a floor sized for a large one.
+inline uint32_t rxRePrimeFloor() {
+	const uint32_t quarter = rxLeadFrames / 4u;
+	return quarter < 256u ? quarter : 256u;
+}
+
+/// The ceiling, and with it the cushion's real operating point: drift pushes the cushion up about a frame a second
+/// and nothing but this stops it, so the machine sits here rather than at the target. Measured 2026-09-09 at
+/// 2240-2300 against a 2304 ceiling and a 2048 target.
+inline uint32_t rxDriftCeiling() {
+	const uint32_t eighth = rxLeadFrames / 8u;
+	return rxLeadFrames + (eighth < 256u ? eighth : 256u);
+}
 
 /// Below this the cushion is not dipping, it is gone, and the reader stops rather than limping.
 ///
@@ -541,7 +574,7 @@ constexpr uint32_t kRxLeadFrames = 2048u;
 /// the reader took what little was there, 54 times a second, and lost 1.4% of the audio in eleven-frame gaps -
 /// which is the gritty sound. Rebuilding deliberately costs one short mute and then runs clean, which is the
 /// same trade the outgoing ring makes when it resyncs.
-constexpr uint32_t kRxRePrimeFloor = 256u;
+/// Now rxRePrimeFloor(), derived from the target above.
 
 /// The cushion's ceiling, and the other half of a guard that only ever had a floor.
 ///
@@ -562,7 +595,7 @@ constexpr uint32_t kRxRePrimeFloor = 256u;
 ///
 /// 256 above the target, which is clear of both the priming point (target plus one render window) and the top of
 /// the engine's own swing (measured hmax 2242 against this 2304).
-constexpr uint32_t kRxDriftCeiling = kRxLeadFrames + 256u;
+/// Now rxDriftCeiling(), derived from the target above.
 
 PLACE_SDRAM_BSS int16_t rxRing[kRxRingFrames * kRxChannels];
 
@@ -1706,7 +1739,7 @@ void beginReturnWindow(uint32_t numSamples) {
 	}
 	else if (!rxPrimed) {
 		// Nothing is read until the ring has built its lead, so the first window does not start already behind.
-		if ((rxWriteFrame - rxReadFrame) >= kRxLeadFrames + numSamples) {
+		if ((rxWriteFrame - rxReadFrame) >= rxLeadFrames + numSamples) {
 			rxPrimed = true;
 		}
 	}
@@ -1749,7 +1782,7 @@ void beginReturnWindow(uint32_t numSamples) {
 
 	// Run dry rather than limp. Reading on when the cushion is gone loses a few frames every window for as long
 	// as it takes to recover, and with matched rates that is indefinitely.
-	if (rxPrimed && held < kRxRePrimeFloor) {
+	if (rxPrimed && held < rxRePrimeFloor()) {
 		rxPrimed = false;
 		statRxRePrimes++;
 	}
@@ -1958,9 +1991,9 @@ void advanceReturnBy(uint32_t numSamplesOutputted) {
 		statRxShortFrames += numSamplesOutputted - take;
 	}
 	// The cushion has drifted above its ceiling, so take one extra frame and let it fall back. See
-	// kRxDriftCeiling: without this the cushion only ever grows, and a session long enough reaches a ring that is
+	// rxDriftCeiling(): without this the cushion only ever grows, and a session long enough reaches a ring that is
 	// permanently full and buzzes.
-	if (held > kRxDriftCeiling && take < held) {
+	if (held > rxDriftCeiling() && take < held) {
 		take++;
 		statRxDriftTrims++;
 	}
@@ -3887,6 +3920,36 @@ void stopAudioWriteTimer() {
 } // namespace
 
 namespace deluge::processing::engines {
+
+/// SCAFFOLD. The return cushion's size, in frames, as an index into the option table.
+///
+/// Changing it drops priming rather than easing between sizes. Going smaller, the ceiling walks the cushion down
+/// a frame a window and converges in a few seconds; going larger, nothing but drift grows it, which would take
+/// minutes. Unpriming stops the reader, so the drain refills to the new size in tens of milliseconds and the cost
+/// is one short mute per change - honest, and the same trade the cushion already makes when it runs dry.
+uint32_t USBAudioStream::getReturnCushionOption() {
+	for (uint32_t i = 0; i < kRxLeadOptionCount; i++) {
+		if (kRxLeadOptions[i] == rxLeadFrames) {
+			return i;
+		}
+	}
+	return 0;
+}
+
+void USBAudioStream::setReturnCushionOption(uint32_t option) {
+	if (option >= kRxLeadOptionCount) {
+		option = 0;
+	}
+	if (kRxLeadOptions[option] == rxLeadFrames) {
+		return;
+	}
+	rxLeadFrames = kRxLeadOptions[option];
+	rxPrimed = false;
+}
+
+uint32_t USBAudioStream::getReturnCushionFrames() {
+	return rxLeadFrames;
+}
 
 void USBAudioStream::routine() {
 	if constexpr (kDiagnostics) {

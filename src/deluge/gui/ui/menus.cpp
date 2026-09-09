@@ -1960,12 +1960,18 @@ PLACE_SDRAM_BSS usb_audio::ReturnPair usbAudioReturnMenu{STRING_FOR_USB_RETURN, 
 PLACE_SDRAM_BSS usb_audio::ReturnLevel usbAudioReturnLevelMenu{STRING_FOR_USB_RETURN_LEVEL,
                                                                STRING_FOR_USB_RETURN_LEVEL};
 
+// SCAFFOLD, 2026-09-09. The return cushion's size, for sweeping it against one song in one sitting. 2048 is the
+// control and is what this build shipped with. Comes out before this ships.
+PLACE_SDRAM_BSS usb_audio::ReturnCushion usbAudioReturnCushionMenu{STRING_FOR_USB_RETURN_CUSHION,
+                                                                   STRING_FOR_USB_RETURN_CUSHION};
+
 PLACE_SDRAM_BSS Submenu usbAudioSettingsMenu{
     STRING_FOR_USB_ROUTING,
     STRING_FOR_USB_ROUTING,
     {
         &usbAudioReturnMenu,
         &usbAudioReturnLevelMenu,
+        &usbAudioReturnCushionMenu,
     },
 };
 
