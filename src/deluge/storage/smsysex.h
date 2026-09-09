@@ -29,9 +29,6 @@ FILdata* findEmptyFIL();
 void noteSessionIdUse(uint8_t msgId);
 void noteFileIdUse(FILdata* fp);
 FILdata* entryForFID(uint32_t fileId);
-/// The one JSON writer these messages are built in. Shared rather than one per subsystem: it holds a 32 KB
-/// buffer, and every handler builds and sends inside a single scheduler pass.
-JsonSerializer& sharedWriter();
 void startDirect(JsonSerializer& writer);
 void startReply(JsonSerializer& writer, JsonDeserializer& reader);
 void sendMsg(MIDICable& device, JsonSerializer& writer);

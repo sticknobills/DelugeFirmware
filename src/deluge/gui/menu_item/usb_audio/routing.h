@@ -18,14 +18,9 @@
 #pragma once
 
 #include "gui/menu_item/integer.h"
-#include "gui/menu_item/menu_item.h"
 #include "gui/menu_item/selection.h"
 #include "gui/menu_item/submenu.h"
 #include "gui/menu_item/toggle.h"
-#include "hid/display/display.h"
-#include "hid/display/oled.h"
-#include "hid/display/seven_segment.h"
-#include "io/midi/usb_audio_sysex.h"
 #include "model/output.h"
 #include "model/song/song.h"
 #include "model/usb_route.h"
@@ -177,47 +172,6 @@ public:
 	deluge::vector<std::string_view> getOptions(OptType optType) override {
 		return {"2048", "1536", "1024", "768", "512", "384", "256"};
 	}
-};
-
-/// Read-only: what is talking to the channel map over the cable, and which version of the vocabulary it speaks.
-///
-/// The difference between a working cable and a working cable with a dead control channel. Without it, the first
-/// thing anyone debugging a host-side tool has to do is guess which half is silent.
-class Host final : public MenuItem {
-public:
-	using MenuItem::MenuItem;
-
-	void beginSession(MenuItem* navigatedBackwardFrom) override { drawValue(); }
-
-	void drawPixelsForOled() override {
-		deluge::hid::display::oled_canvas::Canvas& canvas = hid::display::OLED::main;
-		canvas.drawStringCentredShrinkIfNecessary(text(), 22, 18, 20);
-	}
-
-	void drawValue() {
-		if (display->have7SEG()) {
-			static_cast<hid::display::SevenSegment*>(display)->enableLowercase();
-		}
-		display->setScrollingText(text());
-		if (display->have7SEG()) {
-			static_cast<hid::display::SevenSegment*>(display)->disableLowercase();
-		}
-	}
-
-private:
-	/// "NONE" when nothing has spoken, the host's own name and vocabulary version otherwise.
-	const char* text() {
-		const char* name = deluge::io::midi::usb_audio::hostName();
-		if (name[0] == 0) {
-			return l10n::get(l10n::String::STRING_FOR_NONE);
-		}
-		buffer.set(name);
-		buffer.concatenate(" v");
-		buffer.concatenateInt((int32_t)deluge::io::midi::usb_audio::hostVocabularyVersion());
-		return buffer.get();
-	}
-
-	String buffer;
 };
 
 } // namespace deluge::gui::menu_item::usb_audio

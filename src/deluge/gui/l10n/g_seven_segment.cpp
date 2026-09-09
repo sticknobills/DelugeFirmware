@@ -574,7 +574,6 @@ PLACE_SDRAM_DATA Language seven_segment{
         {STRING_FOR_USB_RETURN_LEVEL, "RLVL"},
         {STRING_FOR_USB_RETURN_CUSHION, "RCSH"},
         {STRING_FOR_USB_INPUT, "USB"},
-        {STRING_FOR_USB_HOST, "HOST"},
     },
     &built_in::english,
 };
