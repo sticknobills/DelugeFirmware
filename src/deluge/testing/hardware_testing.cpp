@@ -1294,11 +1294,32 @@ void i2sAdvance() {
 // least 14 us, and a PWM carrier at 176.4 kHz has gaps of 0 to 5.7 us. C and D
 // reach gaps of 1.4 us and 709 ns.
 //
-// HI and B 16 read above 2 V and come first, on the meter's 20 V range. B 16 is
-// the 2026-08-10 PAT1 pattern and should read ~2.36 V again, which proves the
-// firmware, the cable and the meter together. Everything from LO on stays under
-// 2 V, where the meter reads in 1 mV steps -- ~9 ns at 22.05 kHz, ~4.5 ns at
-// 44.1 kHz. The last two steps repeat earlier ones to show drift.
+// Run 1, 2026-09-11 (commit 4a12197f): same-width pulses in different
+// surroundings lost 20-80 ns different amounts, and no rule in width or gap alone
+// explained it. But every pattern had silences of 14-44 us, which PWM never has.
+//
+// Run 2, this table, asks the question PWM actually poses. Every E to U step is a
+// real 176.4 kHz PWM train at the 44.1 kHz bit rate: four 8-bit periods of 709 ns
+// bits, 5.67 us each, a pulse of d bits at the start of each. The frame lists the
+// four duties.
+//
+//   E d / H d   steady train, every period d. E on the 2 V range, H on the 20 V.
+//   F ab / P ab alternating a, b, a, b.
+//   G ab / U ab two periods of a, then two of b.
+//
+// If each pulse loses an amount set by its own width alone, F ab reads exactly
+// the mean of E a and E b, and so does G ab. A difference is history: a pulse
+// remembering the periods before it, which a static correction table cannot undo.
+// F and G together say whether that memory is one period long or longer.
+//
+// These patterns are not symmetric under bit reversal. They assume SSI3 sends the
+// most significant bit first, as every I2S transmitter does and as SSI0 must to
+// drive the codec correctly. If that is wrong, steady trains are unaffected and
+// an alternating train keeps its alternation, so a history effect still shows.
+//
+// A 4 and C 1 repeat run 1 on the same cable and meter, and must read 0.568 V and
+// 1.112 V again. E 2 and H 2, E 3 and H 3 are one pattern read on both ranges,
+// which ties the two ranges' scales together.
 // ============================================================================
 
 namespace {
@@ -1308,10 +1329,20 @@ constexpr uint8_t kPulseCkdv44k = 4; // /16, 1.4112 MHz bit clock
 
 struct PulseStep {
 	uint8_t ckdv;
-	uint16_t left;  ///< in send order if SSI3 sends MSB first; symmetric either way
-	uint16_t right; ///< zero except for HI
+	uint16_t left;  ///< in send order, assuming SSI3 sends MSB first
+	uint16_t right;
 	char const* label;
 };
+
+/// One 176.4 kHz PWM period at the 44.1 kHz bit rate: d ones, then 8 - d zeros.
+constexpr uint16_t pwmPeriod(int32_t d) {
+	return (uint16_t)((0xFFu << (8 - d)) & 0xFFu);
+}
+
+/// Two PWM periods, d1 then d2.
+constexpr uint16_t pwmWord(int32_t d1, int32_t d2) {
+	return (uint16_t)((pwmPeriod(d1) << 8) | pwmPeriod(d2));
+}
 
 /// One run of k ones at the start of the left word.
 constexpr uint16_t pulseRun(int32_t k) {
@@ -1324,24 +1355,28 @@ constexpr uint16_t pulsePair(int32_t g) {
 }
 
 constexpr PulseStep kPulseSteps[] = {
-    {kPulseCkdv22k, 0xFFFF, 0xFFFF, "HI"},   // 20 V range: true high, ~5.04 V
-    {kPulseCkdv44k, 0xFFFF, 0x0000, "B 16"}, // 20 V range: the 2026-08-10 control, ~2.36 V
-    {kPulseCkdv22k, 0x0000, 0x0000, "LO"},   // 2 V range from here on
-    {kPulseCkdv22k, pulseRun(1), 0, "A 1"},    {kPulseCkdv22k, pulseRun(2), 0, "A 2"},
-    {kPulseCkdv22k, pulseRun(3), 0, "A 3"},    {kPulseCkdv22k, pulseRun(4), 0, "A 4"},
-    {kPulseCkdv22k, pulseRun(5), 0, "A 5"},    {kPulseCkdv22k, pulseRun(6), 0, "A 6"},
-    {kPulseCkdv22k, pulseRun(8), 0, "A 8"},    {kPulseCkdv22k, pulseRun(10), 0, "A 10"},
-    {kPulseCkdv22k, pulseRun(12), 0, "A 12"},  {kPulseCkdv44k, pulseRun(1), 0, "B 1"},
-    {kPulseCkdv44k, pulseRun(2), 0, "B 2"},    {kPulseCkdv44k, pulseRun(3), 0, "B 3"},
-    {kPulseCkdv44k, pulseRun(4), 0, "B 4"},    {kPulseCkdv44k, pulseRun(6), 0, "B 6"},
-    {kPulseCkdv44k, pulseRun(8), 0, "B 8"},    {kPulseCkdv44k, pulseRun(10), 0, "B 10"},
-    {kPulseCkdv44k, pulseRun(12), 0, "B 12"},  {kPulseCkdv22k, pulsePair(1), 0, "C 1"},
-    {kPulseCkdv22k, pulsePair(2), 0, "C 2"},   {kPulseCkdv22k, pulsePair(3), 0, "C 3"},
-    {kPulseCkdv22k, pulsePair(4), 0, "C 4"},   {kPulseCkdv22k, pulsePair(6), 0, "C 6"},
-    {kPulseCkdv22k, pulsePair(8), 0, "C 8"},   {kPulseCkdv44k, pulsePair(1), 0, "D 1"},
-    {kPulseCkdv44k, pulsePair(2), 0, "D 2"},   {kPulseCkdv44k, pulsePair(4), 0, "D 4"},
-    {kPulseCkdv44k, pulsePair(8), 0, "D 8"},   {kPulseCkdv22k, pulseRun(4), 0, "A 4"}, // repeat
-    {kPulseCkdv22k, pulsePair(1), 0, "C 1"},                                           // repeat
+    // 2 V range
+    {kPulseCkdv22k, 0x0000, 0x0000, "LO"},
+    {kPulseCkdv22k, pulseRun(4), 0, "A 4"},  // control: 0.568 V in run 1
+    {kPulseCkdv22k, pulsePair(1), 0, "C 1"}, // control: 1.112 V in run 1
+    {kPulseCkdv44k, pwmWord(1, 1), pwmWord(1, 1), "E 1"},
+    {kPulseCkdv44k, pwmWord(2, 2), pwmWord(2, 2), "E 2"},
+    {kPulseCkdv44k, pwmWord(3, 3), pwmWord(3, 3), "E 3"},
+    {kPulseCkdv44k, pwmWord(1, 2), pwmWord(1, 2), "F 12"},
+    {kPulseCkdv44k, pwmWord(2, 3), pwmWord(2, 3), "F 23"},
+    {kPulseCkdv44k, pwmWord(1, 3), pwmWord(1, 3), "F 13"},
+    {kPulseCkdv44k, pwmWord(1, 1), pwmWord(3, 3), "G 13"},
+    {kPulseCkdv44k, pwmWord(1, 3), pwmWord(1, 3), "F 13"}, // repeat
+    // 20 V range
+    {kPulseCkdv44k, pwmWord(2, 2), pwmWord(2, 2), "H 2"},
+    {kPulseCkdv44k, pwmWord(3, 3), pwmWord(3, 3), "H 3"},
+    {kPulseCkdv44k, pwmWord(4, 4), pwmWord(4, 4), "H 4"},
+    {kPulseCkdv44k, pwmWord(5, 5), pwmWord(5, 5), "H 5"},
+    {kPulseCkdv44k, pwmWord(6, 6), pwmWord(6, 6), "H 6"},
+    {kPulseCkdv44k, pwmWord(3, 5), pwmWord(3, 5), "P 35"},
+    {kPulseCkdv44k, pwmWord(2, 6), pwmWord(2, 6), "P 26"},
+    {kPulseCkdv44k, pwmWord(3, 3), pwmWord(5, 5), "U 35"},
+    {kPulseCkdv44k, pwmWord(3, 5), pwmWord(3, 5), "P 35"}, // repeat
 };
 constexpr int32_t kPulseNumSteps = sizeof(kPulseSteps) / sizeof(kPulseSteps[0]);
 
