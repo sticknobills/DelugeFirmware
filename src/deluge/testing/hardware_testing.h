@@ -62,6 +62,12 @@ void gateSpeedSweepAdvance();
 /// Gate 4 is untouched throughout.
 void i2sAdvance();
 
+/// Diagnostic: the Gate PWM falsification test. One call advances one step of
+/// fixed pulse patterns on gate 2, each read as a DC average on a multimeter, then
+/// OFF restores the pins. See the table in hardware_testing.cpp for what each
+/// label means.
+void pulseTestAdvance();
+
 /// False on OLED models, where the DAC shares its SPI channel with the display and
 /// this cannot work. Everything that acts on a Clip's routing checks this first, so
 /// on an OLED model every Clip behaves as if it were routed to MAIN alone.

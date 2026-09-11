@@ -1083,9 +1083,13 @@ inline uint32_t i2sFrameWord(int32_t left, int32_t right) {
 /// the gate driver reproduces it almost perfectly, so a multimeter reads half rail.
 /// The word select line is a square wave at the same rate for the same reason.
 /// Two independent half-rail readings, with no DAC and no external parts.
+/// The frame i2sFillPattern writes. Left all ones, right all zeros unless the
+/// pulse-width test has set another before starting a step.
+uint32_t i2sPatternWord = i2sFrameWord(-1, 0);
+
 void i2sFillPattern() {
 	for (uint32_t f = 0; f < kI2sFrames; f++) {
-		i2sBuffer[f] = i2sFrameWord(-1, 0); // left all ones, right all zeros
+		i2sBuffer[f] = i2sPatternWord;
 	}
 }
 
@@ -1262,6 +1266,108 @@ void i2sAdvance() {
 	label[i++] = (char)('0' + i2sDmaState());
 	label[i] = 0;
 	display->setText(label);
+}
+
+// ============================================================================
+// Gate PWM falsification test  --  SHIFT + CV
+// ----------------------------------------------------------------------------
+// Gate PWM rests on the gate driver's ~380 ns turn-off delay being something
+// firmware can undo. It cannot if the delay depends on anything firmware does not
+// know. This asks two narrower questions, with a multimeter on gate 2: does the
+// delay depend on how wide the pulse is, and does it depend on the gap before it?
+//
+// Each step loops one 32-bit frame on the data line through the I2S path proven
+// on 2026-08-10, so the DC average is the fraction of the frame the socket was
+// actually high. Every pattern sits inside the left 16-bit word and keeps its
+// shape when that word is reversed, so the answer does not depend on which order
+// SSI3 sends bits in -- which has never been confirmed.
+//
+//   A k  one pulse of k bits at 22.05 kHz: 1417 ns a bit, 45.35 us a frame
+//   B k  one pulse of k bits at 44.1 kHz:   709 ns a bit, 22.68 us a frame
+//        A k and B 2k are the same width after a different gap.
+//   C g  two 4-bit pulses g bits apart, 22.05 kHz
+//   D g  two 4-bit pulses g bits apart, 44.1 kHz
+//        The commanded high time is the same at every g, so the reading should
+//        not move with g. If it does, the delay depends on the gap before a pulse.
+//
+// The old plan paired A k with B 2k alone, but every gap in that pairing is at
+// least 14 us, and a PWM carrier at 176.4 kHz has gaps of 0 to 5.7 us. C and D
+// reach gaps of 1.4 us and 709 ns.
+//
+// HI and B 16 read above 2 V and come first, on the meter's 20 V range. B 16 is
+// the 2026-08-10 PAT1 pattern and should read ~2.36 V again, which proves the
+// firmware, the cable and the meter together. Everything from LO on stays under
+// 2 V, where the meter reads in 1 mV steps -- ~9 ns at 22.05 kHz, ~4.5 ns at
+// 44.1 kHz. The last two steps repeat earlier ones to show drift.
+// ============================================================================
+
+namespace {
+
+constexpr uint8_t kPulseCkdv22k = 5; // /32, 705.6 kHz bit clock
+constexpr uint8_t kPulseCkdv44k = 4; // /16, 1.4112 MHz bit clock
+
+struct PulseStep {
+	uint8_t ckdv;
+	uint16_t left;  ///< in send order if SSI3 sends MSB first; symmetric either way
+	uint16_t right; ///< zero except for HI
+	char const* label;
+};
+
+/// One run of k ones at the start of the left word.
+constexpr uint16_t pulseRun(int32_t k) {
+	return (uint16_t)(0xFFFFu << (16 - k));
+}
+
+/// Two runs of four ones with g zeros between them.
+constexpr uint16_t pulsePair(int32_t g) {
+	return (uint16_t)(0xF000u | (0xF000u >> (4 + g)));
+}
+
+constexpr PulseStep kPulseSteps[] = {
+    {kPulseCkdv22k, 0xFFFF, 0xFFFF, "HI"},   // 20 V range: true high, ~5.04 V
+    {kPulseCkdv44k, 0xFFFF, 0x0000, "B 16"}, // 20 V range: the 2026-08-10 control, ~2.36 V
+    {kPulseCkdv22k, 0x0000, 0x0000, "LO"},   // 2 V range from here on
+    {kPulseCkdv22k, pulseRun(1), 0, "A 1"},    {kPulseCkdv22k, pulseRun(2), 0, "A 2"},
+    {kPulseCkdv22k, pulseRun(3), 0, "A 3"},    {kPulseCkdv22k, pulseRun(4), 0, "A 4"},
+    {kPulseCkdv22k, pulseRun(5), 0, "A 5"},    {kPulseCkdv22k, pulseRun(6), 0, "A 6"},
+    {kPulseCkdv22k, pulseRun(8), 0, "A 8"},    {kPulseCkdv22k, pulseRun(10), 0, "A 10"},
+    {kPulseCkdv22k, pulseRun(12), 0, "A 12"},  {kPulseCkdv44k, pulseRun(1), 0, "B 1"},
+    {kPulseCkdv44k, pulseRun(2), 0, "B 2"},    {kPulseCkdv44k, pulseRun(3), 0, "B 3"},
+    {kPulseCkdv44k, pulseRun(4), 0, "B 4"},    {kPulseCkdv44k, pulseRun(6), 0, "B 6"},
+    {kPulseCkdv44k, pulseRun(8), 0, "B 8"},    {kPulseCkdv44k, pulseRun(10), 0, "B 10"},
+    {kPulseCkdv44k, pulseRun(12), 0, "B 12"},  {kPulseCkdv22k, pulsePair(1), 0, "C 1"},
+    {kPulseCkdv22k, pulsePair(2), 0, "C 2"},   {kPulseCkdv22k, pulsePair(3), 0, "C 3"},
+    {kPulseCkdv22k, pulsePair(4), 0, "C 4"},   {kPulseCkdv22k, pulsePair(6), 0, "C 6"},
+    {kPulseCkdv22k, pulsePair(8), 0, "C 8"},   {kPulseCkdv44k, pulsePair(1), 0, "D 1"},
+    {kPulseCkdv44k, pulsePair(2), 0, "D 2"},   {kPulseCkdv44k, pulsePair(4), 0, "D 4"},
+    {kPulseCkdv44k, pulsePair(8), 0, "D 8"},   {kPulseCkdv22k, pulseRun(4), 0, "A 4"}, // repeat
+    {kPulseCkdv22k, pulsePair(1), 0, "C 1"},                                           // repeat
+};
+constexpr int32_t kPulseNumSteps = sizeof(kPulseSteps) / sizeof(kPulseSteps[0]);
+
+/// -1 means stopped and the pins are back under the gate engine.
+int32_t pulseStep = -1;
+
+} // namespace
+
+void pulseTestAdvance() {
+	if (pulseStep >= 0) {
+		i2sStop();
+	}
+
+	pulseStep++;
+
+	if (pulseStep >= kPulseNumSteps) {
+		pulseStep = -1;
+		i2sPatternWord = i2sFrameWord(-1, 0);
+		display->setText("OFF");
+		return;
+	}
+
+	PulseStep const& step = kPulseSteps[pulseStep];
+	i2sPatternWord = i2sFrameWord((int16_t)step.left, (int16_t)step.right);
+	i2sStart(I2sStep{step.ckdv, false, step.label});
+	display->setText(step.label);
 }
 
 /// Plays the phrase once through the given correction setting.

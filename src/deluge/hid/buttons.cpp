@@ -110,7 +110,7 @@ ActionResult buttonAction(deluge::hid::Button b, bool on, bool inCardRoutine) {
 		if (inCardRoutine) {
 			return ActionResult::REMIND_ME_OUTSIDE_CARD_ROUTINE;
 		}
-		i2sAdvance();
+		pulseTestAdvance();
 		return ActionResult::DEALT_WITH;
 	}
 
