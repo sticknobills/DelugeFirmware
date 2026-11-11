@@ -46,8 +46,8 @@ public:
 
 	bool renderGlobalEffectableForClip(ModelStackWithTimelineCounter* modelStack,
 	                                   std::span<StereoSample> globalEffectableBuffer, int32_t* bufferToTransferTo,
-	                                   int32_t* reverbBuffer, int32_t reverbAmountAdjust, int32_t sideChainHitPending,
-	                                   bool shouldLimitDelayFeedback, bool isClipActive, int32_t pitchAdjust,
+	                                   int32_t* reverbBuffer, RenderAdjustments& adjustments,
+	                                   int32_t sideChainHitPending, bool shouldLimitDelayFeedback, bool isClipActive,
 	                                   int32_t amplitudeAtStart, int32_t amplitudeAtEnd) override;
 
 	void resetEnvelope();
@@ -105,9 +105,21 @@ public:
 
 	Output* getOutputRecordingFrom() override { return outputRecordingFrom; }
 	void clearRecordingFrom() override { setOutputRecordingFrom(nullptr); }
-	// Specific-track recording only makes sense from another audio-capable output.
-	bool canRecordFrom(Output const* source) const {
-		return source && source != this && source->type != OutputType::MIDI_OUT && source->type != OutputType::CV;
+	// Specific-track recording only makes sense from another audio-capable output, and never from one that (directly or
+	// through a chain of tracks) records from us - rendering a cycle recurses until the stack overflows.
+	bool canRecordFrom(Output* source) const {
+		if (!source || source->type == OutputType::MIDI_OUT || source->type == OutputType::CV) {
+			return false;
+		}
+		// Bounded in case a cycle already exists further along the chain
+		Output* link = source;
+		for (int32_t depth = 0; link && depth < 256; depth++) {
+			if (link == this) {
+				return false;
+			}
+			link = link->getOutputRecordingFrom();
+		}
+		return true;
 	}
 	void setOutputRecordingFrom(Output* toRecordfrom) {
 		if (toRecordfrom && !canRecordFrom(toRecordfrom)) {

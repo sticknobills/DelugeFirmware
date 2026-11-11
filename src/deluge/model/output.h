@@ -21,7 +21,6 @@
 #include "hid/button.h"
 #include "model/clip/clip_instance_vector.h"
 #include "model/sample/sample_recorder.h"
-#include "model/usb_route.h"
 #include "modulation/params/param.h"
 #include "util/d_string.h"
 #include <cstdint>
@@ -88,12 +87,6 @@ public:
 
 	ClipInstanceVector clipInstances;
 	[[nodiscard]] Clip* getActiveClip() const;
-
-	/// UsbRoute bits: which USB channels this track is copied to, and whether it stays in the Deluge's own outputs.
-	/// Saved with the song.
-	uint16_t usbRouting = UsbRoute::DEFAULT;
-
-	[[nodiscard]] bool isInMainMix() const { return (usbRouting & UsbRoute::MAIN) != 0; }
 	String name; // Contains the display name as the user sees it.
 	             // E.g. on numeric Deluge, SYNT000 will be just "0". Definitely no leading zeros, so not "000".
 	             // On OLED Deluge I thiiink SYNT000 would be "SYNT000"?
@@ -112,8 +105,8 @@ public:
 	uint8_t modKnobMode;
 
 	// Temp stuff for doLaunch()
-	bool alreadyGotItsNewClip;
-	bool isGettingSoloingClip;
+	bool alreadyGotItsNewClip{false};
+	bool isGettingSoloingClip{false};
 
 	bool nextClipFoundShouldGetArmed; // Temp thing for Session::armClipsToStartOrSoloWithQuantization
 
@@ -171,7 +164,7 @@ public:
 	virtual void loadCrucialAudioFilesOnly() {} // Caller must check that there is an activeClip.
 
 	// No activeClip needed. Call anytime the Instrument comes into existence on the main list thing
-	virtual void resyncLFOs() {};
+	virtual void resyncLFOs(bool reset_state = false) {};
 
 	virtual void sendMIDIPGM() {};
 	virtual void deleteBackedUpParamManagers(Song* song) {}

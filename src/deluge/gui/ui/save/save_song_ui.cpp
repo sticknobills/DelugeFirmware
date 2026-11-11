@@ -43,7 +43,7 @@ using namespace gui;
 
 extern uint8_t currentlyAccessingCard;
 
-SaveSongUI saveSongUI{};
+PLACE_SDRAM_BSS SaveSongUI saveSongUI{};
 
 SaveSongUI::SaveSongUI() {
 	filePrefix = "SONG";
@@ -116,8 +116,11 @@ void SaveSongUI::focusRegained() {
 
 bool SaveSongUI::performSave(bool mayOverwrite) {
 
-	if (ALPHA_OR_BETA_VERSION && currentlyAccessingCard) {
-		FREEZE_WITH_ERROR("E316");
+	if (currentlyAccessingCard) {
+		if (ALPHA_OR_BETA_VERSION) {
+			FREEZE_WITH_ERROR("E316");
+		}
+		return false; // Card is mid-transfer - starting a save now would nest SD access
 	}
 
 	if (currentSong->hasAnyPendingNextOverdubs()) {

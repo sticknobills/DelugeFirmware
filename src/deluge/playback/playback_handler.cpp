@@ -562,6 +562,9 @@ void PlaybackHandler::setupPlayback(int32_t newPlaybackState, int32_t playFromPo
 	bool oldState = AudioEngine::audioRoutineLocked;
 	AudioEngine::audioRoutineLocked = true;
 	currentlyActioningSwungTickOrResettingPlayPos = true;
+	// Start synced global LFOs with fresh state, including sounds without an active clip.
+	// Periodic timer ticks only realign their phase.
+	currentSong->resyncLFOs(true);
 	// Have to do this after calling AudioEngine::routine()
 	currentPlaybackMode->resetPlayPos(playFromPos, !ticksLeftInCountIn, buttonPressLatencyForTempolessRecord);
 	currentlyActioningSwungTickOrResettingPlayPos = false;
@@ -599,6 +602,9 @@ void PlaybackHandler::endPlayback() {
 	// Do this after calling currentPlaybackMode->endPlayback(), cos for arrangement that has to get the current
 	// tick, which needs to refer to which clock is active, which is stored in playbackState.
 	playbackState = 0;
+
+	// Nothing's going to play on into the Clusters we'd prefetched. Before any song swap, so it can delete Samples.
+	audioFileManager.releaseAllPrefetches();
 
 	cvEngine.playbackEnded(); // Call this *after* playbackState is set
 	PadLEDs::clearTickSquares();
@@ -951,13 +957,6 @@ void PlaybackHandler::scheduleMIDIClockOutTickFromExternalClock() {
 }
 
 void PlaybackHandler::doMIDIClockOutTick() {
-	CriticalSectionGuard guard;
-	// if there's a MIDI flush scheduled already then don't mess with it - the clock would go out early with it. Will
-	// catch at next output. Otherwise, any MIDI already waiting gets dumped now so the clock can go at its own time
-	if (!AudioEngine::prepareToSendMIDIClock(guard)) {
-		D_PRINTLN("already scheduled");
-		return;
-	}
 	midiClockOutTickScheduled = false;
 	lastMIDIClockOutTickDone++;
 	timeLastMIDIClockOutTickSent = AudioEngine::audioSampleTimer;
@@ -1530,6 +1529,10 @@ void PlaybackHandler::doSongSwap(bool preservePlayPosition) {
 			// Set it so the tick which we're gonna do right now, at the start of the new song, has 0 increment
 			swungTicksTilNextEvent = 0;
 		}
+
+		// A live song swap bypasses setupPlayback(). Reset the incoming song's
+		// synced LFO state after establishing its clock position, before starting clips.
+		currentSong->resyncLFOs(true);
 
 		// And now, if switching to arranger (in which case, remember, we definitely didn't preserve play position),
 		// do that

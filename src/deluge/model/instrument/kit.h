@@ -105,7 +105,7 @@ public:
 
 	void beenEdited(bool shouldMoveToEmptySlot = true) override;
 	void choke();
-	void resyncLFOs() override;
+	void resyncLFOs(bool reset_state = false) override;
 	void removeDrumFromKitArpeggiator(int32_t drumIndex);
 	void removeDrum(Drum* drum);
 	ModControllable* toModControllable() override;
@@ -139,8 +139,8 @@ public:
 
 	bool renderGlobalEffectableForClip(ModelStackWithTimelineCounter* modelStack,
 	                                   std::span<StereoSample> globalEffectableBuffer, int32_t* bufferToTransferTo,
-	                                   int32_t* reverbBuffer, int32_t reverbAmountAdjust, int32_t sideChainHitPending,
-	                                   bool shouldLimitDelayFeedback, bool isClipActive, int32_t pitchAdjust,
+	                                   int32_t* reverbBuffer, RenderAdjustments& adjustments,
+	                                   int32_t sideChainHitPending, bool shouldLimitDelayFeedback, bool isClipActive,
 	                                   int32_t amplitudeAtStart, int32_t amplitudeAtEnd) override;
 
 	char const* getXMLTag() override { return "kit"; }

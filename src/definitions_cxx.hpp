@@ -362,6 +362,7 @@ enum class OscType : uint8_t {
 	ANALOG_SQUARE,
 	SAW,
 	ANALOG_SAW_2,
+	SUPERSAW,
 	WAVETABLE,
 	SAMPLE,
 	DX7,
@@ -678,6 +679,8 @@ constexpr auto kNumMIDITransposeControlMethods = util::to_underlying(MIDITranspo
 
 constexpr int32_t kNumClustersLoadedAhead = 2;
 constexpr int32_t kMaxNumClustersLoadedAhead = 8;
+// How many further Clusters an AudioClip asks to be loaded beyond those it holds, without holding reasons on them
+constexpr int32_t kNumClustersPrefetchedForAudioClip = 2;
 
 enum class InputMonitoringMode : uint8_t {
 	SMART,
@@ -866,54 +869,14 @@ enum class AudioInputChannel {
 	RIGHT,
 	STEREO,
 	BALANCED,
+	USB, // Stereo audio from a USB host (drivers/usb/usb_audio.h)
 	MIX,
 	OUTPUT,
 	SPECIFIC_OUTPUT,
 	OFFLINE_OUTPUT, // special output only used with offline stem exporting
-	// Audio arriving over USB. Past the internal options, because everything below them reads the codec input.
-	// In the order the USB input menu lists them.
-	USB_1,
-	USB_2,
-	USB_3,
-	USB_4,
-	USB_1_2,
-	USB_3_4,
 };
 
 constexpr AudioInputChannel AUDIO_INPUT_CHANNEL_FIRST_INTERNAL_OPTION = AudioInputChannel::MIX;
-
-/// Whether this input is one of the USB return channels or pairs.
-constexpr bool isUsbReturnInput(AudioInputChannel channel) {
-	return channel >= AudioInputChannel::USB_1 && channel <= AudioInputChannel::USB_3_4;
-}
-
-/// Which single return channel an input names, 1-based. Zero for a pair, and for anything that is not USB.
-constexpr uint32_t usbReturnMonoChannelOf(AudioInputChannel channel) {
-	switch (channel) {
-	case AudioInputChannel::USB_1:
-		return 1;
-	case AudioInputChannel::USB_2:
-		return 2;
-	case AudioInputChannel::USB_3:
-		return 3;
-	case AudioInputChannel::USB_4:
-		return 4;
-	default:
-		return 0;
-	}
-}
-
-/// Which return pair an input names, 1-based. Zero for a single channel, and for anything that is not USB.
-constexpr uint32_t usbReturnPairOf(AudioInputChannel channel) {
-	switch (channel) {
-	case AudioInputChannel::USB_1_2:
-		return 1;
-	case AudioInputChannel::USB_3_4:
-		return 2;
-	default:
-		return 0;
-	}
-}
 
 enum class ActionResult {
 	DEALT_WITH,

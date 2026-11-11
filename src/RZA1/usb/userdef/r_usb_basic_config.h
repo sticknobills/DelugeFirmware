@@ -57,12 +57,6 @@
 #define USB_CFG_PMIDI_USE
 #define USB_CFG_HMIDI_USE
 
-/** [Peripheral Audio Class]
- * USB audio alongside USB MIDI: 8 channels out and 4 back, 16-bit 44.1 kHz.
- * Pipes and buffers are in deluge/drivers/usb/userdef/r_usb_paudio_config.h.
- */
-#define USB_CFG_PAUDIO_USE
-
 /**  [DMA use setting]
  * USB_CFG_ENABLE       : Uses DMA
  * USB_CFG_DISABLE      : Does not use DMA

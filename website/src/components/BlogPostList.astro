@@ -1,0 +1,56 @@
+---
+type Props = {
+  /** Show only the newest `limit` posts. */
+  limit?: number
+}
+
+const dateFormat = new Intl.DateTimeFormat("en", { dateStyle: "long" })
+
+// starlight-blog's route data: newest first, drafts excluded in production.
+const posts = Astro.locals.starlightBlog.posts.slice(0, Astro.props.limit)
+---
+
+{posts.length === 0 ? (
+  <p>No posts yet.</p>
+) : (
+  <ul class="blog-post-list">
+    {posts.map((post) => (
+      <li>
+        <a href={post.href}>{post.title}</a>
+        <p class="blog-post-list__meta">
+          <time datetime={post.createdAt.toISOString()}>
+            {dateFormat.format(post.createdAt)}
+          </time>
+          {post.authors.length > 0 &&
+            ` · ${post.authors.map((author) => author.name).join(", ")}`}
+        </p>
+        {post.entry.data.description && <p>{post.entry.data.description}</p>}
+      </li>
+    ))}
+  </ul>
+)}
+
+<style>
+  .blog-post-list {
+    list-style: none;
+    padding-left: 0;
+  }
+
+  .blog-post-list li + li {
+    margin-top: 1.5rem;
+  }
+
+  .blog-post-list a {
+    font-size: var(--sl-text-h4);
+    font-weight: 600;
+  }
+
+  .blog-post-list p {
+    margin-top: 0.25rem;
+  }
+
+  .blog-post-list__meta {
+    color: var(--sl-color-gray-3);
+    font-size: var(--sl-text-sm);
+  }
+</style>

@@ -1,64 +1,17 @@
-# Deluge USB Audio Firmware
+# Deluge Community Firmware
 
-Class-compliant USB audio interface capability for the Deluge. Send any track to its own channel in your DAW or other USB host, and send up to four channels back into the Deluge. No driver needed.
+## Dear Deluge owners
+If you want to start using the community firmware please visit https://delugecommunity.com/ for all relevant details.
 
+## About
+The [Deluge](https://synthstrom.com/product/deluge/) from [Synthstrom Audible](https://synthstrom.com/) is a portable sequencer, synthesizer and sampler. Synthstrom Audible decided to [open source](https://synthstrom.com/open/) the firmware application that runs on the Deluge to allow the community to customize and extend the capabilities of the device. 
 
-## Features
+The hardware is built around a Renesas RZ/A1L processor with an Arm® Cortex®-A9 core running at 400MHz and 3MB of on-chip SRAM. Connected to that is a 64MB SDRAM chip, a PIC for button handling and either a 7-Segment array or an OLED screen. The application is written in C and C++ and some occasional assembly in bare metal style without an operating system.
 
-- 8 channels out, 4 channels in, 16-bit, 44.1 kHz, alongside USB MIDI
-- Per track: send to any of 8 mono channels or 4 stereo pairs, and optionally take it out of the Deluge's own outputs
-- Return to the song: one returning pair summed into the song mix, before the song's effects, with its own level
-- Return to a track: an audio track can take a USB channel or pair as its input, and play and record it like a line input
-- Delay compensation: holds the Deluge's own sound back 0–100 ms so a track sent through an external effect comes back in time
-
-## Documentation
-
-📖 See [USB Audio Feature Guide](docs/USB_AUDIO.md) for detailed controls and known limitations.
-
-
-## Compatibility
-
-Tested on a 7-segment Deluge with macOS (Ableton Live, Audacity) and Linux (Raspberry Pi). Not yet tested on OLED Deluges or Windows — reports welcome.
-
-While connected as a USB audio device, the Deluge cannot host a USB MIDI controller. MIDI to and from the computer still works.
-
-## Installation
-⚠️ Experimental feature! Install at your own risk.
-
-### For users (flash only)
-
-1. **Back up your SD card** — copy the entire card to your computer first
-2. Download `USB-Audio-1.0.bin` from [Releases](https://github.com/sticknobills/DelugeFirmware/releases/tag/USB-Audio-1.0)
-3. Copy the `.bin` file to the root of your SD card (no subfolders), and delete any other `.bin` there
-4. Insert the card into your Deluge and power off
-5. Hold SHIFT while powering on
-6. Wait approximately 1 minute for the flash to complete — do not interrupt or power off
-7. Your songs and samples are unaffected by the flash
-
-To revert: put an official Deluge firmware `.bin` back and repeat.
-
-### For developers (build from source)
-
-Clone this repository and follow the [upstream build instructions.](https://github.com/SynthstromAudible/DelugeFirmware/blob/main/docs/CONTRIBUTING.md)
-
-```bash
-git clone https://github.com/sticknobills/DelugeFirmware.git
-cd DelugeFirmware
-git checkout usb-audio-1.0
-# Then follow upstream build steps
-```
-
-
-## About this fork
-
-This repo is a downstream fork of [SynthstromAudible/DelugeFirmware](https://github.com/SynthstromAudible/DelugeFirmware). USB Audio is built on upstream `main` at bfd4a0b5 (2026-10-13), the development line for community release 1.3 Derbyshire, and is maintained on `usb-audio-1.0`.
-
-
-## Bugs
-
-This is an experimental feature in development by one person with a limited testing environment. [Please report any bugs!](https://github.com/sticknobills/DelugeFirmware/issues/new/choose)
-
-
-## License
-
-GPL-3.0 (from Deluge community firmware)
+## Important links
+* For acquiring and using the firmware visit the [community firmware website](https://delugecommunity.com/)
+* Once you have the firmware, consult our detailed [update guide](https://github.com/SynthstromAudible/DelugeFirmware/wiki/Update-guide) for instructions on how to install it
+* To contribute to the project with code, bug reports, suggestions, and feedback see: [How to contribute to Deluge Firmware](https://github.com/SynthstromAudible/DelugeFirmware/blob/main/docs/CONTRIBUTING.md)
+* To learn about the toolchain, application, and to start working on the code continue with: [Getting Started with Deluge Development](https://delugecommunity.com/development/deluge/getting_started/)
+* Please also visit the [Synthstrom Forum](https://forums.synthstrom.com/) and the community [Discord](https://discord.gg/BnRcyFSgaT) to interact with other users and the developers
+* You can donate to the project using the [Synthstrom Patreon](https://www.patreon.com/Synthstrom)

@@ -607,9 +607,12 @@ ActionResult InstrumentClipView::buttonAction(deluge::hid::Button b, bool on, bo
 
 					int32_t noteRowIndex = yDisplay + clip->yScroll;
 
-					if (ALPHA_OR_BETA_VERSION
-					    && (noteRowIndex < 0 || noteRowIndex >= clip->noteRows.getNumElements())) {
-						FREEZE_WITH_ERROR("E323");
+					// Deleting a NoteRow outside the array would corrupt memory - skip this press instead
+					if (noteRowIndex < 0 || noteRowIndex >= clip->noteRows.getNumElements()) {
+						if (ALPHA_OR_BETA_VERSION) {
+							FREEZE_WITH_ERROR("E323");
+						}
+						continue;
 					}
 
 					if (clip->isActiveOnOutput()) {
@@ -1612,12 +1615,25 @@ ramError:
 
 							int32_t numNotes = reader.readTagOrAttributeValueInt();
 
-							newCopiedNoteRow->numNotes = numNotes;
-
-							newCopiedNoteRow->notes =
-							    (Note*)GeneralMemoryAllocator::get().allocLowSpeed(sizeof(Note) * numNotes);
-
+							// The file is untrusted: a repeated tag mustn't leak, and the size mustn't wrap (0 would
+							// ask the allocator for its biggest block)
+							if (newCopiedNoteRow->notes) {
+								delugeDealloc(newCopiedNoteRow->notes);
+								newCopiedNoteRow->notes = nullptr;
+							}
+							newCopiedNoteRow->numNotes = 0;
 							currentNote = 0;
+
+							if (numNotes > 0 && numNotes <= INT32_MAX / (int32_t)sizeof(Note)) {
+								newCopiedNoteRow->notes =
+								    (Note*)GeneralMemoryAllocator::get().allocLowSpeed(sizeof(Note) * numNotes);
+								if (!newCopiedNoteRow->notes) {
+									deleteCopiedNoteRows();
+									display->displayError(Error::INSUFFICIENT_RAM);
+									return Error::INSUFFICIENT_RAM;
+								}
+								newCopiedNoteRow->numNotes = numNotes;
+							}
 						}
 						else if (!strcmp(tagName, "yNote")) {
 							int16_t yNote = reader.readTagOrAttributeValueInt();
@@ -1652,6 +1668,12 @@ ramError:
 									goto getOut;
 								}
 
+								// Never write past what numNotes allocated (or at all, if it hasn't been read). Keep
+								// reading so the rest of the value is consumed.
+								if (currentNote >= newCopiedNoteRow->numNotes) {
+									continue;
+								}
+
 								Note* newNote = &newCopiedNoteRow->notes[currentNote];
 
 								int32_t pos = hexToIntFixedLength(hexChars, 8);
@@ -1680,6 +1702,9 @@ ramError:
 getOut: {}
 						}
 					}
+
+					// Only paste notes that were actually read - the rest of the allocation is uninitialised
+					newCopiedNoteRow->numNotes = std::min(newCopiedNoteRow->numNotes, currentNote);
 				}
 			}
 		}
@@ -2759,7 +2784,7 @@ void InstrumentClipView::checkIfAllEditPadPressesEnded(bool mayRenderSidebar) {
 
 // adjust a note's velocity when pressing and holding a pad with a note in it and turning the horizontal encoder <>
 // this function is also called from the automation velocity editing view
-void InstrumentClipView::adjustVelocity(int32_t velocityChange) {
+void InstrumentClipView::adjustVelocity(int32_t velocityChange, bool display_value) {
 	// adjust velocity of note's pressed or remembered (if you're in note editor menu)
 	auto edit_targets = get_note_edit_targets();
 	int32_t velocityValue = 0;
@@ -2843,26 +2868,39 @@ void InstrumentClipView::adjustVelocity(int32_t velocityChange) {
 		}
 	}
 
-	// check if we're currently in the velocity note editor menu
-	// you can get there via the note editor menu or the note row editor menu if you're holding note(s)
-	bool velocity_menu_active = false;
-	if (inSoundEditor && (soundEditor.inNoteEditor() || soundEditor.inNoteRowEditor())) {
-		// we're in the note editor or note row editor
-		// get the current menu item
-		MenuItem* current_item = soundEditor.getCurrentMenuItem();
-		// are we in the note editor horizontal menu?
-		if (current_item == &noteEditorRootMenu
-		    && noteEditorRootMenu.renderingStyle() == menu_item::Submenu::HORIZONTAL) {
-			// if we're in the note editor horizontal menu, get the currently selected menu item
-			current_item = noteEditorRootMenu.getCurrentItem();
+	// the only time this is false is if you're calling this function from the note editor
+	// so we don't want to refresh menu twice
+	if (display_value) {
+		bool velocity_menu_displayed = false; // default is to show velocity change as a popup
+
+		// check if we're currently in the sound editor
+		if (inSoundEditor) {
+			// check if we're in the note editor menu or note velocity menu
+
+			// get the current menu item
+			MenuItem* current_item = soundEditor.getCurrentMenuItem();
+
+			// is the velocity menu currently displayed?
+			// it is displayed if the current item is the note editor velocity menu or the note editor horizontal menu
+			velocity_menu_displayed = (current_item == &noteVelocityMenu)
+			                          || (current_item == &noteEditorRootMenu
+			                              && noteEditorRootMenu.renderingStyle() == menu_item::Submenu::HORIZONTAL);
+
+			if (velocity_menu_displayed) {
+				current_item->readValueAgain();
+			}
 		}
-		// are we currently in the note velocity menu (vertical or horizontal?
-		velocity_menu_active = current_item == &noteVelocityMenu;
+
+		// if velocity menu is not displayed, then you're on 7seg or in oled vertical menu
+		// so display popup
+		if (!velocity_menu_displayed) {
+			displayVelocity(velocityValue, velocityChange);
+		}
 	}
 
-	// if you're not currently in the velocity note editor menu, display popup
-	if (!velocity_menu_active) {
-		displayVelocity(velocityValue, velocityChange);
+	// update instrument default velocity value
+	if (velocityValue != 255) {
+		getCurrentInstrument()->defaultVelocity = velocityValue;
 	}
 
 	reassessAllAuditionStatus();
@@ -2909,7 +2947,6 @@ void InstrumentClipView::displayVelocity(int32_t velocityValue, int32_t velocity
 			// updated when user releases last press.
 		}
 		else {
-			getCurrentInstrument()->defaultVelocity = velocityValue;
 			// if we're not in automation view, show popup
 			// automation view is currently only used in this context with velocity view
 			// which takes care of drawing velocity changes on the display
@@ -4748,8 +4785,9 @@ void InstrumentClipView::scrollVertical_potentiallySwitchOnAuditionedNotes(
 
 				if (outputType == OutputType::SYNTH) {
 					if (inSoundEditor && soundEditor.getCurrentMenuItem() == &menu_item::multiRangeMenu) {
-						menu_item::multiRangeMenu.noteOnToChangeRange(clip->getYNoteFromYDisplay(yDisplay, currentSong)
-						                                              + ((SoundInstrument*)output)->transpose);
+						menu_item::multiRangeMenu.noteOnToChangeRange(
+						    clip->getYNoteFromYDisplay(yDisplay, currentSong)
+						    + static_cast<SoundInstrument&>(*output).transpose);
 					}
 				}
 
@@ -5462,7 +5500,7 @@ void InstrumentClipView::potentiallyUpdateMultiRangeMenu(int32_t velocity, int32
 		if (getCurrentUI() == &soundEditor && soundEditor.getCurrentMenuItem() == &menu_item::multiRangeMenu) {
 			menu_item::multiRangeMenu.noteOnToChangeRange(
 			    getCurrentInstrumentClip()->getYNoteFromYDisplay(yDisplay, currentSong)
-			    + ((SoundInstrument*)instrument)->transpose);
+			    + static_cast<SoundInstrument&>(*instrument).transpose);
 		}
 	}
 }
@@ -5691,10 +5729,16 @@ doDisplayError:
 
 	setSelectedDrum(newDrum); // Does this really need to render?
 
-	// Can't fail because we just set the selected Drum
-	// TODO: what if fail because no RAM
-	bool success = soundEditor.setup(getCurrentInstrumentClip(), &menu_item::file0SelectorMenu, 0);
+	// This operation targets the new drum, even if a previous grid-pad action left
+	// the editor configured for kit-global FX while Affect Entire was enabled.
+	soundEditor.setupKitGlobalFXMenu = false;
+	if (!soundEditor.setup(getCurrentInstrumentClip(), &menu_item::file0SelectorMenu, 0)) {
+		// The new drum stays in the kit as an ordinary empty drum, but say why the browser didn't open
+		display->displayError(Error::UNSPECIFIED);
+		return;
+	}
 
+	bool success;
 	if (doRecording) {
 		success = openUI(&audioRecorder);
 		if (success) {
@@ -5729,9 +5773,10 @@ ModControllableAudio* InstrumentClipView::getModControllableAudioOrNone() {
 		if (getAffectEntire()) {
 			return static_cast<ModControllableAudio*>(output->toModControllable());
 		}
-		if (selectedDrum != nullptr) {
-			if (selectedDrum->type == DrumType::SOUND)
-				return static_cast<SoundDrum*>(selectedDrum);
+		// Use the same selected drum as the sound editor when checking shortcut relevance.
+		Drum* drum = static_cast<Kit*>(output)->selectedDrum;
+		if (drum != nullptr && drum->type == DrumType::SOUND) {
+			return static_cast<SoundDrum*>(drum);
 		}
 		break;
 	}
@@ -6606,6 +6651,16 @@ void InstrumentClipView::commandTransposeScreen(int32_t offset, bool inOctave) {
 						}
 					}
 				}
+			}
+		}
+	}
+
+	// insertStolenNodes() copies the nodes, so the stolen arrays are ours to free - including for any note that
+	// couldn't be placed
+	for (NoteToMove& ntm : notesToMove) {
+		for (StolenParamNodes& stolen : ntm.stolenMPE) {
+			if (stolen.num) {
+				delugeDealloc(stolen.nodes);
 			}
 		}
 	}
@@ -7651,8 +7706,10 @@ void InstrumentClipView::modEncoderAction(int32_t whichModEncoder, int32_t offse
 
 		if (kit->selectedDrum && kit->selectedDrum->type != DrumType::SOUND) {
 
-			if (ALPHA_OR_BETA_VERSION && !kit->getActiveClip()) {
+			// The active Clip gets dereferenced below
+			if (!kit->getActiveClip()) {
 				FREEZE_WITH_ERROR("E381");
+				return;
 			}
 
 			ModelStackWithTimelineCounter* modelStackWithTimelineCounter =

@@ -149,8 +149,8 @@ void runRoutine();
 
 void init();
 /// The volume context for a sample preview: the params the preview drum should adopt so that it sounds like the
-/// instrument or kit-row the sample will be loaded into (issue #1591). Values are already fully resolved - any kit
-/// output volume has been folded in by the caller.
+/// instrument or kit-row the sample will be loaded into (issue #1591). Values are already fully resolved - the song and
+/// kit output stages have been folded in by the caller.
 struct PreviewVolume {
 	int32_t volumePostFX;           ///< params::GLOBAL_VOLUME_POST_FX
 	int32_t localVolume;            ///< params::LOCAL_VOLUME
@@ -207,6 +207,13 @@ extern bool micPluggedIn;
 extern bool lineInPluggedIn;
 extern bool renderInStereo;
 extern uint32_t audioSampleTimer;
+// Latches true once enough samples have elapsed since power-on for the codec ADC to settle and input monitoring to
+// fade in. Until then, input monitoring (Looper/Sampler) is suppressed and then faded in, so the codec's power-on
+// transient isn't passed through to the output. See getInputMonitoringGain().
+extern bool inputMonitoringWarmedUp;
+// Set during a render if any audio track is monitoring the USB input. USB direct monitoring stands aside for that
+// window, or the host's audio would be heard twice. Cleared at the start of each render
+extern bool usbInputMonitoredByTrack;
 extern bool mustUpdateReverbParamsBeforeNextRender;
 extern bool bypassCulling;
 extern uint32_t i2sTXBufferPos;
@@ -234,6 +241,23 @@ extern StereoFloatSample approxRMSLevel;
 extern AbsValueFollower envelopeFollower;
 extern TaskID routine_task_id;
 void feedReverbBackdoorForGrain(int index, q31_t value);
+/// Gain to apply to monitored codec input, `offset` samples into the buffer currently being rendered. 0 until the
+/// codec has settled after power-on, then ramps up to full scale.
+q31_t getInputMonitoringGain(uint32_t offset);
+
+/// Each live input source has a ring buffer laid out like the SSI RX buffer - same length, same stereo interleaving -
+/// and kept in step with it, so the same offset into any of them is the same moment. These find the one for a source:
+/// the USB input's for AudioInputChannel::USB, the SSI RX buffer for the others.
+int32_t* getInputBufferStart(AudioInputChannel channel);
+int32_t* getInputBufferEnd(AudioInputChannel channel);
+/// Where the audio about to be rendered starts, in the source's input buffer - i2sRXBufferPos, translated to it
+int32_t* getInputReadPos(AudioInputChannel channel);
+
+/// Whether a source is the codec's line/mic input - as opposed to USB audio, which is also external (below
+/// AUDIO_INPUT_CHANNEL_FIRST_INTERNAL_OPTION) but needs none of the codec's normalising or jack detection
+constexpr bool isCodecInput(AudioInputChannel channel) {
+	return channel < AUDIO_INPUT_CHANNEL_FIRST_INTERNAL_OPTION && channel != AudioInputChannel::USB;
+}
 
 /// returns whether a voice is allowed to start right now - otherwise it should be deferred to the next tick
 bool allowedToStartVoice();
@@ -241,10 +265,6 @@ bool allowedToStartVoice();
 /// Remove these gate channels from any output waiting to be sent by the MIDI/gate timer, because they've been
 /// superseded by a newer state which is being output now
 void cancelScheduledGates(uint8_t gateMask, const InterruptsDisabled&);
-/// Call before adding a MIDI clock to the output buffer. Returns false if a MIDI flush is already scheduled for the
-/// MIDI/gate timer (the clock would then go out early with it). Otherwise flushes anything already in the MIDI output
-/// buffer so the clock can be sent on its own at its own time.
-bool prepareToSendMIDIClock(const InterruptsDisabled&);
 /// Called from the MIDI/gate timer ISR. Sends any MIDI/gate output which is due and re-arms the timer for the rest
 void midiGateOutputTimerFired();
 } // namespace AudioEngine

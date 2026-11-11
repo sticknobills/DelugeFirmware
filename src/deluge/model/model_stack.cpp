@@ -32,11 +32,9 @@ using namespace deluge::modulation::params;
 ModelStackWithThreeMainThings* ModelStackWithTimelineCounter::addNoteRowAndExtraStuff(int32_t noteRowIndex,
                                                                                       NoteRow* newNoteRow) const {
 
-#if ALPHA_OR_BETA_VERSION
 	if (!newNoteRow->paramManager.containsAnyParamCollectionsIncludingExpression()) {
 		FREEZE_WITH_ERROR("E389");
 	}
-#endif
 
 	ModelStackWithThreeMainThings* toReturn = (ModelStackWithThreeMainThings*)this;
 
@@ -269,11 +267,14 @@ ModelStackWithAutoParam* ModelStackWithThreeMainThings::getPatchCableAutoParamFr
 }
 
 ModelStackWithAutoParam* ModelStackWithThreeMainThings::getExpressionAutoParamFromID(int32_t newParamId) {
-	if (newParamId >= kNumExpressionDimensions) {
+	if (!paramManager || newParamId < 0 || newParamId >= kNumExpressionDimensions) {
 		return addParamCollectionAndId(nullptr, nullptr, 0)->addAutoParam(nullptr); // "No param"
 	}
 
-	paramManager->ensureExpressionParamSetExists(); // Allowed to fail
+	// Allowed to fail (no RAM), in which case there's no collection to look the param up in
+	if (!paramManager->ensureExpressionParamSetExists()) {
+		return addParamCollectionAndId(nullptr, nullptr, 0)->addAutoParam(nullptr); // "No param"
+	}
 	ParamCollectionSummary* summary = paramManager->getExpressionParamSetSummary();
 	ModelStackWithParamId* modelStackWithParamId =
 	    addParamCollectionAndId(summary->paramCollection, summary, newParamId);

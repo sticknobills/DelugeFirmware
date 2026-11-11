@@ -455,12 +455,15 @@ void Kit::drumRemoved(Drum* drum) {
 		selectedDrum = nullptr;
 	}
 
-#if ALPHA_OR_BETA_VERSION
+	// The Drum is usually about to be deallocated, so it must not stay in the render list, or
+	// renderGlobalEffectableForClip() would use it after it's freed. Remove it in all builds.
 	int32_t i = drumsWithRenderingActive.searchExact((int32_t)drum);
 	if (i != -1) {
-		FREEZE_WITH_ERROR("E321");
+		if constexpr (ALPHA_OR_BETA_VERSION) {
+			FREEZE_WITH_ERROR("E321");
+		}
+		drumsWithRenderingActive.deleteAtIndex(i);
 	}
-#endif
 }
 
 Drum* Kit::getFirstUnassignedDrum(InstrumentClip* clip) {
@@ -530,16 +533,20 @@ void Kit::cutAllSound() {
 // Beware - unlike usual, modelStack, a ModelStackWithThreeMainThings*,  might have a NULL timelineCounter
 bool Kit::renderGlobalEffectableForClip(ModelStackWithTimelineCounter* modelStack,
                                         std::span<StereoSample> globalEffectableBuffer, int32_t* bufferToTransferTo,
-                                        int32_t* reverbBuffer, int32_t reverbAmountAdjust, int32_t sideChainHitPending,
-                                        bool shouldLimitDelayFeedback, bool isClipActive, int32_t pitchAdjust,
+                                        int32_t* reverbBuffer, RenderAdjustments& adjustments,
+                                        int32_t sideChainHitPending, bool shouldLimitDelayFeedback, bool isClipActive,
                                         int32_t amplitudeAtStart, int32_t amplitudeAtEnd) {
 	bool rendered = false;
 	// Render Drums. Traverse backwards, in case one stops rendering (removing itself from the list) as we render it
 	for (int32_t d = drumsWithRenderingActive.getNumElements() - 1; d >= 0; d--) {
 		Drum* thisDrum = (Drum*)drumsWithRenderingActive.getKeyAtIndex(d);
 
-		if (ALPHA_OR_BETA_VERSION && thisDrum->type != DrumType::SOUND) {
-			FREEZE_WITH_ERROR("E253");
+		// Only SoundDrums may be in this list - don't render anything else as one
+		if (thisDrum->type != DrumType::SOUND) {
+			if constexpr (ALPHA_OR_BETA_VERSION) {
+				FREEZE_WITH_ERROR("E253");
+			}
+			continue;
 		}
 
 		SoundDrum* soundDrum = (SoundDrum*)thisDrum;
@@ -573,7 +580,7 @@ bool Kit::renderGlobalEffectableForClip(ModelStackWithTimelineCounter* modelStac
 		    modelStack->addNoteRow(noteRowIndex, thisNoteRow)->addOtherTwoThings(soundDrum, drumParamManager);
 
 		soundDrum->render(modelStackWithThreeMainThings, globalEffectableBuffer, reverbBuffer, sideChainHitPending,
-		                  reverbAmountAdjust, shouldLimitDelayFeedback, pitchAdjust,
+		                  adjustments.reverbAmount(), shouldLimitDelayFeedback, adjustments.pitch(),
 		                  nullptr); // According to our volume, we tell Drums to send less reverb
 		rendered = true;
 	}
@@ -678,14 +685,12 @@ void Kit::renderOutput(ModelStack* modelStack, std::span<StereoSample> output, i
 	// render kit row without kit affect entire FX (but leave in kit affect entire pitch adjustment)
 	if (stemExport.processStarted && (stemExport.currentStemExportType == StemExportType::DRUM)
 	    && !stemExport.includeKitFX) [[unlikely]] {
-		UnpatchedParamSet* unpatchedParams = paramManager->getUnpatchedParamSet();
-
-		int32_t pitchAdjust =
-		    getFinalParameterValueExp(kMaxSampleValue, unpatchedParams->getValue(params::UNPATCHED_PITCH_ADJUST) >> 3);
+		// Pitch adjust as usual, but the drums' reverb isn't scaled by the kit's volume
+		RenderAdjustments adjustments{*this, *paramManager, reverbAmountAdjust, false};
 
 		GlobalEffectableForClip::renderedLastTime = renderGlobalEffectableForClip(
-		    modelStackWithTimelineCounter, output, nullptr, reverbBuffer, reverbAmountAdjust, sideChainHitPending,
-		    shouldLimitDelayFeedback, isClipActive, pitchAdjust, 134217728, 134217728);
+		    modelStackWithTimelineCounter, output, nullptr, reverbBuffer, adjustments, sideChainHitPending,
+		    shouldLimitDelayFeedback, isClipActive, 134217728, 134217728);
 	}
 	// render kit row with kit affect entire FX
 	else {
@@ -911,10 +916,10 @@ void Kit::choke() {
 	}
 }
 
-void Kit::resyncLFOs() {
+void Kit::resyncLFOs(bool reset_state) {
 	for (Drum* thisDrum = firstDrum; thisDrum; thisDrum = thisDrum->next) {
 		if (thisDrum && thisDrum->type == DrumType::SOUND) {
-			((SoundDrum*)thisDrum)->resyncGlobalLFOs();
+			((SoundDrum*)thisDrum)->resyncGlobalLFOs(reset_state);
 		}
 	}
 }
@@ -1312,6 +1317,7 @@ void Kit::noteOnPreKitArp(ModelStackWithThreeMainThings* modelStack, Drum* drum,
 		}
 
 		// If kit arp not bypassed, execute instruction
+		kitInstruction.sampleSyncLengthOn = sampleSyncLength;
 		arpeggiator.noteOn(arpSettings, drumIndex, velocity, &kitInstruction, fromMIDIChannel, mpeValues);
 		if (kitInstruction.arpNoteOn != nullptr && kitInstruction.arpNoteOn->noteCodeOnPostArp[0] != ARP_NOTE_NONE) {
 			// Set the invertReverse flag for the drum arpeggiator

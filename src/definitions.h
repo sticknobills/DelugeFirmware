@@ -3,7 +3,10 @@
 #include "RZA1/cpu_specific.h"
 #include "RZA1/system/r_typedefs.h"
 
-#define ALPHA_OR_BETA_VERSION 1 // Whether to compile with additional error-checking
+// Whether to compile with additional error-checking. The build sets this to 0 for rc/release builds.
+#ifndef ALPHA_OR_BETA_VERSION
+#define ALPHA_OR_BETA_VERSION 1
+#endif
 
 #if !defined(NDEBUG)
 #define ENABLE_SEQUENTIALITY_TESTS 1
@@ -49,9 +52,6 @@ extern void freezeWithError(char const* errmsg);
 #define TIMER_SYSTEM_SUPERFAST 1
 
 #define SSI_TX_BUFFER_NUM_SAMPLES 128
-
-// How far the output stage shifts the mix up on its way to the codec.
-#define AUDIO_OUTPUT_GAIN_DOUBLINGS 8
 #define SSI_RX_BUFFER_NUM_SAMPLES 2048
 #define NUM_MONO_INPUT_CHANNELS (NUM_STEREO_INPUT_CHANNELS * 2)
 #define NUM_MONO_OUTPUT_CHANNELS (NUM_STEREO_OUTPUT_CHANNELS * 2)

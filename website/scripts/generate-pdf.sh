@@ -4,7 +4,9 @@ set -euo pipefail
 # Run from website/ after building the site.
 SITE_BASE_PATH=${SITE_BASE_PATH:-}
 preview_log=$(mktemp)
-node ./node_modules/astro/astro.js preview --host 127.0.0.1 --port 4321 > "$preview_log" 2>&1 &
+# --ignore-lock keeps the server in the foreground (Astro 7 backgrounds it when
+# it detects an AI agent) so this script owns, and later kills, the process.
+node ./node_modules/astro/bin/astro.mjs preview --host 127.0.0.1 --port 4321 --ignore-lock > "$preview_log" 2>&1 &
 preview_pid=$!
 trap 'kill "$preview_pid" 2>/dev/null || true; rm -f "$preview_log"' EXIT
 
@@ -41,5 +43,7 @@ pnpm exec starlight-to-pdf "$preview_url" \
   --print-bg \
   --pdf-outline \
   --margins '0 0 0 0' \
-  --paddings '2cm 1cm 2cm 1.5cm'
+  --paddings '2cm 1cm 2cm 1.5cm' \
+  --styles src/assets/starlight2pdf/body.css
+
 test -s dist/downloads/delugecommunity.com.pdf

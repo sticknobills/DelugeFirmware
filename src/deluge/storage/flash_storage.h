@@ -84,20 +84,15 @@ extern ScreensaverMode screensaverMode;
 /// kMaxScreensaverTimeoutMinutes.
 extern uint8_t screensaverTimeoutMinutes;
 
-/// USB audio: which returning pair is summed into the song's mix (0 none, 1 pair 1-2, 2 pair 3-4), its level
-/// (0-50), and the compensation delay in ms. Per machine, because they describe what is on the other end of the
-/// cable.
-extern uint8_t usbAudioReturnPair;
-extern uint8_t usbAudioReturnLevel;
-extern uint8_t usbAudioCompensationMs;
-
 extern ThresholdRecordingMode defaultThresholdRecordingMode;
 
 extern Polarity defaultPatchCablePolarity;
 
-extern GlobalMIDICommand defaultLoopRecordingCommand;
-
 extern bool defaultUseSharps;
+
+/// Whether the Deluge offers USB audio to a computer, alongside USB MIDI. Read when USB starts up as a peripheral, at
+/// power-on - changing it takes effect after a restart
+extern bool usbAudioEnabled;
 
 void readSettings();
 void writeSettings();

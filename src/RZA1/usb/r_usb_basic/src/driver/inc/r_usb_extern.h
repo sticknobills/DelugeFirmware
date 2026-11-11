@@ -181,10 +181,8 @@ void usb_pstd_data_end(uint16_t pipe, uint16_t status);
 #if (USB_CFG_MODE & USB_CFG_PERI) == USB_CFG_PERI
 void usb_pstd_nrdy_pipe_process(uint16_t bitsts);
 void usb_pstd_bemp_pipe_process(uint16_t bitsts);
-void usb_pstd_bemp_pipe_process_paudio(uint16_t bitsts);
 void usb_pstd_bemp_pipe_process_rohan_midi(uint16_t bitsts); // By Rohan
 void usb_pstd_brdy_pipe_process(uint16_t bitsts);
-void usb_pstd_brdy_pipe_process_paudio(uint16_t bitsts);
 void usb_pstd_brdy_pipe_process_rohan_midi(uint16_t bitsts); // By Rohan
 
 #endif /* (USB_CFG_MODE & USB_CFG_PERI) == USB_CFG_PERI */
@@ -587,6 +585,7 @@ extern void usb_hmsc_drive_complete(usb_utr_t* ptr, uint16_t addr, uint16_t data
 #endif /* defined(USB_CFG_HMSC_USE) */
 
 extern uint16_t g_usb_pstd_eptbl[];
+extern uint16_t g_usb_pstd_eptbl_midi_only[];
 
 #if defined(USB_CFG_PMSC_USE)
 extern void usb_pmsc_receive_cbw(void);

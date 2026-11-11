@@ -439,6 +439,12 @@ static void usb_hmidi_enumeration_sequence(usb_utr_t* mess)
             desc_len = ((uint16_t)*(p_desc + 3)) << 8;
             desc_len += (uint16_t)*(p_desc + 2);
 
+            // Descriptors longer than the buffer were truncated when fetched, so don't parse past it
+            if (desc_len > USB_CONFIGSIZE)
+            {
+                desc_len = USB_CONFIGSIZE;
+            }
+
             /* Searching InterfaceDescriptor */
             p_iftable = g_p_usb_hmidi_interface_table[mess->ip];
 
@@ -530,8 +536,8 @@ uint16_t usb_hmidi_pipe_info(usb_utr_t* ptr, uint8_t* table, uint16_t speed, uin
     /* Descriptor Address set */
     ofdsc = table[0];
 
-    /* Loop for Endpoint Descriptor search */
-    while (ofdsc < length)
+    /* Loop for Endpoint Descriptor search. Stop at a descriptor which doesn't fit within length */
+    while (ofdsc < length && ofdsc + table[ofdsc] <= length)
     {
         /* Branch descriptor type */
         switch (table[ofdsc + 1])
@@ -825,6 +831,14 @@ void hmidi_detach(usb_utr_t* ptr, uint16_t devadr, uint16_t data2)
         int devAddrHere = g_usb_hmidi_tmp_ep_tbl[USB_CFG_USE_USBIP][d][3] >> USB_DEVADDRBIT;
         if (devAddrHere == devadr)
             break;
+    }
+
+    // Not found - there's no table entry to clear, and indexing with d would write out of bounds. Still report it, so
+    // hostedDeviceDetached() can flag it (E367) in beta builds - it ignores out-of-range device numbers.
+    if (d == MAX_NUM_USB_MIDI_DEVICES)
+    {
+        hostedDeviceDetached(USB_CFG_USE_USBIP, d);
+        return;
     }
 
     // Clear endpoint table

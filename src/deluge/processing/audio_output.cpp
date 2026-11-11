@@ -29,7 +29,6 @@
 #include "playback/mode/playback_mode.h"
 #include "playback/playback_handler.h"
 #include "processing/engines/audio_engine.h"
-#include "processing/engines/usb_audio_stream.h"
 #include "storage/audio/audio_file.h"
 #include "storage/storage_manager.h"
 #include "util/lookuptables/lookuptables.h"
@@ -137,10 +136,9 @@ bool AudioOutput::modeAllowsMonitoring() const {
 // Beware - unlike usual, modelStack, a ModelStackWithThreeMainThings*,  might have a NULL timelineCounter
 bool AudioOutput::renderGlobalEffectableForClip(ModelStackWithTimelineCounter* modelStack,
                                                 std::span<StereoSample> render, int32_t* bufferToTransferTo,
-                                                int32_t* reverbBuffer, int32_t reverbAmountAdjust,
+                                                int32_t* reverbBuffer, RenderAdjustments& adjustments,
                                                 int32_t sideChainHitPending, bool shouldLimitDelayFeedback,
-                                                bool isClipActive, int32_t pitchAdjust, int32_t amplitudeAtStart,
-                                                int32_t amplitudeAtEnd) {
+                                                bool isClipActive, int32_t amplitudeAtStart, int32_t amplitudeAtEnd) {
 	bool rendered = false;
 	// audio outputs can have an activeClip while being muted
 	if (isClipActive) {
@@ -183,7 +181,7 @@ renderEnvelope:
 
 				std::span render_mono{reinterpret_cast<q31_t*>(render.data()), render.size()};
 				activeAudioClip.render(modelStack, render_mono, amplitudeEffectiveStart, amplitudeIncrementEffective,
-				                       pitchAdjust);
+				                       adjustments.pitch());
 				rendered = true;
 				amplitudeLastTime = amplitudeLocal;
 
@@ -209,37 +207,35 @@ renderEnvelope:
 	                                     ? std::span{reinterpret_cast<StereoSample*>(bufferToTransferTo), render.size()}
 	                                     : render;
 
-	// Audio arriving over USB as this track's input, rendered through the track like a line input. Reading it here
-	// also takes that pair off the song's own mix, which is summed later.
-	if (modeAllowsMonitoring() && modelStack->song->isOutputActiveInArrangement(this)
-	    && isUsbReturnInput(inputChannel)) {
+	// add in the monitored audio if in sampler or looper mode. Suppress until the codec ADC has settled after
+	// power-on, then fade it in (issue #4517) - otherwise its power-on transient gets passed straight through to the
+	// output.
+	q31_t const monitoring_gain_end = AudioEngine::getInputMonitoringGain(render.size());
+	if (monitoring_gain_end != 0 && modeAllowsMonitoring() && modelStack->song->isOutputActiveInArrangement(this)
+	    && inputChannel != AudioInputChannel::SPECIFIC_OUTPUT) {
 		rendered = true;
-		const uint32_t monoChannel = usbReturnMonoChannelOf(inputChannel);
-		if (monoChannel != 0) {
-			deluge::processing::engines::USBAudioStream::readReturnChannel(
-			    monoChannel, output.data(), (uint32_t)output.size(), amplitudeAtStart, amplitudeAtEnd);
-		}
-		else {
-			deluge::processing::engines::USBAudioStream::readReturnPair(usbReturnPairOf(inputChannel), output.data(),
-			                                                            (uint32_t)output.size(), amplitudeAtStart,
-			                                                            amplitudeAtEnd);
-		}
-	}
-
-	// add in the monitored audio if in sampler or looper mode
-	else if (modeAllowsMonitoring() && modelStack->song->isOutputActiveInArrangement(this)
-	         && inputChannel != AudioInputChannel::SPECIFIC_OUTPUT) {
-		rendered = true;
-		int32_t const* __restrict__ input_ptr = (int32_t const*)AudioEngine::i2sRXBufferPos;
+		int32_t const* __restrict__ input_ptr = AudioEngine::getInputReadPos(inputChannel);
+		int32_t const* const input_end = AudioEngine::getInputBufferEnd(inputChannel);
 
 		AudioInputChannel input_channel = this->inputChannel;
+		if (input_channel == AudioInputChannel::USB) {
+			input_channel = AudioInputChannel::STEREO; // Just a stereo input, from a different buffer
+			AudioEngine::usbInputMonitoredByTrack = true;
+		}
 		if (input_channel == AudioInputChannel::STEREO && !AudioEngine::renderInStereo) {
 			input_channel = AudioInputChannel::NONE; // 0 means combine channels
 		}
 
-		auto amplitude_increment = static_cast<int32_t>((static_cast<double>(amplitudeAtEnd - amplitudeAtStart) //
+		int32_t amplitude_start = amplitudeAtStart;
+		int32_t amplitude_end = amplitudeAtEnd;
+		if (!AudioEngine::inputMonitoringWarmedUp) {
+			amplitude_start = multiply_32x32_rshift32(amplitude_start, AudioEngine::getInputMonitoringGain(0)) << 1;
+			amplitude_end = multiply_32x32_rshift32(amplitude_end, monitoring_gain_end) << 1;
+		}
+
+		auto amplitude_increment = static_cast<int32_t>((static_cast<double>(amplitude_end - amplitude_start) //
 		                                                 / static_cast<double>(render.size())));
-		int32_t amplitude = amplitudeAtStart;
+		int32_t amplitude = amplitude_start;
 
 		for (StereoSample& output_sample : output) {
 			amplitude += amplitude_increment;
@@ -274,7 +270,7 @@ renderEnvelope:
 			}
 
 			input_ptr += NUM_MONO_INPUT_CHANNELS;
-			if (input_ptr >= getRxBufferEnd()) {
+			if (input_ptr >= input_end) {
 				input_ptr -= SSI_RX_BUFFER_NUM_SAMPLES * NUM_MONO_INPUT_CHANNELS;
 			}
 		}
@@ -287,8 +283,8 @@ renderEnvelope:
 		rendered = true;
 		std::byte modelStackMemory[MODEL_STACK_MAX_SIZE];
 		ModelStack* songModelStack = setupModelStackWithSong(modelStackMemory, currentSong);
-		outputRecordingFrom->renderOutput(songModelStack, output, reverbBuffer, reverbAmountAdjust, sideChainHitPending,
-		                                  shouldLimitDelayFeedback, isClipActive);
+		outputRecordingFrom->renderOutput(songModelStack, output, reverbBuffer, adjustments.reverbAmount(),
+		                                  sideChainHitPending, shouldLimitDelayFeedback, isClipActive);
 	}
 	return rendered;
 }
@@ -320,7 +316,13 @@ bool AudioOutput::writeDataToFile(Serializer& writer, Clip* clipForSavingOutputO
 	writer.writeAttribute("mode", aoModeToString(mode));
 
 	writer.writeAttribute("inputChannel", inputChannelToString(inputChannel));
-	writer.writeAttribute("outputRecordingIndex", currentSong->getOutputIndex(outputRecordingFrom));
+	// getOutputIndex() returns 0 for an output that isn't in the song, which would reload as recording from the first
+	// track - possibly one that records from us. Save -1 (no source) instead.
+	int32_t outputRecordingIndex = currentSong->getOutputIndex(outputRecordingFrom);
+	if (!outputRecordingFrom || currentSong->getOutputFromIndex(outputRecordingIndex) != outputRecordingFrom) {
+		outputRecordingIndex = -1;
+	}
+	writer.writeAttribute("outputRecordingIndex", outputRecordingIndex);
 	Output::writeDataToFile(writer, clipForSavingOutputOnly, song);
 
 	GlobalEffectableForClip::writeAttributesToFile(writer, clipForSavingOutputOnly == nullptr);
@@ -404,13 +406,20 @@ Clip* AudioOutput::createNewClipForArrangementRecording(ModelStack* modelStack) 
 	}
 
 	AudioClip* newClip = new (clipMemory) AudioClip();
-	newClip->setOutput(modelStack->addTimelineCounter(newClip), this);
+	Error error = newClip->setOutput(modelStack->addTimelineCounter(newClip), this);
 
-#if ALPHA_OR_BETA_VERSION
-	if (!newClip->paramManager.summaries[0].paramCollection) {
-		FREEZE_WITH_ERROR("E422"); // Trying to diversify Leo's E410
+	// A Clip without param collections would crash as soon as its params are accessed. Bail in all builds - the
+	// caller handles NULL as insufficient RAM.
+	if (error != Error::NONE || !newClip->paramManager.summaries[0].paramCollection) {
+		if constexpr (ALPHA_OR_BETA_VERSION) {
+			if (error == Error::NONE) {
+				FREEZE_WITH_ERROR("E422"); // Trying to diversify Leo's E410
+			}
+		}
+		newClip->~AudioClip();
+		delugeDealloc(clipMemory);
+		return nullptr;
 	}
-#endif
 
 	return newClip;
 }
