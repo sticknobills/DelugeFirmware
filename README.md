@@ -1,8 +1,8 @@
-# Deluge USB Audio 2.0 — multitrack
+# Deluge USB Audio — multitrack
 
 Multitrack USB audio for the Deluge: send each track to its own channel in your DAW, and send up to four channels back. No driver needed.
 
-2.0 is built on the community firmware's own USB audio, which already gives the Deluge a stereo USB audio interface. It adds a third mode, multitrack, alongside upstream's MIDI-only and stereo modes.
+The current release (2.0) is built on the community firmware's own USB audio, which already gives the Deluge a stereo USB audio interface. It adds a third mode, multitrack, alongside the community nightly build's MIDI-only and stereo modes.
 
 ## Features
 
@@ -33,13 +33,13 @@ The computer's channels 1-2 are mixed straight into the Deluge's outputs by defa
 
 📖 [USB Audio guide](website/src/content/docs/features/usb_audio.mdx): every mode, setting and limitation, including how to send a track through an effect and back.
 
-## Changes from USB Audio 1.0
+## Changes from previous releases
 
-- 1.0's own USB audio is replaced by the community firmware's, with multitrack added on top. Clocking now follows upstream's design.
+- 1.0's USB audio is replaced by the community firmware's, with multitrack added on top. Clocking now follows upstream's design.
 - The settings moved from `SETTINGS > USB` to `SETTINGS > USB AUDIO`.
-- `RTN` and `RLVL` are gone. Channels 1-2 use upstream's `INPUT` setting, which mixes them in after the song's effects. Channels 3-4 are heard through an audio clip.
+- `RTN` and `RLVL` are gone. Channels 1-2 use the community firmware's `INPUT` setting, which mixes them in after the song's effects. Channels 3-4 are heard through an audio clip.
 - An audio clip takes a pair as its source: `USB INPUT` (1-2) or `USB INPUT 3-4`. Single return channels are gone; a 1.0 song set to one loads as the pair it belongs to.
-- Track routing saved in 1.0 songs loads unchanged.
+- Track routing saved in release 1.0 songs loads unchanged.
 - Delay compensation no longer delays the audio coming back from the computer.
 
 ## Compatibility
