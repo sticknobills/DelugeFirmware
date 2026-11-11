@@ -55,7 +55,7 @@ While connected as a USB audio device, the Deluge cannot host a USB MIDI control
 ### For users (flash only)
 
 1. **Back up your SD card**: copy the entire card to your computer first.
-2. Download `USB-Multitrack-Audio.bin` from [Releases](https://github.com/sticknobills/DelugeFirmware/releases/tag/USB-Multitrack-Audio).
+2. Download `USB-Multitrack-Audio-2.0.bin` from [Releases](https://github.com/sticknobills/DelugeFirmware/releases/tag/USB-Multitrack-Audio).
 3. Copy the `.bin` file to the root of your SD card (no subfolders), and delete any other `.bin` there.
 4. Insert the card into your Deluge and power off.
 5. Hold `SHIFT` while powering on.
