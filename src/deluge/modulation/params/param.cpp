@@ -287,6 +287,8 @@ char const* getParamDisplayName(Kind kind, int32_t p) {
 		    [UNPATCHED_MOD_FX_FEEDBACK] = STRING_FOR_MODFX_FEEDBACK,
 		    [UNPATCHED_SIDECHAIN_SHAPE] = STRING_FOR_SIDECHAIN_SHAPE,
 		    [UNPATCHED_COMPRESSOR_THRESHOLD] = STRING_FOR_THRESHOLD,
+		    [UNPATCHED_CV1_SEND] = STRING_FOR_CV_OUTPUT_CV1,
+		    [UNPATCHED_CV2_SEND] = STRING_FOR_CV_OUTPUT_CV2,
 		    [UNPATCHED_ARP_GATE] = STRING_FOR_ARP_GATE_MENU_TITLE,
 		    [UNPATCHED_ARP_RHYTHM] = STRING_FOR_ARP_RHYTHM_MENU_TITLE,
 		    [UNPATCHED_ARP_SEQUENCE_LENGTH] = STRING_FOR_ARP_SEQUENCE_LENGTH_MENU_TITLE,
@@ -566,6 +568,13 @@ constexpr char const* paramNameForFileConst(Kind const kind, ParamType const par
 
 		case UNPATCHED_SPREAD_VELOCITY:
 			return "spreadVelocity";
+
+		// Legacy AUX Sends 1.0.x params: read by their own tags, never written by name.
+		case UNPATCHED_CV1_SEND:
+			return "cv1Send";
+
+		case UNPATCHED_CV2_SEND:
+			return "cv2Send";
 
 		case UNPATCHED_NUM_SHARED:
 		    // Intentionally not handled

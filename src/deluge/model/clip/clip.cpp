@@ -30,8 +30,10 @@
 #include "model/consequence/consequence_output_existence.h"
 #include "model/output.h"
 #include "model/song/song.h"
+#include "modulation/params/param_set.h"
 #include "playback/mode/playback_mode.h"
 #include "playback/playback_handler.h"
+#include "processing/engines/cv_audio_stream.h"
 #include "processing/sound/sound_instrument.h"
 #include "storage/storage_manager.h"
 #include <new>
@@ -58,6 +60,11 @@ Clip::Clip(ClipType newType) : type(newType) {
 	originalLength = 0;
 	armedForRecording = true;
 	launchStyle = LaunchStyle::DEFAULT;
+	cvOutput = 0;
+	cvGainLast = 0;
+	cvLegacyCheckPending = false;
+	cvOutputReadFromFile = false;
+	cvLegacyRoutingBits = 0;
 	fillEventAtTickCount = 0;
 
 	// initialize automation clip view variables
@@ -95,6 +102,7 @@ void Clip::cloneFrom(Clip const* otherClip) {
 	repeatCount = otherClip->repeatCount;
 	armedForRecording = otherClip->armedForRecording;
 	launchStyle = otherClip->launchStyle;
+	cvOutput = otherClip->cvOutput;
 }
 
 void Clip::copyBasicsFrom(Clip const* otherClip) {
@@ -103,6 +111,7 @@ void Clip::copyBasicsFrom(Clip const* otherClip) {
 	// modKnobMode = otherClip->modKnobMode;
 	section = otherClip->section;
 	launchStyle = otherClip->launchStyle;
+	cvOutput = otherClip->cvOutput;
 	onAutomationClipView = otherClip->onAutomationClipView;
 }
 
@@ -687,6 +696,14 @@ void Clip::writeDataToFile(Serializer& writer, Song* song) {
 	if (launchStyle != LaunchStyle::DEFAULT) {
 		writer.writeAttribute("launchStyle", launchStyleToString(launchStyle));
 	}
+	// Only written when it differs from MAIN, so songs which never use the CV outputs are
+	// byte-for-byte as before. Firmware which doesn't know this attribute skips it, same as any
+	// other unrecognised one. A song from 1.0.x that has not played yet is converted first, or
+	// its routing would be lost on this save.
+	applyLegacyCvRouting();
+	if (cvOutput != 0) {
+		writer.writeAttribute("cvOutput", cvOutput);
+	}
 }
 
 void Clip::writeMidiCommandsToFile(Serializer& writer, Song* song) {
@@ -694,6 +711,8 @@ void Clip::writeMidiCommandsToFile(Serializer& writer, Song* song) {
 }
 
 void Clip::readTagFromFile(Deserializer& reader, char const* tagName, Song* song, int32_t* readAutomationUpToPos) {
+	// Any tag at all means this Clip came from a file, which may be one saved by AUX Sends 1.0.x or earlier.
+	cvLegacyCheckPending = true;
 
 	if (!strcmp(tagName, "isPlaying")) {
 		activeIfNoSolo = reader.readTagOrAttributeValueInt();
@@ -763,6 +782,18 @@ void Clip::readTagFromFile(Deserializer& reader, char const* tagName, Song* song
 
 	else if (!strcmp(tagName, "launchStyle")) {
 		launchStyle = stringToLaunchStyle(reader.readTagOrAttributeValue());
+	}
+
+	else if (!strcmp(tagName, "cvRouting")) {
+		// Written by AUX Sends 1.0.x and earlier. Masked, so unknown bits cannot reach the conversion.
+		cvLegacyRoutingBits = (uint8_t)reader.readTagOrAttributeValueInt() & ClipRoute::ALL;
+	}
+
+	else if (!strcmp(tagName, "cvOutput")) {
+		// Anything out of range from a later firmware falls back to MAIN.
+		const int32_t value = reader.readTagOrAttributeValueInt();
+		cvOutput = (value >= 0 && value < deluge::processing::engines::kNumCvOutputs) ? (uint8_t)value : 0;
+		cvOutputReadFromFile = true;
 	}
 
 	/*
@@ -1182,4 +1213,48 @@ void Clip::setupOverdubInPlace(OverDubType type) {
 	// This is used to indicate a cloned overdub clip that doesn't have anything in it, not overdub in place
 	isPendingOverdub = false;
 	overdubNature = type;
+}
+
+void Clip::applyLegacyCvRouting() {
+	using deluge::processing::engines::cvGetLegacySplitOff;
+	using deluge::processing::engines::CvOutput;
+	namespace params = deluge::modulation::params;
+
+	if (!cvLegacyCheckPending) {
+		return;
+	}
+	cvLegacyCheckPending = false;
+
+	bool toCv1 = (cvLegacyRoutingBits & ClipRoute::CV1) != 0;
+	bool toCv2 = (cvLegacyRoutingBits & ClipRoute::CV2) != 0;
+
+	// 1.0.x kept a send level per socket in the patch. Any send above off counts as routed.
+	// They are reset to off afterwards: nothing writes them any more, and a preset loaded later
+	// must not reroute the track.
+	if (paramManager.containsAnyMainParamCollections()) {
+		UnpatchedParamSet* const unpatched = paramManager.getUnpatchedParamSet();
+		toCv1 = toCv1 || unpatched->getValue(params::UNPATCHED_CV1_SEND) != params::kCvSendOff;
+		toCv2 = toCv2 || unpatched->getValue(params::UNPATCHED_CV2_SEND) != params::kCvSendOff;
+		unpatched->params[params::UNPATCHED_CV1_SEND].setCurrentValueBasicForSetup(params::kCvSendOff);
+		unpatched->params[params::UNPATCHED_CV2_SEND].setCurrentValueBasicForSetup(params::kCvSendOff);
+	}
+
+	const uint8_t legacyBits = cvLegacyRoutingBits;
+	cvLegacyRoutingBits = 0;
+	if (cvOutputReadFromFile || (!toCv1 && !toCv2)) {
+		return;
+	}
+
+	// Songs from before sends carried the stereo split per Clip. 1.0.x made it one setting for
+	// the whole unit, on unless switched off, and with it on the one send was CV1's.
+	const bool split =
+	    (legacyBits & ClipRoute::ANY_CV) ? (legacyBits & ClipRoute::STEREO_SPLIT) != 0 : !cvGetLegacySplitOff();
+	CvOutput output;
+	if (split || (toCv1 && toCv2)) {
+		output = CvOutput::STEREO;
+	}
+	else {
+		output = toCv1 ? CvOutput::CV1 : CvOutput::CV2;
+	}
+	cvOutput = static_cast<uint8_t>(output);
 }

@@ -61,6 +61,7 @@
 #include "playback/mode/arrangement.h"
 #include "playback/mode/session.h"
 #include "processing/engines/audio_engine.h"
+#include "processing/engines/cv_audio_stream.h"
 #include "processing/engines/cv_engine.h"
 #include "scheduler_api.h"
 #include "storage/audio/audio_file_manager.h"
@@ -142,8 +143,11 @@ void inputRoutine() {
 	bool speakerOn = (!AudioEngine::headphonesPluggedIn && !outputPluggedInR && !outputPluggedInL);
 	setOutputState(SPEAKER_ENABLE.port, SPEAKER_ENABLE.pin, speakerOn);
 
+	// A track on CVSTEREO is a listener too: its pan places it across the CV sockets, and a mono
+	// render skips pan, so without it both sockets would carry the mono sum.
 	AudioEngine::renderInStereo =
-	    (AudioEngine::headphonesPluggedIn || outputPluggedInR || AudioEngine::isAnyInternalRecordingHappening());
+	    (AudioEngine::headphonesPluggedIn || outputPluggedInR || AudioEngine::isAnyInternalRecordingHappening()
+	     || deluge::processing::engines::cvStreamNeedsStereo());
 
 	bool lineInNow = readInput(LINE_IN_DETECT.port, LINE_IN_DETECT.pin) != 0u;
 	if (lineInNow != AudioEngine::lineInPluggedIn) {

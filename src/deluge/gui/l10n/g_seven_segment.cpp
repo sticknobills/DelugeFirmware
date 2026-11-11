@@ -565,6 +565,11 @@ PLACE_SDRAM_DATA Language seven_segment{
         {STRING_FOR_DEFAULT_USE_LAST_CLIP_TYPE, "LAST"},
         {STRING_FOR_FAVOURITES_EMPTY, "NONE"},
         {STRING_FOR_DEFAULT_HORIZONTAL_MENU, "HORZ"},
+        {STRING_FOR_CV_AUDIO, "CVAU"},
+        {STRING_FOR_CV_OUTPUT_MAIN, "MAIN"},
+        {STRING_FOR_CV_OUTPUT_CV1, "CV1"},
+        {STRING_FOR_CV_OUTPUT_CV2, "CV2"},
+        {STRING_FOR_CV_OUTPUT_STEREO, "CVSTEREO"},
     },
     &built_in::english,
 };

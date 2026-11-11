@@ -57,6 +57,7 @@
 #include "playback/playback_handler.h"
 #include "processing/audio_output.h"
 #include "processing/engines/audio_engine.h"
+#include "processing/engines/cv_audio_stream.h"
 #include "processing/engines/cv_engine.h"
 #include "processing/sound/sound_instrument.h"
 #include "processing/stem_export/stem_export.h"
@@ -134,6 +135,7 @@ OutputType getCurrentOutputType() {
 }
 
 using namespace deluge;
+using namespace deluge::processing::engines;
 
 Song::Song() : backedUpParamManagers(sizeof(BackedUpParamManager)) {
 	outputClipInstanceListIsCurrentlyInvalid = false;
@@ -2522,8 +2524,50 @@ void Song::renderAudio(std::span<StereoSample> outputBuffer, int32_t* reverbBuff
 		    (output->getActiveClip() && isClipActive(output->getActiveClip()->getClipBeingRecordedFrom()));
 		ENTER_CRITICAL_SECTION();
 		if (output->shouldRenderInSong()) {
-			output->renderOutput(modelStack, outputBuffer, reverbBuffer, volumePostFX >> 1, sideChainHitPending,
+			// The CV output setting lives on the Clip, so read it from whichever one is playing.
+			// A track with nothing playing goes to the main outputs, as in stock firmware.
+			Clip* const routingClip = output->getActiveClip();
+			CvOutput cvOutput = CvOutput::MAIN;
+			if (routingClip != nullptr && cvOutputsAvailable()) {
+				routingClip->applyLegacyCvRouting();
+				cvOutput = static_cast<CvOutput>(routingClip->cvOutput);
+			}
+
+			// Snapshot the mix before this track renders and take the difference
+			// afterwards. That isolates its contribution without changing how
+			// anything is rendered, and the same difference serves both jobs
+			// below. Failure mode is silence, not a damaged mix.
+			const uint32_t numSamples = (uint32_t)outputBuffer.size();
+			const uint32_t numMono = numSamples * 2;
+			const bool fitsScratch = numMono <= 512;
+			// Each track has one output. A track sent to CV leaves the main mix entirely. If the
+			// window is too long to snapshot, it stays in the main mix rather than going silent.
+			const bool toCV = cvOutput != CvOutput::MAIN && fitsScratch;
+			const bool capture = toCV;
+
+			int32_t* const mixRaw = (int32_t*)outputBuffer.data();
+			if (capture) {
+				memcpy(cvStreamCaptureScratch(), mixRaw, numMono * sizeof(int32_t));
+			}
+
+			// A track sent to CV renders its reverb send somewhere nothing reads, so its reverb
+			// tail cannot reach the main outputs. The track's own reverb amount is left as set.
+			int32_t* const trackReverbBuffer = toCV ? cvStreamReverbDiscard() : reverbBuffer;
+			output->renderOutput(modelStack, outputBuffer, trackReverbBuffer, volumePostFX >> 1, sideChainHitPending,
 			                     !isClipActiveNow, isClipActiveNow);
+
+			if (capture) {
+				int32_t* const scratch = cvStreamCaptureScratch();
+				// The difference against the snapshot is taken inside the accumulate loop
+				// rather than in a pass of its own here -- that pass walked every sample
+				// only to hand them straight to a loop that was about to walk them again.
+				cvStreamCapture((uint32_t)routingClip, mixRaw, scratch, numSamples, &routingClip->cvGainLast, cvOutput);
+				// Then take the track back out of the mix it was just added to. Subtracting the
+				// contribution and restoring the snapshot are the same thing -- mix minus (mix
+				// minus snapshot) is the snapshot -- so this is a copy, and it must follow the
+				// capture above, which reads the post-render mix.
+				memcpy(mixRaw, scratch, numMono * sizeof(int32_t));
+			}
 		}
 		EXIT_CRITICAL_SECTION();
 #if DO_AUDIO_LOG
@@ -2533,6 +2577,9 @@ void Song::renderAudio(std::span<StereoSample> outputBuffer, int32_t* reverbBuff
 #endif
 	}
 	AudioEngine::logAction("done rendering outputs");
+	// The full set of Clips feeding each CV socket is now known for this window.
+	cvStreamRenderComplete();
+
 	// If recording the "MIX", this is the place where we want to grab it - before any master FX or volume applied
 	// Go through each SampleRecorder, feeding them audio
 	for (SampleRecorder* recorder = AudioEngine::firstRecorder; recorder; recorder = recorder->next) {

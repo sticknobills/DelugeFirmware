@@ -39,6 +39,7 @@
 #include "gui/menu_item/cv/submenu.h"
 #include "gui/menu_item/cv/transpose.h"
 #include "gui/menu_item/cv/volts.h"
+#include "gui/menu_item/cv_output/routing.h"
 #include "gui/menu_item/defaults/accessibility_menu_highlighting.h"
 #include "gui/menu_item/defaults/bend_range.h"
 #include "gui/menu_item/defaults/favourites_layout.h"
@@ -651,6 +652,12 @@ PLACE_SDRAM_BSS HorizontalMenu soundDistortionMenu{
 PLACE_SDRAM_BSS midi::sound::OutputMidiChannel outputMidiChannelMenu{STRING_FOR_CHANNEL, STRING_FOR_CHANNEL};
 PLACE_SDRAM_BSS midi::sound::OutputMidiNoteForDrum outputMidiNoteForDrumMenu{STRING_FOR_NOTE, STRING_FOR_NOTE};
 PLACE_SDRAM_BSS Submenu outputMidiSubmenu{STRING_FOR_MIDI, {&outputMidiChannelMenu, &outputMidiNoteForDrumMenu}};
+// CV outputs ---------------------------------------------------------------------------
+
+// Where the track goes: MAIN, CV1, CV2 or CVSTEREO. One instance hides itself on kits, because
+// the Sound root is also the Drum editor; the kit's own instance is in KIT GLOBAL FX.
+PLACE_SDRAM_BSS cv_output::Output cvAudioSoundMenu{STRING_FOR_CV_AUDIO, STRING_FOR_CV_AUDIO, true};
+PLACE_SDRAM_BSS cv_output::Output cvAudioMenu{STRING_FOR_CV_AUDIO, STRING_FOR_CV_AUDIO, false};
 
 // MIDIInstrument menu ----------------------------------------------------------------------
 PLACE_SDRAM_BSS midi::device_definition::Linked midiDeviceLinkedMenu{
@@ -1545,6 +1552,7 @@ PLACE_SDRAM_BSS Submenu soundEditorRootMenu{
         &patchCablesMenu,
         &sequenceDirectionMenu,
         &outputMidiSubmenu,
+        &cvAudioSoundMenu,
     },
 };
 
@@ -1742,6 +1750,7 @@ PLACE_SDRAM_BSS menu_item::Submenu soundEditorRootMenuAudioClip{
         &audioClipSampleMenu,
         &audioClipAttackMenu,
         &priorityMenu,
+        &cvAudioMenu,
     },
 };
 
@@ -1889,6 +1898,8 @@ PLACE_SDRAM_BSS menu_item::Submenu soundEditorRootMenuKitGlobalFX{
         &globalFiltersMenu,
         &globalFXMenu,
         &globalSidechainMenu,
+        // Kit-wide: the capture can only isolate a whole track.
+        &cvAudioMenu,
     },
 };
 

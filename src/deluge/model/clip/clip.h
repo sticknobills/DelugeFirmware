@@ -43,6 +43,16 @@ class ModelStackWithTimelineCounter;
 class Serializer;
 class Deserializer;
 
+/// Routing bits from songs saved by AUX Sends 1.0.x and earlier. Read only, to convert those songs.
+namespace ClipRoute {
+constexpr uint8_t MAIN = 1;
+constexpr uint8_t CV1 = 2;
+constexpr uint8_t CV2 = 4;
+constexpr uint8_t STEREO_SPLIT = 8;
+constexpr uint8_t ANY_CV = CV1 | CV2;
+constexpr uint8_t ALL = MAIN | CV1 | CV2 | STEREO_SPLIT;
+} // namespace ClipRoute
+
 class Clip : public TimelineCounter {
 
 public:
@@ -195,6 +205,29 @@ public:
 	uint32_t indexForSaving; // For use only while saving song
 
 	LaunchStyle launchStyle;
+
+	/// Where this Clip's audio goes: a CvOutput -- MAIN, CV1, CV2 or STEREO. Lives on the Clip
+	/// rather than in the patch, so it survives a preset change or a change of track type.
+	/// Saved only when it differs from MAIN.
+	uint8_t cvOutput;
+
+	/// Gain applied last render window, Q16. Render state, not a setting: never saved and never
+	/// cloned. Lets a track switched to CV fade in over one window instead of clicking on.
+	int32_t cvGainLast;
+
+	/// Converts a song saved by AUX Sends 1.0.x, or earlier, into cvOutput. Runs once, the first
+	/// time the Clip is rendered or saved after being read from a file, because the routing
+	/// attribute and the param manager holding the old sends are not ordered against each other
+	/// during load.
+	void applyLegacyCvRouting();
+
+	/// Set whenever this Clip is read from a file; cleared by applyLegacyCvRouting().
+	bool cvLegacyCheckPending;
+	/// Set when the file carried cvOutput, which means it needs no conversion.
+	bool cvOutputReadFromFile;
+	/// The old routing attribute, kept until applyLegacyCvRouting() reads it.
+	uint8_t cvLegacyRoutingBits;
+
 	int64_t fillEventAtTickCount;
 	bool overdubsShouldCloneOutput;
 

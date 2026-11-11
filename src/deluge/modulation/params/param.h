@@ -186,6 +186,13 @@ enum UnpatchedShared : ParamType {
 	UNPATCHED_MOD_FX_FEEDBACK,
 	UNPATCHED_SIDECHAIN_SHAPE,
 	UNPATCHED_COMPRESSOR_THRESHOLD,
+	/// AUX Sends 1.0.x kept a send level per CV socket here. Read from old files only, so that
+	/// Clip::applyLegacyCvRouting() can turn them into an output; never written, never shown.
+	///
+	/// Deliberately placed outside UNPATCHED_FIRST_ARP_PARAM..UNPATCHED_LAST_ARP_PARAM,
+	/// which automation_view treats as a contiguous range of arpeggiator params.
+	UNPATCHED_CV1_SEND,
+	UNPATCHED_CV2_SEND,
 	// Arp
 	UNPATCHED_FIRST_ARP_PARAM,
 	UNPATCHED_ARP_GATE = UNPATCHED_FIRST_ARP_PARAM,
@@ -207,6 +214,9 @@ enum UnpatchedShared : ParamType {
 	/// Special value for chaining the UNPATCHED_* params
 	UNPATCHED_NUM_SHARED = UNPATCHED_LAST_ARP_PARAM,
 };
+
+/// The off position of the legacy CV send params, and their default.
+constexpr int32_t kCvSendOff = -2147483648;
 
 /// Unpatched params which are only used for Sounds
 enum UnpatchedSound : ParamType {

@@ -137,6 +137,11 @@ void ModControllableAudio::initParams(ParamManager* paramManager) {
 
 	unpatchedParams->params[params::UNPATCHED_SIDECHAIN_SHAPE].setCurrentValueBasicForSetup(-601295438);
 	unpatchedParams->params[params::UNPATCHED_COMPRESSOR_THRESHOLD].setCurrentValueBasicForSetup(0);
+
+	// Legacy CV sends from AUX Sends 1.0.x: off unless an old file sets them. See
+	// Clip::applyLegacyCvRouting(), the only reader.
+	unpatchedParams->params[params::UNPATCHED_CV1_SEND].setCurrentValueBasicForSetup(params::kCvSendOff);
+	unpatchedParams->params[params::UNPATCHED_CV2_SEND].setCurrentValueBasicForSetup(params::kCvSendOff);
 }
 
 bool ModControllableAudio::hasBassAdjusted(ParamManager* paramManager) {
@@ -704,6 +709,17 @@ bool ModControllableAudio::readParamTagFromFile(Deserializer& reader, char const
 		unpatchedParams->readParam(reader, unpatchedParamsSummary, params::UNPATCHED_ARP_SPREAD_OCTAVE,
 		                           readAutomationUpToPos);
 		reader.exitTag("spreadOctave");
+	}
+
+	// Read from AUX Sends 1.0.x files only; never written.
+	else if (!strcmp(tagName, "cv1Send")) {
+		unpatchedParams->readParam(reader, unpatchedParamsSummary, params::UNPATCHED_CV1_SEND, readAutomationUpToPos);
+		reader.exitTag("cv1Send");
+	}
+
+	else if (!strcmp(tagName, "cv2Send")) {
+		unpatchedParams->readParam(reader, unpatchedParamsSummary, params::UNPATCHED_CV2_SEND, readAutomationUpToPos);
+		reader.exitTag("cv2Send");
 	}
 
 	else {
