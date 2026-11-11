@@ -41,6 +41,8 @@ Macro definitions
 #define USB_RELEASE (0x0302u)
 // With USB audio turned off we describe ourselves exactly as before USB audio existed
 #define USB_RELEASE_MIDI_ONLY (0x0200u)
+// Multitrack has its own, so a host doesn't reuse what it cached about the stereo streams for streams of another shape
+#define USB_RELEASE_MULTITRACK (0x0312u)
 #define USB_CONFIGNUM (1u) /* Configuration number */
 #define USB_DCPMAXP (64u)  /* DCP max packet size */
 
@@ -614,12 +616,62 @@ uint8_t* g_midi_string_table[] = {g_midi_string0, g_midi_string1, g_midi_string2
  * from the MIDI section of g_midi_configuration, so there's only one copy of the MIDI descriptors to maintain */
 static uint8_t g_midi_only_configuration[MIDI_ONLY_CONFIG_LENGTH + (MIDI_ONLY_CONFIG_LENGTH % 2)];
 
-uint8_t* usbPeripheralConfigurationDescriptor(bool withAudio) {
-	g_midi_device[12] = LO(withAudio ? USB_RELEASE : USB_RELEASE_MIDI_ONLY); /* bcdDevice */
-	g_midi_device[13] = HI(withAudio ? USB_RELEASE : USB_RELEASE_MIDI_ONLY);
+/* The configuration for multitrack mode: g_midi_configuration with the audio streams widened to 8 channels to the host
+ * and 4 from it, at 16 bits. Everything else - interfaces, endpoints, terminals, lengths - is the same, so it's made by
+ * walking a copy and changing the fields that differ, rather than keeping a second copy of the descriptors in step */
+static uint8_t g_multitrack_configuration[TOTAL_CONFIG_LENGTH + (TOTAL_CONFIG_LENGTH % 2)];
 
-	if (withAudio) {
+static void widenForMultitrack(uint8_t* config) {
+	int interfaceNumber = -1;
+	for (uint32_t at = 0; at + 2 <= TOTAL_CONFIG_LENGTH && config[at] != 0; at += config[at]) {
+		uint8_t* d = &config[at];
+		if (d[1] == USB_DT_INTERFACE) {
+			interfaceNumber = d[2];
+		}
+		else if (d[1] == CS_INTERFACE && interfaceNumber == USB_PAUDIO_INTERFACE_CONTROL
+		         && d[2] == AUDIO_AC_INPUT_TERMINAL) {
+			// bNrChannels. wChannelConfig 0: channels without spatial positions, which hosts list by number
+			d[7] =
+			    (d[3] == AUDIO_TERMINAL_FROM_HOST) ? USB_PAUDIO_MT_CHANNELS_FROM_HOST : USB_PAUDIO_MT_CHANNELS_TO_HOST;
+			d[8] = 0;
+			d[9] = 0;
+		}
+		else if (d[1] == CS_INTERFACE && d[2] == AUDIO_AS_FORMAT_TYPE
+		         && (interfaceNumber == USB_PAUDIO_INTERFACE_STREAM_OUT
+		             || interfaceNumber == USB_PAUDIO_INTERFACE_STREAM_IN)) {
+			d[4] = (interfaceNumber == USB_PAUDIO_INTERFACE_STREAM_OUT) ? USB_PAUDIO_MT_CHANNELS_FROM_HOST
+			                                                            : USB_PAUDIO_MT_CHANNELS_TO_HOST;
+			d[5] = USB_PAUDIO_MT_SUBFRAME_BYTES;
+			d[6] = USB_PAUDIO_MT_BIT_RESOLUTION;
+		}
+		else if (d[1] == USB_DT_ENDPOINT && d[2] == (uint8_t)(USB_EP_IN | USB_PAUDIO_EP_IN)) {
+			d[4] = LO(USB_PAUDIO_MT_TO_HOST_MAX_PACKET_BYTES);
+			d[5] = HI(USB_PAUDIO_MT_TO_HOST_MAX_PACKET_BYTES);
+		}
+		else if (d[1] == USB_DT_ENDPOINT && d[2] == (uint8_t)(USB_EP_OUT | USB_PAUDIO_EP_OUT)) {
+			// Both alternate settings: 46 frames, so the pair fits the host's bandwidth reservation (see
+			// r_usb_paudio_config.h)
+			d[4] = LO(USB_PAUDIO_MT_FROM_HOST_MAX_PACKET_BYTES);
+			d[5] = HI(USB_PAUDIO_MT_FROM_HOST_MAX_PACKET_BYTES);
+		}
+	}
+}
+
+uint8_t* usbPeripheralConfigurationDescriptor(uint8_t audioMode) {
+	uint16_t const release = (audioMode == USB_PAUDIO_MODE_MULTITRACK) ? USB_RELEASE_MULTITRACK
+	                         : (audioMode == USB_PAUDIO_MODE_STEREO)   ? USB_RELEASE
+	                                                                   : USB_RELEASE_MIDI_ONLY;
+	g_midi_device[12] = LO(release); /* bcdDevice */
+	g_midi_device[13] = HI(release);
+
+	if (audioMode == USB_PAUDIO_MODE_STEREO) {
 		return g_midi_configuration;
+	}
+
+	if (audioMode == USB_PAUDIO_MODE_MULTITRACK) {
+		memcpy(g_multitrack_configuration, g_midi_configuration, TOTAL_CONFIG_LENGTH);
+		widenForMultitrack(g_multitrack_configuration);
+		return g_multitrack_configuration;
 	}
 
 	memcpy(g_midi_only_configuration, g_midi_configuration, USB_CD_BLENGTH);

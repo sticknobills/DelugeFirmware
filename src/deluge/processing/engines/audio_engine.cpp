@@ -957,16 +957,16 @@ q31_t getInputMonitoringGain(uint32_t offset) {
 }
 
 int32_t* getInputBufferStart(AudioInputChannel channel) {
-	return (channel == AudioInputChannel::USB) ? usb_audio::getInputRingStart() : getRxBufferStart();
+	return isUsbInput(channel) ? usb_audio::getInputRingStart(usbInputPair(channel)) : getRxBufferStart();
 }
 
 int32_t* getInputBufferEnd(AudioInputChannel channel) {
-	return (channel == AudioInputChannel::USB) ? usb_audio::getInputRingEnd() : getRxBufferEnd();
+	return isUsbInput(channel) ? usb_audio::getInputRingEnd(usbInputPair(channel)) : getRxBufferEnd();
 }
 
 int32_t* getInputReadPos(AudioInputChannel channel) {
 	auto* rxPos = reinterpret_cast<int32_t*>(i2sRXBufferPos);
-	return (channel == AudioInputChannel::USB) ? usb_audio::toInputRing(rxPos) : rxPos;
+	return isUsbInput(channel) ? usb_audio::toInputRing(rxPos, usbInputPair(channel)) : rxPos;
 }
 
 void renderAudio(size_t numSamples) {
@@ -983,6 +983,7 @@ void renderAudio(size_t numSamples) {
 
 	numHopsEndedThisRoutineCall = 0;
 	usbInputMonitoredByTrack = false;
+	usb_audio::beginTrackCapture(numSamples);
 
 	// Render audio for song
 	if (currentSong != nullptr) {
@@ -1019,6 +1020,7 @@ void renderAudioForStemExport(size_t numSamples) {
 
 	numHopsEndedThisRoutineCall = 0;
 	usbInputMonitoredByTrack = false;
+	usb_audio::beginTrackCapture(numSamples);
 
 	// Render audio for song
 	if (currentSong != nullptr) {
@@ -1270,10 +1272,12 @@ void renderSongFX(size_t numSamples) { // LPF and stutter for song (must happen 
 }
 void setMonitoringMode() { // Monitoring setup
 	doMonitoring = false;
-	if (audioRecorder.recordingSource == AudioInputChannel::USB) {
+	if (isUsbInput(audioRecorder.recordingSource)) {
 		// No risk of feedback from the internal mic here, so "conditional" means on. Unless it's already being sent
-		// straight to the outputs - then we'd hear it twice
-		doMonitoring = (inputMonitoringMode != InputMonitoringMode::OFF && !usb_audio::directMonitoring);
+		// straight to the outputs - then we'd hear it twice. That's only ever channels 1-2
+		bool const alreadyHeard =
+		    usb_audio::directMonitoring && audioRecorder.recordingSource == AudioInputChannel::USB;
+		doMonitoring = (inputMonitoringMode != InputMonitoringMode::OFF && !alreadyHeard);
 		monitoringAction = MonitoringAction::NONE;
 		return;
 	}
@@ -1457,10 +1461,12 @@ bool doSomeOutputting() {
 	std::span<StereoSample> outputBufferForResampling{reinterpret_cast<StereoSample*>(spareRenderingBuffer), 128 * 2};
 	StereoSample* __restrict__ renderingBufferOutputPosNow = renderingBufferOutputPos;
 	int32_t* __restrict__ i2sTXBufferPosNow = (int32_t*)i2sTXBufferPos;
+	// Where in the render window this pass starts - USB multitrack mode's channels are kept by the same offsets
+	size_t const renderOffsetAtStart = renderingBufferOutputPos - renderingMemory.begin();
 
 	// Monitored input - normally the codec's, but the USB input if that's what we're sampling
 	AudioInputChannel const monitoringSource =
-	    (audioRecorder.recordingSource == AudioInputChannel::USB) ? AudioInputChannel::USB : AudioInputChannel::STEREO;
+	    isUsbInput(audioRecorder.recordingSource) ? audioRecorder.recordingSource : AudioInputChannel::STEREO;
 	int32_t* __restrict__ inputReadPos = getInputReadPos(monitoringSource);
 	int32_t const* const inputBufferEnd = getInputBufferEnd(monitoringSource);
 
@@ -1471,7 +1477,8 @@ bool doSomeOutputting() {
 	    usb_audio::directMonitoring && !usbInputMonitoredByTrack && usb_audio::receivingFromHost();
 	int32_t const* __restrict__ usbReadPos = getInputReadPos(AudioInputChannel::USB);
 	int32_t const* const usbInputEnd = usb_audio::getInputRingEnd();
-	bool const doSendToUSB = usb_audio::sendingToHost();
+	// In multitrack mode the host gets the tracks routed to it instead (usb_audio::sendTracksToHost())
+	bool const doSendToUSB = usb_audio::sendingToHost() && !usb_audio::multitrackActive();
 	std::array<StereoSample, SSI_TX_BUFFER_NUM_SAMPLES> toUSB;
 
 	// Or the host might want the line input instead of our output. The internal mic only has a left channel
@@ -1585,6 +1592,9 @@ bool doSomeOutputting() {
 
 		if (doSendToUSB) {
 			usb_audio::sendToHost(std::span{toUSB}.first(numSamplesOutputted), i2sTXBufferPosNow);
+		}
+		else if (usb_audio::multitrackSending()) {
+			usb_audio::sendTracksToHost(renderOffsetAtStart, numSamplesOutputted, i2sTXBufferPosNow);
 		}
 
 		i2sRXBufferPos += (numSamplesOutputted << (NUM_MONO_INPUT_CHANNELS_MAGNITUDE + 2));

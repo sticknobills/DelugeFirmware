@@ -15,6 +15,8 @@ as a class-compliant audio device alongside its existing USB MIDI ports, so no d
 
 ## Format
 
+In the default stereo mode:
+
 |             | From computer to Deluge | From Deluge to computer |
 | ----------- | ----------------------- | ----------------------- |
 | Channels    | 2 (stereo)              | 2 (stereo)              |
@@ -44,19 +46,25 @@ The Deluge's USB MIDI ports keep working as before.
 
 USB audio's settings are in `SETTINGS > USB AUDIO` (`USBA` on 7SEG):
 
-| Setting   | 7SEG  | Options                                                     |
-| --------- | ----- | ----------------------------------------------------------- |
-| `ENABLED` | `ON`  | On (default), off                                           |
-| `INPUT`   | `IN`  | On (default), off - see below                               |
-| `OUTPUT`  | `OUT` | `MAIN MIX` (default, `MIX`), `LINE IN` (`LINE`) - see below |
+| Setting              | 7SEG   | Options                                                                     |
+| -------------------- | ------ | --------------------------------------------------------------------------- |
+| `MODE`               | `MODE` | `OFF`, `STEREO` (default, `STER`), `MULTITRACK` (`MULT`) - see below        |
+| `INPUT`              | `IN`   | On (default), off - see below                                               |
+| `OUTPUT`             | `OUT`  | `MAIN MIX` (default, `MIX`), `LINE IN` (`LINE`) - stereo mode only, below   |
+| `DELAY COMPENSATION` | `CMP`  | 0-100 ms, 0 (off) by default - multitrack mode only, see below              |
 
-## Turning USB audio off
+## Modes
 
-USB audio is on by default. To turn it off, set `SETTINGS > USB AUDIO > ENABLED` to off. The Deluge then connects to
-your computer as a USB MIDI device only, exactly as it did before USB audio was added.
+`SETTINGS > USB AUDIO > MODE` sets what the Deluge offers your computer:
+
+- **`OFF`**: USB MIDI only, exactly as before USB audio was added.
+- **`STEREO`** (the default): USB MIDI, and one stereo stream each way, as described on most of this page.
+- **`MULTITRACK`**: USB MIDI, eight channels from the Deluge to the computer and four back, at 16 bits. You choose which
+  tracks go to which channels. See [Multitrack mode](#multitrack-mode).
 
 The setting takes effect the next time the Deluge is turned on, since your computer only finds out what kind of
-device the Deluge is when it first connects.
+device the Deluge is when it first connects. Multitrack mode needs some extra memory, set aside when the Deluge starts
+up in that mode - none is used in the other modes.
 
 <Aside>
   If you've used the Deluge over USB MIDI before, your computer may treat it as
@@ -118,3 +126,65 @@ Recording a sample from a synth or kit's sample menu still uses the line input o
 Audio from the computer is buffered by about 6 ms (256 samples) on the Deluge before it's played or recorded, which
 keeps it smooth when the Deluge is busy. Audio going to the computer is buffered by about 2 ms. Your computer adds its
 own buffering on top of both, which you can usually set in your DAW.
+
+## Multitrack mode
+
+In multitrack mode the computer sees eight channels from the Deluge and four going back to it. Instead of the main mix,
+the eight channels carry the tracks you route to them.
+
+### Sending a track to the computer
+
+1. Open the track's sound menu: in a synth clip, press :key[Select]; in an audio clip, :key[Select] or :key[Shift + Select]. In a kit, turn on `AFFECT ENTIRE` first,
+   then press :key[Select] - a kit is routed as a whole, and the menu of a single drum has no USB routing.
+2. Go to `USB AUDIO` (`USBA` on 7SEG) - the same name as the settings menu.
+3. Turn on the channels you want. Any number can be on at once.
+
+| Item                     | What it does                                                                     |
+| ------------------------ | -------------------------------------------------------------------------------- |
+| `CHANNEL 1` - `8`        | Sends the track to that channel, mixed down to mono                              |
+| `CHANNELS 1-2` ... `7-8` | Sends the track to that pair in stereo: left on the first, right on the second   |
+| `MAIN OUTPUTS` (`MAIN`)  | On by default. Off takes the track out of the Deluge's own outputs and headphones, whether or not a computer is attached |
+
+- Routing belongs to the track, so launching another clip on it keeps it. It's saved with the song.
+- Several tracks sent to the same channel are mixed together there.
+- A new song sends nothing until you route a track.
+- MIDI and CV tracks have no USB routing.
+- Tracks are sent before the song's master effects and volume, and without their reverb, which stays in the Deluge's
+  own outputs - even for a track taken out of them.
+
+### Audio from the computer
+
+The computer's channels 1-2 behave as in stereo mode: `INPUT` mixes them straight into the Deluge's outputs, and an
+audio clip can use them as its source with `USB INPUT`. Channels 3-4 are a second source for audio clips,
+`USB INPUT 3-4` (`U34` on 7SEG). They aren't mixed into the outputs on their own - use an audio clip to hear them. An
+audio clip plays its input only in `LOOPER` mode, or `SAMPLER` while it's empty: hold the clip's pad and turn
+:key[Select]. New audio clips start in `PLAYER`, which doesn't. Outside multitrack mode, a clip set to `USB INPUT 3-4` is
+silent.
+
+### Sending a track out through an effect and back
+
+To process a track with an effect on your computer and hear it in time with the rest of the song:
+
+1. Route the track to a pair, and turn its `MAIN OUTPUTS` off.
+2. In your DAW, put the effect on that pair and send the result back to the Deluge's channels 3-4.
+3. On the Deluge, set an audio clip's source to `USB INPUT 3-4` and play it.
+4. Set `SETTINGS > USB AUDIO > DELAY COMPENSATION` to the round trip's delay through your computer, in ms.
+
+Delay compensation holds the Deluge's own tracks back by that much, so the processed track lands in time. Audio clips
+playing the computer's audio aren't held back, since it has already been out and back. With it on, everything else you
+play on the Deluge is heard that much later, including the line input, but not the
+metronome. Set it back to 0 when you don't need it.
+
+With delay compensation on:
+
+- An audio clip using `USB INPUT` or `USB INPUT 3-4` as its source isn't held back, even while it plays a recorded
+  sample rather than the live input. Keep compensation at 0 while recording from the computer.
+- That clip's reverb is still held back, so its reverb lands late against it.
+- Recording the Deluge's own `MIX` records the held-back audio.
+
+### Limitations
+
+- Kits are routed as a whole, not per drum.
+- 16 bits rather than 24, to fit eight channels into a full-speed USB connection.
+- Windows hasn't been tried. Its built-in driver may not handle more than two channels.
+- Each routed track costs a little processing, which can matter on a dense song.

@@ -1212,6 +1212,9 @@ char const* inputChannelToString(AudioInputChannel inputChannel) {
 	case AudioInputChannel::USB:
 		return "usb";
 
+	case AudioInputChannel::USB_3_4:
+		return "usb34";
+
 	case AudioInputChannel::MIX:
 		return "mix";
 
@@ -1241,6 +1244,16 @@ AudioInputChannel stringToInputChannel(char const* string) {
 	}
 	else if (!strcmp(string, "usb")) {
 		return AudioInputChannel::USB;
+	}
+	else if (!strcmp(string, "usb34")) {
+		return AudioInputChannel::USB_3_4;
+	}
+	// Songs from the USB Audio 1.0 firmware, which also had single channels: each becomes the pair it's in
+	else if (!strcmp(string, "usb12") || !strcmp(string, "usb1") || !strcmp(string, "usb2")) {
+		return AudioInputChannel::USB;
+	}
+	else if (!strcmp(string, "usb3") || !strcmp(string, "usb4")) {
+		return AudioInputChannel::USB_3_4;
 	}
 	else if (!strcmp(string, "mix")) {
 		return AudioInputChannel::MIX;

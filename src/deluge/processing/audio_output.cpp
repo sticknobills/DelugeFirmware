@@ -18,6 +18,7 @@
 #include "processing/audio_output.h"
 #include "definitions.h"
 #include "definitions_cxx.hpp"
+#include "drivers/usb/usb_audio.h"
 #include "dsp/stereo_sample.h"
 #include "gui/views/view.h"
 #include "memory/general_memory_allocator.h"
@@ -211,16 +212,22 @@ renderEnvelope:
 	// power-on, then fade it in (issue #4517) - otherwise its power-on transient gets passed straight through to the
 	// output.
 	q31_t const monitoring_gain_end = AudioEngine::getInputMonitoringGain(render.size());
+	// Channels 3-4 from a USB host only exist in multitrack mode. Outside it, a track set to them is silent
+	bool const inputExists = inputChannel != AudioInputChannel::USB_3_4 || deluge::usb_audio::multitrackActive();
 	if (monitoring_gain_end != 0 && modeAllowsMonitoring() && modelStack->song->isOutputActiveInArrangement(this)
-	    && inputChannel != AudioInputChannel::SPECIFIC_OUTPUT) {
+	    && inputChannel != AudioInputChannel::SPECIFIC_OUTPUT && inputExists) {
 		rendered = true;
 		int32_t const* __restrict__ input_ptr = AudioEngine::getInputReadPos(inputChannel);
 		int32_t const* const input_end = AudioEngine::getInputBufferEnd(inputChannel);
 
 		AudioInputChannel input_channel = this->inputChannel;
-		if (input_channel == AudioInputChannel::USB) {
-			input_channel = AudioInputChannel::STEREO; // Just a stereo input, from a different buffer
-			AudioEngine::usbInputMonitoredByTrack = true;
+		if (isUsbInput(input_channel)) {
+			// Just a stereo input, from a different buffer. Channels 1-2 are the ones the "USB input" setting mixes
+			// straight to the outputs, which then stops, so they aren't heard twice
+			if (input_channel == AudioInputChannel::USB) {
+				AudioEngine::usbInputMonitoredByTrack = true;
+			}
+			input_channel = AudioInputChannel::STEREO;
 		}
 		if (input_channel == AudioInputChannel::STEREO && !AudioEngine::renderInStereo) {
 			input_channel = AudioInputChannel::NONE; // 0 means combine channels

@@ -219,9 +219,11 @@ enum Entries {
 192-195: GlobalMIDICommand::SHIFT product / vendor ids
 196: screensaver mode
 197: screensaver timeout minutes
-198: USB audio disabled - stored inverted, so a unit that has never saved it (all zeros) has USB audio on
+198: USB audio mode: 0 stereo, 1 off, 2 multitrack - so a unit that has never saved it (all zeros) has stereo USB audio,
+     and firmware that only knows on and off reads multitrack as on
 199: USB input not mixed to outputs (usb_audio::directMonitoring) - stored inverted, so it defaults to on
 200: USB audio output source (usb_audio::OutputSource)
+201: USB audio delay compensation in ms (usb_audio::compensationMs), multitrack mode only
 */
 
 uint8_t defaultScale;
@@ -291,7 +293,7 @@ Polarity defaultPatchCablePolarity = Polarity::BIPOLAR;
 
 bool defaultUseSharps = true;
 
-bool usbAudioEnabled = true;
+uint8_t usbAudioMode = USB_PAUDIO_MODE_STEREO;
 
 void resetSettings() {
 
@@ -401,7 +403,8 @@ void resetSettings() {
 
 	defaultUseSharps = true;
 
-	usbAudioEnabled = true;
+	usbAudioMode = USB_PAUDIO_MODE_STEREO;
+	usb_audio::compensationMs = 0;
 	usb_audio::directMonitoring = true;
 	usb_audio::outputSource = usb_audio::OutputSource::MAIN_MIX;
 }
@@ -882,7 +885,11 @@ void readSettings() {
 		    (buffer[196] < kNumScreensaverModes) ? static_cast<ScreensaverMode>(buffer[196]) : kDefaultScreensaverMode;
 	}
 
-	usbAudioEnabled = (buffer[198] != 1);
+	usbAudioMode = (buffer[198] == 1)   ? USB_PAUDIO_MODE_OFF
+	               : (buffer[198] == 2) ? USB_PAUDIO_MODE_MULTITRACK
+	                                    : USB_PAUDIO_MODE_STEREO;
+	// Out of range is a byte nothing wrote - not a delay anyone asked for
+	usb_audio::compensationMs = (buffer[201] <= usb_audio::kCompensationMaxMs) ? buffer[201] : 0;
 	usb_audio::directMonitoring = (buffer[199] != 1);
 	usb_audio::outputSource = (buffer[200] < usb_audio::kNumOutputSources)
 	                              ? static_cast<usb_audio::OutputSource>(buffer[200])
@@ -1155,7 +1162,8 @@ void writeSettings() {
 	buffer[196] = util::to_underlying(screensaverMode);
 	buffer[197] = screensaverTimeoutMinutes;
 
-	buffer[198] = usbAudioEnabled ? 0 : 1;
+	buffer[198] = (usbAudioMode == USB_PAUDIO_MODE_OFF) ? 1 : (usbAudioMode == USB_PAUDIO_MODE_MULTITRACK) ? 2 : 0;
+	buffer[201] = usb_audio::compensationMs;
 	buffer[199] = usb_audio::directMonitoring ? 0 : 1;
 	buffer[200] = util::to_underlying(usb_audio::outputSource);
 

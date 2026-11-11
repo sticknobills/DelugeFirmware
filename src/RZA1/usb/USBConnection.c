@@ -41,7 +41,7 @@ Includes   <System Includes> , "Project Includes"
 extern uint8_t g_midi_device[];
 extern uint8_t g_midi_configuration[];
 extern uint8_t* g_midi_string_table[];
-uint8_t* usbPeripheralConfigurationDescriptor(bool withAudio);
+uint8_t* usbPeripheralConfigurationDescriptor(uint8_t audioMode);
 
 static usb_descriptor_t usb_descriptor = {
     (uint8_t*)g_midi_device,        /* Pointer to the device descriptor */

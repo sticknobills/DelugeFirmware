@@ -50,3 +50,40 @@
 // alternate settings of the same format by bandwidth then prefer it, if they can't use the asynchronous one
 #define USB_PAUDIO_ADAPTIVE_MAX_FRAMES_PER_PACKET 46
 #define USB_PAUDIO_ADAPTIVE_MAX_PACKET_BYTES (USB_PAUDIO_ADAPTIVE_MAX_FRAMES_PER_PACKET * USB_PAUDIO_BYTES_PER_FRAME)
+
+// Which USB configuration the Deluge offers, chosen in SETTINGS > USB AUDIO > MODE and fixed until USB next starts
+#define USB_PAUDIO_MODE_OFF 0        // USB MIDI only
+#define USB_PAUDIO_MODE_STEREO 1     // USB MIDI, and one stereo stream each way
+#define USB_PAUDIO_MODE_MULTITRACK 2 // USB MIDI, eight channels to the host and four from it
+#define USB_PAUDIO_NUM_MODES 3
+
+// Multitrack: the same endpoints, interfaces and clocking as stereo, with more channels at 16 bits.
+//
+// What limits it is the host's bandwidth reservation, made from each endpoint's wMaxPacketSize. Behind a USB 2.0 hub or
+// a USB 2.0/3 host's built-in one - which every current Mac is - a Full Speed device's isochronous traffic is scheduled
+// in 188-byte microframe slots, at most six in a frame. Both streams have to fit together, since implicit feedback
+// opens them as a pair: 736 bytes (4 slots) and 368 (2) do. At the 48-frame maximum stereo uses, 768 (5) and 384 (3)
+// don't, and macOS refuses to start either stream. So multitrack declares 46 frames each way, which is the most we
+// ever send (framesForNextPacket()) - and so, under implicit feedback, the most a host sends us. At 24 bits the to-host
+// stream alone wouldn't fit.
+#define USB_PAUDIO_MT_CHANNELS_TO_HOST 8
+#define USB_PAUDIO_MT_CHANNELS_FROM_HOST 4
+#define USB_PAUDIO_MT_SUBFRAME_BYTES 2
+#define USB_PAUDIO_MT_BIT_RESOLUTION 16
+#define USB_PAUDIO_MT_MAX_FRAMES_PER_PACKET 46
+#define USB_PAUDIO_MT_TO_HOST_BYTES_PER_FRAME (USB_PAUDIO_MT_CHANNELS_TO_HOST * USB_PAUDIO_MT_SUBFRAME_BYTES)
+#define USB_PAUDIO_MT_FROM_HOST_BYTES_PER_FRAME (USB_PAUDIO_MT_CHANNELS_FROM_HOST * USB_PAUDIO_MT_SUBFRAME_BYTES)
+#define USB_PAUDIO_MT_TO_HOST_MAX_PACKET_BYTES                                                                         \
+	(USB_PAUDIO_MT_MAX_FRAMES_PER_PACKET * USB_PAUDIO_MT_TO_HOST_BYTES_PER_FRAME)
+#define USB_PAUDIO_MT_FROM_HOST_MAX_PACKET_BYTES                                                                       \
+	(USB_PAUDIO_MT_MAX_FRAMES_PER_PACKET * USB_PAUDIO_MT_FROM_HOST_BYTES_PER_FRAME)
+// The to-host pipe's buffer, in whole 64-byte blocks: 736 bytes needs 12
+#define USB_PAUDIO_MT_TO_HOST_BUFFER_BYTES (768)
+#if USB_PAUDIO_MT_TO_HOST_BUFFER_BYTES < USB_PAUDIO_MT_TO_HOST_MAX_PACKET_BYTES
+#error "the to-host pipe's buffer must hold its largest packet"
+#endif
+// Four 16-bit channels make the same 8-byte frame as two 24-bit ones, so the from-host stream's packet sizes, pipe
+// buffer and DMA are the same in both modes
+#if USB_PAUDIO_MT_FROM_HOST_BYTES_PER_FRAME != USB_PAUDIO_BYTES_PER_FRAME
+#error "the from-host stream relies on both modes having the same frame size"
+#endif

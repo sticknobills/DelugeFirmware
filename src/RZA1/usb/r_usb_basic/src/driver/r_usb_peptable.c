@@ -264,6 +264,58 @@ uint16_t g_usb_pstd_eptbl[] = {
 };
 
 #if defined(USB_CFG_PMIDI_USE)
+/* USB audio in multitrack mode: the same endpoints as g_usb_pstd_eptbl, but the to-host stream's packets are twice the
+ * size, so its buffer is, and USB MIDI's in pipe moves up clear of it. Each pipe uses twice its size, being double
+ * buffered, in 64-byte blocks:
+ *
+ *   from host 8-19    to host 20-43    MIDI in 48-63    MIDI out 72-87
+ */
+uint16_t g_usb_pstd_eptbl_multitrack[] = {
+    USB_CFG_PAUDIO_ISO_OUT, /* Pipe No. - the out stream's asynchronous alternate setting */
+    /* TYPE    / BFRE        / DBLB         / CNTMD         / SHTNAK         / DIR      / EPNUM */
+    USB_NULL | USB_BFREOFF | USB_CFG_DBLB | USB_CFG_CNTMD | USB_NULL | USB_NULL | USB_NULL, /* PIPECFG */
+    (uint16_t)USB_BUF_SIZE(USB_PAUDIO_MAX_PACKET_BYTES) | USB_BUF_NUMB(8u),                 /* PIPEBUF */
+    USB_NULL,                                                                               /* PIPEMAXP */
+    USB_NULL,                                                                               /* PIPEPERI */
+    USB_NULL,                                                                               /* reserve */
+
+    USB_CFG_PAUDIO_ISO_OUT, /* Pipe No. - the same pipe and buffer, for the adaptive alternate setting */
+    /* TYPE    / BFRE        / DBLB         / CNTMD         / SHTNAK         / DIR      / EPNUM */
+    USB_NULL | USB_BFREOFF | USB_CFG_DBLB | USB_CFG_CNTMD | USB_NULL | USB_NULL | USB_NULL, /* PIPECFG */
+    (uint16_t)USB_BUF_SIZE(USB_PAUDIO_MAX_PACKET_BYTES) | USB_BUF_NUMB(8u),                 /* PIPEBUF */
+    USB_NULL,                                                                               /* PIPEMAXP */
+    USB_NULL,                                                                               /* PIPEPERI */
+    USB_NULL,                                                                               /* reserve */
+
+    USB_CFG_PAUDIO_ISO_IN, /* Pipe No. - drops a packet the host didn't collect in its frame */
+    /* TYPE    / BFRE        / DBLB         / CNTMD         / SHTNAK         / DIR      / EPNUM */
+    USB_NULL | USB_BFREOFF | USB_CFG_DBLB | USB_CFG_CNTMD | USB_NULL | USB_NULL | USB_NULL, /* PIPECFG */
+    (uint16_t)USB_BUF_SIZE(USB_PAUDIO_MT_TO_HOST_BUFFER_BYTES) | USB_BUF_NUMB(20u),         /* PIPEBUF */
+    USB_NULL,                                                                               /* PIPEMAXP */
+    USB_IFISON,                                                                             /* PIPEPERI */
+    USB_NULL,                                                                               /* reserve */
+
+    USB_CFG_PMIDI_BULK_IN, /* Pipe No. */
+    /* TYPE    / BFRE        / DBLB         / CNTMD         / SHTNAK         / DIR      / EPNUM */
+    USB_NULL | USB_BFREOFF | USB_CFG_DBLB | USB_CFG_CNTMD | USB_CFG_SHTNAK | USB_NULL | USB_NULL, /* PIPECFG */
+    (uint16_t)USB_BUF_SIZE(512u) | USB_BUF_NUMB(48u),                                             /* PIPEBUF */
+    USB_NULL,                                                                                     /* PIPEMAXP */
+    USB_NULL,                                                                                     /* PIPEPERI */
+    USB_NULL,                                                                                     /* reserve */
+
+    USB_CFG_PMIDI_BULK_OUT, /* Pipe No. */
+    /* TYPE    / BFRE        / DBLB         / CNTMD         / SHTNAK         / DIR      / EPNUM */
+    USB_NULL | USB_BFREOFF | USB_CFG_DBLB | USB_CFG_CNTMD | USB_CFG_SHTNAK | USB_NULL | USB_NULL, /* PIPECFG */
+    (uint16_t)USB_BUF_SIZE(512u) | USB_BUF_NUMB(72u),                                             /* PIPEBUF */
+    USB_NULL,                                                                                     /* PIPEMAXP */
+    USB_NULL,                                                                                     /* PIPEPERI */
+    USB_NULL,                                                                                     /* reserve */
+
+    USB_PDTBLEND,
+};
+#endif /* defined(USB_CFG_PMIDI_USE) */
+
+#if defined(USB_CFG_PMIDI_USE)
 /* With USB audio off, the configuration descriptor only has the MIDI interface, so its endpoints come first */
 uint16_t g_usb_pstd_eptbl_midi_only[] = {
     USB_CFG_PMIDI_BULK_IN, /* Pipe No. */

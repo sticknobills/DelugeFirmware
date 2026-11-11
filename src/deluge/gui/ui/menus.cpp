@@ -225,6 +225,7 @@
 #include "gui/menu_item/unpatched_param.h"
 #include "gui/menu_item/unpatched_param/pan.h"
 #include "gui/menu_item/usb/audio.h"
+#include "gui/menu_item/usb/routing.h"
 #include "gui/menu_item/voice/polyphony.h"
 #include "gui/menu_item/voice/portamento.h"
 #include "gui/menu_item/voice/priority.h"
@@ -1045,15 +1046,17 @@ PLACE_SDRAM_BSS Submenu recordSubmenu{
 PLACE_SDRAM_BSS sample::browser_preview::Mode sampleBrowserPreviewModeMenu{STRING_FOR_SAMPLE_PREVIEW};
 
 PLACE_SDRAM_BSS flash::Status flashStatusMenu{STRING_FOR_PLAY_CURSOR};
-PLACE_SDRAM_BSS usb::Audio usbAudioEnabledMenu{STRING_FOR_ENABLED, STRING_FOR_USB_AUDIO};
+PLACE_SDRAM_BSS usb::Mode usbAudioModeMenu{STRING_FOR_MODE, STRING_FOR_USB_AUDIO};
 PLACE_SDRAM_BSS usb::DirectMonitoring usbAudioInputMenu{STRING_FOR_INPUT, STRING_FOR_USB_INPUT};
 PLACE_SDRAM_BSS usb::OutputSource usbAudioOutputMenu{STRING_FOR_OUTPUT, STRING_FOR_USB_OUTPUT};
+PLACE_SDRAM_BSS usb::Compensation usbAudioCompensationMenu{STRING_FOR_USB_COMPENSATION, STRING_FOR_USB_COMPENSATION};
 PLACE_SDRAM_BSS Submenu usbAudioMenu{
     STRING_FOR_USB_AUDIO,
     {
-        &usbAudioEnabledMenu,
+        &usbAudioModeMenu,
         &usbAudioInputMenu,
         &usbAudioOutputMenu,
+        &usbAudioCompensationMenu,
     },
 };
 
@@ -1522,6 +1525,41 @@ PLACE_SDRAM_BSS Submenu soundEditorRootActionsMenu{
     {&editNameMenu, &sample0RecorderMenu, &sample1RecorderMenu},
 };
 
+// USB multitrack routing, per track: the host's eight channels, its four pairs, and whether the track stays in the
+// Deluge's own outputs
+PLACE_SDRAM_BSS usb::RouteToggle usbChannel1Menu{STRING_FOR_USB_CHANNEL_1, STRING_FOR_USB_CHANNEL_1, UsbRoute::CH1};
+PLACE_SDRAM_BSS usb::RouteToggle usbChannel2Menu{STRING_FOR_USB_CHANNEL_2, STRING_FOR_USB_CHANNEL_2, UsbRoute::CH2};
+PLACE_SDRAM_BSS usb::RouteToggle usbChannel3Menu{STRING_FOR_USB_CHANNEL_3, STRING_FOR_USB_CHANNEL_3, UsbRoute::CH3};
+PLACE_SDRAM_BSS usb::RouteToggle usbChannel4Menu{STRING_FOR_USB_CHANNEL_4, STRING_FOR_USB_CHANNEL_4, UsbRoute::CH4};
+PLACE_SDRAM_BSS usb::RouteToggle usbChannel5Menu{STRING_FOR_USB_CHANNEL_5, STRING_FOR_USB_CHANNEL_5, UsbRoute::CH5};
+PLACE_SDRAM_BSS usb::RouteToggle usbChannel6Menu{STRING_FOR_USB_CHANNEL_6, STRING_FOR_USB_CHANNEL_6, UsbRoute::CH6};
+PLACE_SDRAM_BSS usb::RouteToggle usbChannel7Menu{STRING_FOR_USB_CHANNEL_7, STRING_FOR_USB_CHANNEL_7, UsbRoute::CH7};
+PLACE_SDRAM_BSS usb::RouteToggle usbChannel8Menu{STRING_FOR_USB_CHANNEL_8, STRING_FOR_USB_CHANNEL_8, UsbRoute::CH8};
+PLACE_SDRAM_BSS usb::RouteToggle usbPair12Menu{STRING_FOR_USB_PAIR_12, STRING_FOR_USB_PAIR_12, UsbRoute::PAIR12};
+PLACE_SDRAM_BSS usb::RouteToggle usbPair34Menu{STRING_FOR_USB_PAIR_34, STRING_FOR_USB_PAIR_34, UsbRoute::PAIR34};
+PLACE_SDRAM_BSS usb::RouteToggle usbPair56Menu{STRING_FOR_USB_PAIR_56, STRING_FOR_USB_PAIR_56, UsbRoute::PAIR56};
+PLACE_SDRAM_BSS usb::RouteToggle usbPair78Menu{STRING_FOR_USB_PAIR_78, STRING_FOR_USB_PAIR_78, UsbRoute::PAIR78};
+PLACE_SDRAM_BSS usb::MainToggle usbMainMenu{STRING_FOR_USB_MAIN, STRING_FOR_USB_MAIN};
+PLACE_SDRAM_BSS usb::RoutingSubmenu usbRoutingMenu{
+    STRING_FOR_USB_AUDIO,
+    STRING_FOR_USB_AUDIO,
+    {
+        &usbChannel1Menu,
+        &usbChannel2Menu,
+        &usbChannel3Menu,
+        &usbChannel4Menu,
+        &usbChannel5Menu,
+        &usbChannel6Menu,
+        &usbChannel7Menu,
+        &usbChannel8Menu,
+        &usbPair12Menu,
+        &usbPair34Menu,
+        &usbPair56Menu,
+        &usbPair78Menu,
+        &usbMainMenu,
+    },
+};
+
 PLACE_SDRAM_BSS Submenu soundEditorRootDrumActionsMenu{
     STRING_FOR_ACTIONS,
     {&drumNameEditMenu, &sample0RecorderMenu, &sample1RecorderMenu},
@@ -1557,6 +1595,7 @@ PLACE_SDRAM_BSS Submenu soundEditorRootMenu{
         &patchCablesMenu,
         &sequenceDirectionMenu,
         &outputMidiSubmenu,
+        &usbRoutingMenu,
     },
 };
 
@@ -1754,6 +1793,7 @@ PLACE_SDRAM_BSS menu_item::Submenu soundEditorRootMenuAudioClip{
         &audioClipSampleMenu,
         &audioClipAttackMenu,
         &priorityMenu,
+        &usbRoutingMenu,
     },
 };
 
@@ -1901,6 +1941,7 @@ PLACE_SDRAM_BSS menu_item::Submenu soundEditorRootMenuKitGlobalFX{
         &globalFiltersMenu,
         &globalFXMenu,
         &globalSidechainMenu,
+        &usbRoutingMenu,
     },
 };
 

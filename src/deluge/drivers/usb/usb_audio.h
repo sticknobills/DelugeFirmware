@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "userdef/r_usb_paudio_config.h" // Relative: this header is included from C, with other include paths
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -35,11 +36,14 @@
 extern "C" {
 #endif
 
-/// Called as USB starts up as a peripheral. Takes the user's USB audio setting (FlashStorage::usbAudioEnabled), which
-/// then holds until the next start - it decides which configuration descriptor the host gets. Returns it
-bool usbAudioStartPeripheral(void);
-/// Whether USB audio is on for the current peripheral session
+/// Called as USB starts up as a peripheral. Takes the user's USB audio setting (FlashStorage::usbAudioMode), which
+/// then holds until the next start - it decides which configuration descriptor the host gets. Returns the mode in
+/// effect, a USB_PAUDIO_MODE_ value: multitrack falls back to stereo if its buffers can't be allocated
+uint8_t usbAudioStartPeripheral(void);
+/// Whether USB audio is on for the current peripheral session, in either mode
 bool usbAudioActive(void);
+/// Whether the current peripheral session is multitrack
+bool usbAudioMultitrackActive(void);
 
 // Hooks for the Renesas USB peripheral driver. These may be called from the USB interrupt or the USB task.
 
@@ -74,16 +78,52 @@ bool sendingToHost();
 /// SSI TX buffer in front of this render.
 void fillInputRing(uint32_t rxPosition, size_t numSamples, size_t txQueued);
 
-/// The USB input ring buffer. It's the same size and layout as the SSI RX buffer, and kept in step with it, so the same
-/// offset into either is the same moment in time.
-int32_t* getInputRingStart();
-int32_t* getInputRingEnd();
-/// The position in the USB input ring buffer matching a position in the SSI RX buffer
-int32_t* toInputRing(int32_t const* rxPosition);
+/// The USB input ring buffers. Each is the same size and layout as the SSI RX buffer, and kept in step with it, so the
+/// same offset into either is the same moment in time. Pair 0 is channels 1-2 - the only pair in stereo mode. Pair 1
+/// is channels 3-4, in multitrack mode only: otherwise it's pair 0's ring, so anything reading it reads real memory.
+/// Audio tracks set to channels 3-4 don't play outside multitrack mode (AudioOutput)
+int32_t* getInputRingStart(uint32_t pair = 0);
+int32_t* getInputRingEnd(uint32_t pair = 0);
+/// The position in a USB input ring buffer matching a position in the SSI RX buffer
+int32_t* toInputRing(int32_t const* rxPosition, uint32_t pair = 0);
 
-/// Queue audio to send to the host. Does nothing if the host isn't collecting it. txPosition is the SSI TX buffer
-/// position just after where these frames went.
+/// Queue audio to send to the host. Does nothing if the host isn't collecting it, or in multitrack mode, where the
+/// host gets the tracks routed to it instead (sendTracksToHost()). txPosition is the SSI TX buffer position just after
+/// where these frames went.
 void sendToHost(std::span<const StereoSample> frames, int32_t const* txPosition);
+
+/*********************************************************************************************************************
+ * Multitrack mode: tracks routed to the host's eight channels. Each track's copy is the difference its render makes
+ * to the song's mix - so nothing renders twice - captured between snapshotBeforeTrack() and captureTrack() around it
+ */
+
+/// Whether multitrack mode is on for this peripheral session - routing then applies, cable or not
+bool multitrackActive();
+/// Whether a host is collecting the routed tracks, so they're worth capturing
+bool multitrackSending();
+
+/// Call at the start of each render window, before the song renders
+void beginTrackCapture(size_t numSamples);
+/// Call before a routed track (or one taken out of the main mix) renders into mix
+void snapshotBeforeTrack(StereoSample const* mix, size_t numSamples);
+/// Call after it rendered: adds what it added to mix to the channels its route (UsbRoute bits) names
+void captureTrack(uint16_t route, StereoSample const* mix, size_t numSamples);
+/// Call after it rendered, to take it back out of mix - for a track not in the main mix
+void removeTrackFromMix(StereoSample* mix, size_t numSamples);
+/// Call after it rendered, instead, for a track playing audio from the host: takes what it added back out of mix, to be
+/// added again after the delay compensation - so the host's audio, which has already been out and back, isn't delayed
+/// a second time
+void holdBackFromCompensation(StereoSample* mix, size_t numSamples);
+
+/// Queue the captured tracks for frames [renderOffset, renderOffset + numFrames) of the render window to the host. As
+/// sendToHost(), which this takes the place of in multitrack mode
+void sendTracksToHost(size_t renderOffset, size_t numFrames, int32_t const* txPosition);
+
+/// Delay compensation, multitrack mode only: holds the song's own audio and its reverb send back by this much, so a
+/// track sent out through an external processor and returned lands in time with the rest
+constexpr uint32_t kCompensationMaxMs = 100;
+extern uint8_t compensationMs;
+void compensate(std::span<StereoSample> mix, int32_t* reverbSend);
 
 /// The "USB input" setting: mix audio from the host straight into the Deluge's outputs, after the song's FX, when
 /// nothing else (an audio track, or the sampler) is monitoring it

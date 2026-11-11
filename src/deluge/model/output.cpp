@@ -17,6 +17,7 @@
 
 #include "model/output.h"
 #include "definitions_cxx.hpp"
+#include "drivers/usb/usb_audio.h"
 #include "memory/general_memory_allocator.h"
 #include "model/action/action_logger.h"
 #include "model/clip/clip.h"
@@ -270,6 +271,11 @@ bool Output::writeDataToFile(Serializer& writer, Clip* clipForSavingOutputOnly, 
 		writer.writeAttribute("isArmedForRecording", armedForRecording);
 		writer.writeAttribute("activeModFunction", modKnobMode);
 
+		// Only when set, so a song that never uses USB routing saves exactly as before
+		if (usbRouting != UsbRoute::DEFAULT) {
+			writer.writeAttribute("usbRouting", usbRouting);
+		}
+
 		if (clipInstances.getNumElements()) {
 			writer.insertCommaIfNeeded();
 			writer.write("\n");
@@ -343,6 +349,11 @@ bool Output::readTagFromFile(Deserializer& reader, char const* tagName) {
 
 	else if (!strcmp(tagName, "activeModFunction")) {
 		modKnobMode = reader.readTagOrAttributeValueInt();
+	}
+
+	else if (!strcmp(tagName, "usbRouting")) {
+		// Masked, so a bit this firmware doesn't know routes nowhere
+		usbRouting = static_cast<uint16_t>(reader.readTagOrAttributeValueInt() & UsbRoute::ALL);
 	}
 
 	else if (!strcmp(tagName, "colour")) {
@@ -617,3 +628,7 @@ Clip* Output::getActiveClip() const {
 for (int32_t i = 0; i < clipInstances.getNumElements(); i++) {
     ClipInstance* thisInstance = clipInstances.getElement(i);
 */
+
+bool Output::isInMainMix() const {
+	return !deluge::usb_audio::multitrackActive() || (usbRouting & UsbRoute::MAIN);
+}

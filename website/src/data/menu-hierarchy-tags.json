@@ -141,9 +141,10 @@
 
   "__subsection_01_09_usbAudioMenu": "Subsection: USB Audio",
   "usbAudioMenu": "c1.4",
-  "usbAudioEnabledMenu": "c1.4",
+  "usbAudioModeMenu": "c1.4",
   "usbAudioInputMenu": "c1.4",
   "usbAudioOutputMenu": "c1.4",
+  "usbAudioCompensationMenu": "c1.4",
 
   "__section_02_songMenu": "Hierarchy: Song",
   "__subsection_02_00_root": "Subsection: Song (root)",

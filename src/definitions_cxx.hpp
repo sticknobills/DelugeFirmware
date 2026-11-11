@@ -869,7 +869,8 @@ enum class AudioInputChannel {
 	RIGHT,
 	STEREO,
 	BALANCED,
-	USB, // Stereo audio from a USB host (drivers/usb/usb_audio.h)
+	USB,     // Stereo audio from a USB host (drivers/usb/usb_audio.h) - channels 1-2 in multitrack mode
+	USB_3_4, // Channels 3-4 from a USB host, in multitrack mode
 	MIX,
 	OUTPUT,
 	SPECIFIC_OUTPUT,
@@ -877,6 +878,14 @@ enum class AudioInputChannel {
 };
 
 constexpr AudioInputChannel AUDIO_INPUT_CHANNEL_FIRST_INTERNAL_OPTION = AudioInputChannel::MIX;
+
+/// Whether a source is audio from a USB host, and which of its input rings that is (drivers/usb/usb_audio.h)
+constexpr bool isUsbInput(AudioInputChannel channel) {
+	return channel == AudioInputChannel::USB || channel == AudioInputChannel::USB_3_4;
+}
+constexpr uint32_t usbInputPair(AudioInputChannel channel) {
+	return (channel == AudioInputChannel::USB_3_4) ? 1 : 0;
+}
 
 enum class ActionResult {
 	DEALT_WITH,

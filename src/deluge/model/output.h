@@ -21,6 +21,7 @@
 #include "hid/button.h"
 #include "model/clip/clip_instance_vector.h"
 #include "model/sample/sample_recorder.h"
+#include "model/usb_route.h"
 #include "modulation/params/param.h"
 #include "util/d_string.h"
 #include <cstdint>
@@ -87,6 +88,13 @@ public:
 
 	ClipInstanceVector clipInstances;
 	[[nodiscard]] Clip* getActiveClip() const;
+
+	/// UsbRoute bits: which of the host's channels this track is copied to in USB multitrack mode, and whether it stays
+	/// in the Deluge's own outputs. Saved with the song. Ignored outside multitrack mode
+	uint16_t usbRouting = UsbRoute::DEFAULT;
+	/// Whether the track is heard on the Deluge's own outputs - always, outside multitrack mode
+	[[nodiscard]] bool isInMainMix() const;
+
 	String name; // Contains the display name as the user sees it.
 	             // E.g. on numeric Deluge, SYNT000 will be just "0". Definitely no leading zeros, so not "000".
 	             // On OLED Deluge I thiiink SYNT000 would be "SYNT000"?

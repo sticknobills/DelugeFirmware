@@ -17,6 +17,7 @@
 
 #include "model/song/song.h"
 #include "definitions_cxx.hpp"
+#include "drivers/usb/usb_audio.h"
 #include "dsp/reverb/reverb.hpp"
 #include "gui/l10n/l10n.h"
 #include "gui/ui/browser/browser.h"
@@ -2513,6 +2514,11 @@ void Song::renderAudio(std::span<StereoSample> outputBuffer, int32_t* reverbBuff
 	ModelStack* modelStack = setupModelStackWithSong(modelStackMemory, this);
 
 	AudioEngine::logAction("Start output render");
+	// USB multitrack routing. Left out of a stem export, which renders every track on its own and would otherwise lose
+	// the ones taken out of the main mix
+	namespace usb_audio = deluge::usb_audio;
+	bool const usbRouting = usb_audio::multitrackActive() && !stemExport.processStarted;
+	bool const usbCapturing = usbRouting && usb_audio::multitrackSending();
 	for (Output *output = firstOutput, *next; output; output = next) {
 		// Read alongside inValidState (same cache line): rendering this Output often evicts it
 		next = output->next;
@@ -2524,8 +2530,30 @@ void Song::renderAudio(std::span<StereoSample> outputBuffer, int32_t* reverbBuff
 		    (output->getActiveClip() && isClipActive(output->getActiveClip()->getClipBeingRecordedFrom()));
 		ENTER_CRITICAL_SECTION();
 		if (output->shouldRenderInSong()) {
+			// A track's USB copy is the difference its render makes to the mix. Its reverb send goes to a shared buffer
+			// mixed in later, so the copy is dry - and a track taken out of the main mix still leaves its reverb there
+			uint16_t const route = output->usbRouting;
+			bool const copy = usbCapturing && (route & UsbRoute::ANY_USB);
+			bool const takeOut = usbRouting && !(route & UsbRoute::MAIN);
+			// The host's audio has already been out and back, so the delay compensation mustn't delay it again
+			bool const holdBack = usbRouting && usb_audio::compensationMs != 0 && output->type == OutputType::AUDIO
+			                      && isUsbInput(static_cast<AudioOutput*>(output)->inputChannel);
+			if (copy || takeOut || holdBack) {
+				usb_audio::snapshotBeforeTrack(outputBuffer.data(), outputBuffer.size());
+			}
+
 			output->renderOutput(modelStack, outputBuffer, reverbBuffer, volumePostFX >> 1, sideChainHitPending,
 			                     !isClipActiveNow, isClipActiveNow);
+
+			if (copy) {
+				usb_audio::captureTrack(route, outputBuffer.data(), outputBuffer.size());
+			}
+			if (takeOut) {
+				usb_audio::removeTrackFromMix(outputBuffer.data(), outputBuffer.size());
+			}
+			else if (holdBack) {
+				usb_audio::holdBackFromCompensation(outputBuffer.data(), outputBuffer.size());
+			}
 		}
 		EXIT_CRITICAL_SECTION();
 #if DO_AUDIO_LOG
@@ -2533,6 +2561,11 @@ void Song::renderAudio(std::span<StereoSample> outputBuffer, int32_t* reverbBuff
 		snprintf(buf, sizeof(buf), "complete: %s", output->name.get());
 		AudioEngine::logAction(buf);
 #endif
+	}
+	// Hold the Deluge's own tracks back by the USB delay compensation, so a track sent out through an external
+	// processor and returned on an audio track lands in time. Not in an offline stem export, which has no external path
+	if (usbRouting) {
+		usb_audio::compensate(outputBuffer, reverbBuffer);
 	}
 	AudioEngine::logAction("done rendering outputs");
 	// If recording the "MIX", this is the place where we want to grab it - before any master FX or volume applied

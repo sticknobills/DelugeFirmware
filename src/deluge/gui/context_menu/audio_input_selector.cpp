@@ -17,6 +17,7 @@
 
 #include "gui/context_menu/audio_input_selector.h"
 #include "definitions_cxx.hpp"
+#include "drivers/usb/usb_audio.h"
 #include "gui/l10n/l10n.h"
 #include "gui/ui/root_ui.h"
 #include "gui/views/session_view.h"
@@ -35,11 +36,12 @@ enum class AudioInputSelector::Value {
 	STEREO,
 	BALANCED,
 	USB,
+	USB_3_4,
 	MASTER,
 	OUTPUT,
 	TRACK,
 };
-constexpr size_t kNumValues = 9;
+constexpr size_t kNumValues = 10;
 
 PLACE_SDRAM_BSS AudioInputSelector audioInputSelector{};
 
@@ -81,7 +83,8 @@ std::span<const char*> AudioInputSelector::getOptions() {
 	static const char* options[] = {
 	    l10n::get(STRING_FOR_DISABLED),     l10n::get(STRING_FOR_LEFT_INPUT),     l10n::get(STRING_FOR_RIGHT_INPUT),
 	    l10n::get(STRING_FOR_STEREO_INPUT), l10n::get(STRING_FOR_BALANCED_INPUT), l10n::get(STRING_FOR_USB_INPUT),
-	    l10n::get(STRING_FOR_MIX_PRE_FX),   l10n::get(STRING_FOR_MIX_POST_FX),    l10n::get(STRING_FOR_TRACK),
+	    l10n::get(STRING_FOR_USB_INPUT_34), l10n::get(STRING_FOR_MIX_PRE_FX),     l10n::get(STRING_FOR_MIX_POST_FX),
+	    l10n::get(STRING_FOR_TRACK),
 	};
 	return {options, kNumValues};
 }
@@ -110,6 +113,10 @@ bool AudioInputSelector::setupAndCheckAvailability() {
 		valueOption = Value::USB;
 		break;
 
+	case AudioInputChannel::USB_3_4:
+		valueOption = Value::USB_3_4;
+		break;
+
 	case AudioInputChannel::MIX:
 		valueOption = Value::MASTER;
 		break;
@@ -129,6 +136,14 @@ bool AudioInputSelector::setupAndCheckAvailability() {
 	currentOption = static_cast<int32_t>(valueOption);
 
 	scrollPos = currentOption;
+	return true;
+}
+
+// Channels 3-4 only exist in USB multitrack mode - but a track already set to them shows it, rather than a wrong source
+bool AudioInputSelector::isCurrentOptionAvailable() {
+	if (static_cast<Value>(currentOption) == Value::USB_3_4) {
+		return usbAudioMultitrackActive() || audioOutput->inputChannel == AudioInputChannel::USB_3_4;
+	}
 	return true;
 }
 
@@ -176,6 +191,10 @@ void AudioInputSelector::selectEncoderAction(int8_t offset) {
 
 	case Value::USB:
 		audioOutput->inputChannel = AudioInputChannel::USB;
+		break;
+
+	case Value::USB_3_4:
+		audioOutput->inputChannel = AudioInputChannel::USB_3_4;
 		break;
 
 	case Value::MASTER:

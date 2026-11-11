@@ -1272,7 +1272,9 @@ void usb_peri_registration(usb_ctrl_t* ctrl, usb_cfg_t* cfg)
 
     /* pdriver registration */
     /* Pipe Define Table address - matching whichever configuration descriptor openUSBPeripheral() chose */
-    pdriver.p_pipetbl   = usbAudioActive() ? g_usb_pstd_eptbl : g_usb_pstd_eptbl_midi_only;
+    pdriver.p_pipetbl   = usbAudioMultitrackActive() ? g_usb_pstd_eptbl_multitrack
+                          : usbAudioActive()         ? g_usb_pstd_eptbl
+                                                     : g_usb_pstd_eptbl_midi_only;
     pdriver.p_devicetbl = cfg->p_usb_reg->p_device;    /* Device descriptor Table address */
     pdriver.p_qualitbl  = cfg->p_usb_reg->p_qualifier; /* Qualifier descriptor Table address */
     pdriver.p_configtbl = cfg->p_usb_reg->p_config_f;  /* Configuration descriptor Table address */
