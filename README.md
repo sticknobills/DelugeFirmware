@@ -77,7 +77,7 @@ git checkout usb-multitrack-audio
 
 ## About this fork
 
-This repo is a fork of the community firmware, [SynthstromAudible/DelugeFirmware](https://github.com/SynthstromAudible/DelugeFirmware). USB Multitrack Audio is built on the community firmware nightly build of 2026-11-11, [Deluge nightly Release 20261111](https://github.com/SynthstromAudible/DelugeFirmware/actions/runs/42932627525) (commit [8766cce2](https://github.com/SynthstromAudible/DelugeFirmware/commit/8766cce27)), and is maintained on `usb-multitrack-audio`. USB Audio 1.0 stays available from its [release](https://github.com/sticknobills/DelugeFirmware/releases/tag/USB-Audio-1.0).
+This repo is a fork of the community firmware, [SynthstromAudible/DelugeFirmware](https://github.com/SynthstromAudible/DelugeFirmware). USB Multitrack Audio is built on the community firmware nightly build of 2026-11-11, [Deluge nightly Release 20261111](https://github.com/SynthstromAudible/DelugeFirmware/actions/runs/42932627525) (commit [8766cce2](https://github.com/SynthstromAudible/DelugeFirmware/commit/8766cce27)), and is maintained on `usb-multitrack-audio`. It replaces USB Audio 1.0.
 
 ## Bugs
 
